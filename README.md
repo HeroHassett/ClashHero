@@ -34,16 +34,18 @@ management, legend and ranked tracking, war and CWL tools, and battle alerts in 
 | --- | --- | --- |
 | Server setup | `/setup`, `/alias`, `/category`, `/config`, `/debug` | Clan aliases, categories, channel default clans, manager roles (bot/roster/links/flags), embed color |
 | Accounts | `/link`, `/verify`, `/profile`, `/whois` | Multiple accounts per user, default account, API-token verification, name history |
-| Logs | `/logs clan`, `/logs server` | Join/leave, donations, roles, names, TH upgrades, war preference, leagues, war/CWL attacks, missed attacks, CWL lineup changes, capital contributions/raids/summary, Clan Games, clan achievements, legend battles + daily summary, flag alerts, roster changes, maintenance, welcome |
+| Logs | `/logs clan`, `/logs server` | Join/leave (with where members went next), donations, roles, names, TH upgrades, troop/spell/hero/equipment upgrades, super troop boosts, clan settings changes, war preference, leagues, war/CWL attacks, missed attacks, CWL lineup changes, capital contributions/raids/summary, Clan Games, clan achievements, legend battles + daily summary, flag alerts, roster changes, maintenance, welcome |
 | Live embeds | `/live`, `/legendboard` | Auto-edited war, CWL, Clan Games, last-seen, clan showcase and legend leaderboard messages |
-| Reminders | `/reminders` | War, CWL, raid and Clan Games pings for members with attacks left; opt-in/opt-out roles |
-| Legends & ranked | `/track`, `/legends`, `/top` | Attack/defense alerts (DM or channel) for Dragon League 28 through Legend I, day/week/season logs, history, clan & family leaderboards, global/local rankings |
+| Reminders | `/reminders` | War, CWL, raid and Clan Games pings for members with attacks left, filtered by Town Hall, clan role, war type and thresholds; opt-in/opt-out roles |
+| To-do & activity | `/todo`, `/inactive` | Everything left to do across a user's accounts; members inactive for N days |
+| Scheduled boards | `/autoboard` | Post leaderboards daily, weekly, at season end or as a live message |
+| Legends & ranked | `/track`, `/legends`, `/top` | Attack/defense alerts (DM or channel) with opponent, stars, destruction and View/Copy army buttons for Dragon League 28 through Legend I, day/week/season logs, history, clan & family leaderboards, global/local rankings |
 | War & CWL | `/war`, `/caller`, `/stats`, `/cwl` | Current war, lineup, remaining attacks, war log, hit-rate and defense stats, war history, target calling, CWL rounds/standings/stars/history |
 | Capital & games | `/capital`, `/clangames` | Raid weekends, contributions, Clan Games leaderboard |
-| Info | `/clan`, `/player`, `/summary`, `/army` | Clan & player info, members, compo, donations, last seen, activity graph, units/upgrades/rushed, family-wide summaries, army link parsing |
-| Rosters | `/roster` | Rosters with signup buttons, groups, eligibility rules, pings, export |
+| Info | `/clan`, `/player`, `/summary`, `/army`, `/boosts` | Clan & player info, members, compo, donations, last seen, activity graph, units/upgrades/rushed, family-wide summaries, army link parsing |
+| Rosters | `/roster` | Rosters with signup buttons, groups, eligibility rules, pings, export; suggested lineups ranked by war and CWL history; automatic signup reminders |
 | Bases | `/bases` | Base layout library, posts with copy link + voting, CWL usage tracking per round |
-| Moderation | `/flag`, `/autorole`, `/nickname` | Ban/strike flags, roles by clan role/TH/league/family/war, nickname templates |
+| Moderation | `/flag`, `/autorole`, `/nickname` | Ban flags and weighted, expiring strikes with optional DMs, roles by clan role/TH/league/family/war, nickname templates |
 | Exports | `/export` | CSV: members, season stats, wars, attacks, missed, CWL, capital, Clan Games, users |
 | Privacy | `/privacy`, `/about` | See or delete your data; links to terms, privacy policy and support |
 
@@ -76,6 +78,38 @@ docker compose logs -f         # follow the logs
 The database lives in the `clashhero-data` volume; back it up by copying `/app/data/clashhero.db`
 out of the container. Without Docker, run `uv run clashhero` under a process manager such as
 systemd or launchd.
+
+## Game updates
+
+Clash of Clans changes often (a new Town Hall, new ranked tiers, new troop levels). The bot is
+built to keep running through updates and degrade gracefully rather than break:
+
+- Everything it stores is read from the raw API data, so unknown troops, heroes, equipment or
+  Town Hall levels don't stop data collection. A player or clan that can't be processed is logged
+  once and skipped; everyone else keeps updating.
+- Ranked league tiers are loaded from the API at startup, so new tiers are recognised.
+- Unknown battle-log types are logged once. If trophies move without a recognised ranked battle,
+  the battle is recorded from the trophy change after 30 minutes.
+- Starting up during maintenance waits for the API instead of exiting; Docker restarts the bot if
+  it ever stops.
+- coc.py's bundled game data (max levels per Town Hall) lags behind the game. `/player upgrades`
+  falls back to the API's overall max for units it doesn't cover, and `/player rushed` skips them.
+
+After an update (once maintenance ends), run the compatibility check:
+
+```bash
+docker compose exec clashhero clashhero-check   # or: uv run clashhero-check
+```
+
+It makes a few real API calls and lists anything this version doesn't recognise: new tiers,
+battle types, units missing from coc.py's data, or a season schedule change. Then:
+
+1. Watch `docker compose logs -f` for "Skipping ..." or "Unknown ..." warnings.
+2. If a newer coc.py is out, update it and rebuild:
+   `uv lock --upgrade-package coc.py && docker compose up -d --build`
+3. If ranked rules changed (battle caps, tracked tiers), edit `utils/ranked.py`; if the season
+   schedule moved, set `SEASON_ANCHOR` in `.env`.
+4. Command options that take a Town Hall accept up to TH20.
 
 ## Privacy and policies
 

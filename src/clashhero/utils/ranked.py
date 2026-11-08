@@ -14,9 +14,11 @@ Tournament rules (adjust here if Supercell changes them):
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
-# Official order from GET /leaguetiers (index == tier number).
+# Built-in copy of GET /leaguetiers (index == tier number). The bot replaces it with the live list at
+# startup (set_tiers), so tiers Supercell adds later are recognised without a code change.
 LEAGUE_TIERS: tuple[str, ...] = (
     "Unranked",
     "Skeleton League 1", "Skeleton League 2", "Skeleton League 3",
@@ -52,12 +54,28 @@ def is_tracked_ranked(name: str | None) -> bool:
 
 
 def is_legend_tier(name: str | None) -> bool:
-    n = tier_number(name)
-    return n is not None and n >= _TIER_INDEX["legend iii"]
+    return bool(name) and name.lower().startswith("legend")
 
 
 def is_legend_one(name: str | None) -> bool:
-    return tier_number(name) == _TIER_INDEX["legend i"]
+    return bool(name) and name.lower() in ("legend i", "legend league")
+
+
+def set_tiers(names: Sequence[str]) -> list[str]:
+    """Replace the tier list with the live one from ``GET /leaguetiers`` (ordered by id).
+
+    Returns names that weren't in the previous list. Ignores obviously broken input.
+    """
+    global LEAGUE_TIERS, _TIER_INDEX, MIN_TRACKED_TIER
+    cleaned = tuple(n for n in names if n)
+    if len(cleaned) < 2:
+        return []
+    added = [n for n in cleaned if n.lower() not in _TIER_INDEX]
+    LEAGUE_TIERS = cleaned
+    _TIER_INDEX = {n.lower(): i for i, n in enumerate(cleaned)}
+    _TIER_INDEX.setdefault("legend league", len(cleaned) - 1)
+    MIN_TRACKED_TIER = _TIER_INDEX.get("dragon league 28", MIN_TRACKED_TIER)
+    return added
 
 
 def daily_attack_cap(name: str | None) -> int | None:

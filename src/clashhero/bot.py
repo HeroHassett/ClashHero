@@ -15,6 +15,7 @@ from clashhero.cogs._base import send_error
 from clashhero.config import Config, ConfigError
 from clashhero.db import Database
 from clashhero.services.collector import Collector
+from clashhero.utils import ranked
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +77,8 @@ class ClashHeroBot(commands.Bot):
             mode = "developer-portal credentials"
         try:
             await self.coc.search_locations(limit=1)  # one cheap request to validate access
+        except coc.Maintenance:
+            log.warning("Clash of Clans API is in maintenance; data collection resumes when it ends")
         except (coc.Forbidden, coc.InvalidCredentials) as e:
             raise ConfigError(
                 "The Clash of Clans API rejected the key. API keys only work from the IP "
@@ -83,6 +86,18 @@ class ClashHeroBot(commands.Bot):
                 f"public IP to the key (or create a new key) and restart. API said: {e}"
             ) from e
         log.info("Connected to the Clash of Clans API using %s", mode)
+        await self._refresh_league_tiers()
+
+    async def _refresh_league_tiers(self) -> None:
+        """Load the current ranked tiers so tiers added in a game update are recognised."""
+        try:
+            data = await self.coc.http.request(coc.http.Route("GET", self.coc.http.base_url, "/leaguetiers"))
+            items = sorted(data.get("items") or [], key=lambda i: i.get("id", 0))
+            added = ranked.set_tiers([i.get("name") for i in items])
+            if added:
+                log.warning("New ranked league tiers from the API: %s", ", ".join(added))
+        except Exception:
+            log.warning("Couldn't load ranked league tiers; using the built-in list", exc_info=True)
 
     async def on_ready(self) -> None:
         log.info("Ready as %s (id=%s)", self.user, getattr(self.user, "id", "?"))

@@ -11,12 +11,30 @@ collector splits the trophy delta it observes between polls across the new ranke
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
+log = logging.getLogger(__name__)
+
 RANKED_TYPES = frozenset({"legend", "ranked"})
+KNOWN_TYPES = RANKED_TYPES | {"homeVillage"}
+# If trophies move but no ranked battle shows up within this window (e.g. a new battle type after
+# a game update), the collector falls back to inferring the battle from the trophy change.
+PENDING_TIMEOUT = timedelta(minutes=30)
+
+_warned_types: set[str] = set()
+
+
+def note_unknown_types(battles: Iterable[Battle]) -> set[str]:
+    """Log each battle type this version doesn't recognise, once. Returns the new ones."""
+    new = {b.battle_type for b in battles if b.battle_type not in KNOWN_TYPES} - _warned_types
+    for t in sorted(new):
+        log.warning("Unknown battle log type %r; it isn't treated as ranked. See README 'Game updates'.", t)
+    _warned_types.update(new)
+    return new
 
 
 @dataclass(frozen=True)
@@ -82,14 +100,25 @@ class Cursor:
     timestamp: str | None = None
     keys: list[str] = field(default_factory=list)
     pending_delta: int = 0
+    pending_since: str | None = None  # ISO time the pending change was first seen
 
     def to_json(self) -> dict:
-        return {"timestamp": self.timestamp, "keys": self.keys, "pending_delta": self.pending_delta}
+        return {
+            "timestamp": self.timestamp,
+            "keys": self.keys,
+            "pending_delta": self.pending_delta,
+            "pending_since": self.pending_since,
+        }
 
     @classmethod
     def from_json(cls, d: dict | None) -> Cursor:
         d = d or {}
-        return cls(d.get("timestamp"), list(d.get("keys") or []), int(d.get("pending_delta") or 0))
+        return cls(
+            d.get("timestamp"),
+            list(d.get("keys") or []),
+            int(d.get("pending_delta") or 0),
+            d.get("pending_since"),
+        )
 
 
 def take_new(battles: Sequence[Battle], cursor: Cursor | None) -> tuple[list[Battle], Cursor]:
@@ -114,7 +143,7 @@ def take_new(battles: Sequence[Battle], cursor: Cursor | None) -> tuple[list[Bat
         return fresh, cursor
     if newest == cursor.timestamp:
         keys_at_newest = sorted(set(cursor.keys) | set(keys_at_newest))
-    return fresh, Cursor(newest, keys_at_newest, cursor.pending_delta)
+    return fresh, Cursor(newest, keys_at_newest, cursor.pending_delta, cursor.pending_since)
 
 
 def _even_split(total: int, n: int) -> list[int]:

@@ -129,11 +129,22 @@ class PlayerSnap:
 
     @classmethod
     def from_coc(cls, p: Any) -> PlayerSnap:
-        games = 0
-        for a in getattr(p, "achievements", None) or []:
-            if a.name == GAMES_CHAMPION:
-                games = a.value
-        heroes = sum(h.level for h in (getattr(p, "heroes", None) or []) if getattr(h, "is_home_base", True))
+        raw = getattr(p, "_raw_data", None)
+        if isinstance(raw, dict):  # raw payload: unaffected by units coc.py doesn't know yet
+            games = next(
+                (a.get("value", 0) for a in raw.get("achievements") or [] if a.get("name") == GAMES_CHAMPION),
+                0,
+            )
+            heroes = sum(
+                h.get("level", 0) for h in raw.get("heroes") or [] if h.get("village", "home") == "home"
+            )
+        else:
+            games = next(
+                (a.value for a in getattr(p, "achievements", None) or [] if a.name == GAMES_CHAMPION), 0
+            )
+            heroes = sum(
+                h.level for h in getattr(p, "heroes", None) or [] if getattr(h, "is_home_base", True)
+            )
         clan = getattr(p, "clan", None)
         return cls(
             tag=p.tag,

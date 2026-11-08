@@ -11,6 +11,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from coc import (
+    PETS_ORDER,
+    SEASONAL_SPELL_ORDER,
+    SEASONAL_TROOP_ORDER,
+    SIEGE_MACHINE_ORDER,
+    SUPER_TROOP_ORDER,
+)
+
 # ------------------------------------------------------------------ time
 
 
@@ -85,6 +93,7 @@ class UnitLevel:
     level: int
     max_for_th: int | None  # max level at the player's TH
     max_for_prev_th: int | None  # max level at TH - 1 (None if locked there)
+    approximate: bool = False  # coc.py's data is behind the game; max_for_th is the overall max
 
     @property
     def remaining(self) -> int:
@@ -139,7 +148,7 @@ def upgrade_progress(units: Iterable[UnitLevel]) -> tuple[list[UnitLevel], Progr
 
 
 def _max_for(unit: Any, th: int) -> int | None:
-    if th <= 0:
+    if unit is None or th <= 0:
         return None
     try:
         return unit.get_max_level_for_townhall(th)
@@ -148,12 +157,72 @@ def _max_for(unit: Any, th: int) -> int | None:
 
 
 def unit_levels(player: Any) -> list[UnitLevel]:
-    """Extract home-village unit levels from a coc.py Player (with static data loaded)."""
+    """Home-village unit levels for a coc.py Player.
+
+    Names and levels come from the raw API payload, which is always current. Per-Town-Hall max
+    levels come from coc.py's bundled game data, looked up per unit; when that data is missing or
+    out of date (the player is already past what it lists), the max is None ("unknown") rather
+    than an error. coc.py's own Player.troops can raise on levels it doesn't know, so it's only
+    used as a fallback when no raw payload is available.
+    """
     th = player.town_hall or 0
+    raw = getattr(player, "_raw_data", None)
+    if not isinstance(raw, dict):
+        return _unit_levels_from_models(player, th)
+    client = getattr(player, "_client", None)
+    skip = set(SUPER_TROOP_ORDER) | set(SEASONAL_TROOP_ORDER) | set(SEASONAL_SPELL_ORDER)
+    out: list[UnitLevel] = []
+    for key, default_cat in (
+        ("troops", "troops"),
+        ("spells", "spells"),
+        ("heroes", "heroes"),
+        ("heroEquipment", "equipment"),
+    ):
+        for u in raw.get(key) or []:
+            name, level = u.get("name"), int(u.get("level") or 0)
+            if not name or u.get("village", "home") != "home" or name in skip:
+                continue
+            cat = "pets" if name in PETS_ORDER else "sieges" if name in SIEGE_MACHINE_ORDER else default_cat
+            static = _static_unit(client, cat, name)
+            max_th, max_prev = _max_for(static, th), _max_for(static, th - 1)
+            approximate = False
+            if max_th is None or level > max_th:
+                # coc.py doesn't know this unit or its newest levels (it lags game updates): use
+                # the game's overall max from the API, and leave the previous-TH max unknown so
+                # /player rushed doesn't guess.
+                max_th, max_prev, approximate = u.get("maxLevel"), None, True
+            out.append(UnitLevel(name, cat, level, max_th, max_prev, approximate))
+    return out
+
+
+_STATIC_GETTERS = {
+    "troops": lambda c, n: c.get_troop(n, True, 1),
+    "sieges": lambda c, n: c.get_troop(n, True, 1),
+    "spells": lambda c, n: c.get_spell(n, 1),
+    "heroes": lambda c, n: c.get_hero(n, 1),
+    "pets": lambda c, n: c.get_pet(n, 1),
+    "equipment": lambda c, n: c.get_equipment(n, 1),
+}
+
+
+def _static_unit(client: Any, category: str, name: str) -> Any:
+    if client is None:
+        return None
+    try:
+        return _STATIC_GETTERS[category](client, name)
+    except Exception:
+        return None
+
+
+def _unit_levels_from_models(player: Any, th: int) -> list[UnitLevel]:
     out: list[UnitLevel] = []
 
-    def add(units: Iterable[Any], category: str) -> None:
-        for u in units or []:
+    def add(attr: str, category: str) -> None:
+        try:
+            units = getattr(player, attr, None) or []
+        except Exception:  # coc.py can't parse a level it doesn't know
+            return
+        for u in units:
             if getattr(u, "is_super_troop", False) or getattr(u, "is_seasonal", False):
                 continue
             if hasattr(u, "is_home_base") and not u.is_home_base:
@@ -161,11 +230,11 @@ def unit_levels(player: Any) -> list[UnitLevel]:
             cat = "sieges" if getattr(u, "is_siege_machine", False) else category
             out.append(UnitLevel(u.name, cat, u.level, _max_for(u, th), _max_for(u, th - 1)))
 
-    add(getattr(player, "home_troops", None) or getattr(player, "troops", []), "troops")
-    add(getattr(player, "spells", []), "spells")
-    add(getattr(player, "heroes", []), "heroes")
-    add(getattr(player, "pets", []), "pets")
-    add(getattr(player, "equipment", []), "equipment")
+    add("home_troops", "troops")
+    add("spells", "spells")
+    add("heroes", "heroes")
+    add("pets", "pets")
+    add("equipment", "equipment")
     return out
 
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
@@ -26,7 +27,15 @@ import coc
 from discord.ext import tasks
 
 from clashhero import events as ev
-from clashhero.services.battlelog import Battle, Cursor, assign_trophies, parse_battles, take_new
+from clashhero.services.battlelog import (
+    PENDING_TIMEOUT,
+    Battle,
+    Cursor,
+    assign_trophies,
+    note_unknown_types,
+    parse_battles,
+    take_new,
+)
 from clashhero.services.snapshots import (
     MAX_PLAUSIBLE_DELTA,
     ClanSnap,
@@ -157,6 +166,21 @@ class Collector:
             self.dispatch(ev.MaintenanceChanged(started=False, at=datetime.now(UTC)))
         return result
 
+    _failure_logged: set[tuple[str, str]] = set()
+
+    async def _isolated(self, coro: Awaitable[Any], what: str, tag: str) -> None:
+        """Run one clan/player/war/raid update; log and skip it on error instead of failing the
+        whole cycle. Unexpected API data after a game update shows up here first."""
+        try:
+            await coro
+        except Exception:
+            key = (what, tag)
+            if key not in self._failure_logged:  # log each failing item once, not every minute
+                self._failure_logged.add(key)
+                log.exception("Skipping %s %s: couldn't process its data", what, tag)
+        else:
+            self._failure_logged.discard((what, tag))
+
     async def _record_activity(
         self, player_tag: str, clan_tag: str | None, now: datetime, amount: int = 1
     ) -> None:
@@ -190,7 +214,7 @@ class Collector:
     async def _poll_clans(self) -> None:
         now = datetime.now(UTC)
         tags = await self.db.all_clan_tags()
-        await asyncio.gather(*(self._poll_clan(t, now) for t in tags))
+        await asyncio.gather(*(self._isolated(self._poll_clan(t, now), "clan", t) for t in tags))
 
     async def _poll_clan(self, tag: str, now: datetime) -> None:
         clan = await self._guarded(self.coc.get_clan(tag))
@@ -305,7 +329,7 @@ class Collector:
         tags = await self.player_tags_to_poll()
         if not tags:
             return
-        await asyncio.gather(*(self._poll_player(t, now) for t in tags))
+        await asyncio.gather(*(self._isolated(self._poll_player(t, now), "player", t) for t in tags))
 
     async def _poll_player(self, tag: str, now: datetime) -> None:
         player = await self._guarded(self.coc.get_player(tag))
@@ -320,6 +344,7 @@ class Collector:
                 self._battlelog_fetched[tag] = now
                 fresh, cursor = take_new(battles, self._battle_cursors.get(tag))
                 self._battle_cursors[tag] = cursor
+                note_unknown_types(fresh)
                 ranked_new = [b for b in fresh if b.ranked]
         async with self.db.batch():
             await self._store_player(new, now)
@@ -455,6 +480,10 @@ class Collector:
         if ranked_new is not None:
             await self._record_logged_battles(old, new, ranked_new, now)
             return
+        await self._record_inferred(old, new, now)
+
+    async def _record_inferred(self, old: PlayerSnap, new: PlayerSnap, now: datetime) -> None:
+        clan = new.clan_tag
         battles = infer_battles(old, new)
         if battles:
             day = legend_day_id(now)
@@ -480,11 +509,19 @@ class Collector:
         if not battles:
             if plausible and delta:
                 cursor.pending_delta += delta
+                cursor.pending_since = cursor.pending_since or _iso(now)
                 if abs(cursor.pending_delta) > MAX_PLAUSIBLE_DELTA:
-                    cursor.pending_delta = 0
+                    cursor.pending_delta, cursor.pending_since = 0, None
+            if cursor.pending_delta and cursor.pending_since:
+                if now - datetime.fromisoformat(cursor.pending_since) >= PENDING_TIMEOUT:
+                    # Trophies moved but no matching battle ever appeared (for example a battle
+                    # type this version doesn't know yet): record it the old, inferred way.
+                    pending = cursor.pending_delta
+                    cursor.pending_delta, cursor.pending_since = 0, None
+                    await self._record_inferred(replace(new, trophies=new.trophies - pending), new, now)
             return
         total = cursor.pending_delta + (delta if plausible else 0)
-        cursor.pending_delta = 0
+        cursor.pending_delta, cursor.pending_since = 0, None
         trophies = assign_trophies(battles, total)
         running = new.trophies - sum(trophies)
         for b, t in zip(battles, trophies, strict=True):
@@ -556,7 +593,7 @@ class Collector:
     async def _poll_wars(self) -> None:
         now = datetime.now(UTC)
         tags = await self.db.all_clan_tags()
-        await asyncio.gather(*(self._poll_war(t, now) for t in tags))
+        await asyncio.gather(*(self._isolated(self._poll_war(t, now), "war", t) for t in tags))
 
     async def _poll_war(self, clan_tag: str, now: datetime) -> None:
         war = await self._guarded(self.coc.get_current_war(clan_tag))
@@ -722,7 +759,7 @@ class Collector:
 
     async def _poll_raids(self) -> None:
         tags = await self.db.all_clan_tags()
-        await asyncio.gather(*(self._poll_raid(t) for t in tags))
+        await asyncio.gather(*(self._isolated(self._poll_raid(t), "raid", t) for t in tags))
 
     async def _poll_raid(self, clan_tag: str) -> None:
         log_ = await self._guarded(self.coc.get_raid_log(clan_tag, limit=1))
