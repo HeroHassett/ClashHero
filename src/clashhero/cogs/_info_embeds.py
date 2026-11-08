@@ -647,6 +647,7 @@ def profile_parts(
     season: tuple[int, int] | None = None,
     names: Sequence[str] = (),
     country: Any = None,
+    best_finish: Any = None,
 ) -> tuple[str, list[tuple[str, str, bool]]]:
     """(description, fields) for /player info: everything is in the description, in sections
     (season, other, all-time achievement stats, heroes), one stat per line. ``fields`` is kept for
@@ -654,7 +655,8 @@ def profile_parts(
 
     ``p`` is a coc.py Player; the rest comes from the database (linked Discord user, last seen,
     season donations given/received, earlier names, ``country``: a ``repos.ranks.CountryRank``
-    when the player is in their country's top 200)."""
+    when the player is in their country's top 200; ``best_finish``: a ``repos.ranks.Finish``,
+    the best season-end global rank in Legend I)."""
     a = achievement_values(p)
     trophy, castle = sym("res_trophy", "🏆"), sym("ui_donate_troops", "🏰")
     sword, shield = sym("ui_sword", "🗡️"), sym("ui_shield", "🛡️")
@@ -687,6 +689,9 @@ def profile_parts(
     # Other: the all-time trophy high (the API's bestTrophies, not a season finish), clan, etc.
     lines += ["", "**Other Stats**"]
     lines.append(_stat(trophy, "Best Trophies", f"{p.best_trophies:,} (all-time high)"))
+    if best_finish:  # best season-end global rank in Legend I (finished seasons only)
+        finish = f"#{best_finish.rank:,} ({best_finish.trophies:,})"
+        lines.append(_stat(EMOJIS.league("Legend I") or trophy, "Best Finish", finish))
     clan = getattr(p, "clan", None)
     if clan:
         role = role_name(_enum(getattr(p, "role", None)) or None)

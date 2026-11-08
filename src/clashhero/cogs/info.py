@@ -391,6 +391,7 @@ async def render_player_page(
             else None,
             names=names,
             country=await ranks.country_rank(client.db, p.tag, now=datetime.now(UTC)),
+            best_finish=await ranks.best_finish(client.db, p.tag),
         )
         for name, value, inline in fields[:25]:
             embed.add_field(name=name, value=value or "—", inline=inline)

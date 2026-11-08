@@ -77,3 +77,34 @@ async def test_collector_polls_country_rankings(setup):  # noqa: F811
     coc.http = Http()
     await col._poll_country_ranks()
     assert (await ranks.country_rank(bot.db, "#A")).rank == 7
+
+
+async def test_season_finishes_and_best_finish(db):
+    await ranks.store_season_finishes(db, "v2-2026-09-28T05:00:00Z", items(("#A", 12000), ("#B", 4)))
+    await ranks.store_season_finishes(db, "v2-2026-10-26T05:00:00Z", items(("#A", 9013)))
+    assert await ranks.stored_seasons(db) == {"v2-2026-09-28T05:00:00Z", "v2-2026-10-26T05:00:00Z"}
+    best = await ranks.best_finish(db, "#A")
+    assert (best.rank, best.season_id) == (9013, "v2-2026-10-26T05:00:00Z")
+    assert await ranks.best_finish(db, "#Z") is None
+
+
+async def test_collector_fetches_each_finished_season_once(setup):  # noqa: F811
+    bot, coc, col = setup
+    calls = []
+
+    class Http(FakeHttp):
+        async def request(self, route):
+            calls.append(route.url)
+            if route.url.endswith("/seasons"):
+                return {"items": [{"id": "2025-05"}, {"id": "v2-2026-10-26T05:00:00Z"}]}
+            if "after=" not in route.url:
+                return {"items": items(("#A", 1)), "paging": {"cursors": {"after": "p2"}}}
+            return {"items": items(("#B", 2)), "paging": {"cursors": {}}}
+
+    coc.http = Http()
+    await col._poll_season_finishes()
+    assert (await ranks.best_finish(bot.db, "#B")).rank == 2  # both pages stored
+    assert not any("2025-05" in u for u in calls[1:])  # pre-ranked-era seasons skipped
+    calls.clear()
+    await col._poll_season_finishes()
+    assert len(calls) == 1  # already stored: only the season list is read

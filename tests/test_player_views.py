@@ -330,3 +330,11 @@ def test_profile_shows_country_flag():
     assert desc.splitlines()[1].endswith("🇺🇸 United States")
     assert "#57" not in desc  # the flag only; ranks shown are global
     assert "🇺🇸" not in profile_parts(profile_player())[0]
+
+
+def test_profile_best_finish():
+    from clashhero.repos.ranks import Finish
+
+    desc, _ = profile_parts(profile_player(), best_finish=Finish(9013, 4980, "v2-2026-10-26T05:00:00Z"))
+    assert "🏆 **Best Finish** #9,013 (4,980)" in desc.splitlines()
+    assert "Best Finish" not in profile_parts(profile_player())[0]

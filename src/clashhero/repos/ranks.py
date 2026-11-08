@@ -117,3 +117,45 @@ async def country_rank(db: Database, tag: str, now: datetime | None = None) -> C
     if now is not None and now - datetime.fromisoformat(row["fetched_at"]) > MAX_COUNTRY_RANK_AGE:
         return None
     return CountryRank(row["rank"], row["country_code"], row["country_name"])
+
+
+# ------------------------------------------------------------------ season finishes
+
+
+@dataclass(frozen=True)
+class Finish:
+    rank: int
+    trophies: int
+    season_id: str
+
+
+async def stored_seasons(db: Database) -> set[str]:
+    rows = await db.fetchall("SELECT DISTINCT season_id FROM season_finishes")
+    return {r["season_id"] for r in rows}
+
+
+async def store_season_finishes(db: Database, season_id: str, items: Iterable[Mapping[str, Any]]) -> int:
+    """Store a finished season's whole final ranking (all pages). Returns the number of players."""
+    rows = [
+        (season_id, i["tag"], int(i["rank"]), int(i.get("trophies") or 0))
+        for i in items
+        if i.get("tag") and isinstance(i.get("rank"), int)
+    ]
+    if not rows:
+        return 0
+    async with db.batch():
+        await db.execute("DELETE FROM season_finishes WHERE season_id = ?", (season_id,))
+        await db.executemany(
+            "INSERT INTO season_finishes (season_id, player_tag, rank, trophies) VALUES (?, ?, ?, ?)", rows
+        )
+    return len(rows)
+
+
+async def best_finish(db: Database, tag: str) -> Finish | None:
+    """The player's best season-end global rank in Legend I (of the seasons stored)."""
+    row = await db.fetchone(
+        "SELECT rank, trophies, season_id FROM season_finishes WHERE player_tag = ? "
+        "ORDER BY rank, season_id DESC LIMIT 1",
+        (tag,),
+    )
+    return Finish(row["rank"], row["trophies"], row["season_id"]) if row else None

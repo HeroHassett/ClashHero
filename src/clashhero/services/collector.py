@@ -69,6 +69,9 @@ COUNTRY_RANK_POLL_SECONDS = 3 * 60 * 60  # every country's top 200 (flags and lo
 # Auto defenses can reach the API's trophy count a while after the 05:00 UTC reset.
 LATE_AUTOFILL_WINDOW = timedelta(hours=2)
 RESET_TROPHIES = 5000  # Legend I's season reset and weekly floor
+SEASON_FINISH_POLL_SECONDS = 6 * 60 * 60  # look for newly finished Legend I seasons
+LEGEND_LEAGUE_ID = 29000022  # the API's Legend League, whose seasons hold final rankings
+MAX_SEASON_PAGES = 200  # 1000 players a page; a season had about 12k
 
 PlayerSource = Callable[[], Awaitable[Iterable[str]]]
 
@@ -138,6 +141,7 @@ class Collector:
         self.raid_loop = tasks.loop(seconds=cfg.raid_poll_seconds)(self._poll_raids)
         self.rank_loop = tasks.loop(seconds=RANK_POLL_SECONDS)(self._poll_ranks)
         self.country_rank_loop = tasks.loop(seconds=COUNTRY_RANK_POLL_SECONDS)(self._poll_country_ranks)
+        self.season_finish_loop = tasks.loop(seconds=SEASON_FINISH_POLL_SECONDS)(self._poll_season_finishes)
         self._loops = (
             self.clan_loop,
             self.player_loop,
@@ -145,6 +149,7 @@ class Collector:
             self.raid_loop,
             self.rank_loop,
             self.country_rank_loop,
+            self.season_finish_loop,
         )
         for loop in self._loops:
             loop.error(self._make_error_handler(loop))
@@ -1096,6 +1101,35 @@ class Collector:
         )
         if countries:
             self._cycle_done("country_ranks", now)
+
+    async def _poll_season_finishes(self) -> None:
+        """Final global rankings of finished Legend I seasons (ranked era, ids "v2-..."): each
+        season is fetched once, all pages (about 12k players, 1000 per page)."""
+        base = self.coc.http.base_url
+        data = await self._guarded(
+            self.coc.http.request(coc.http.Route("GET", base, f"/leagues/{LEGEND_LEAGUE_ID}/seasons"))
+        )
+        seasons = [s["id"] for s in (data or {}).get("items") or [] if str(s.get("id", "")).startswith("v2")]
+        todo = [s for s in seasons if s not in await ranks.stored_seasons(self.db)]
+        for season_id in todo:
+            items: list[dict] = []
+            after = None
+            for _ in range(MAX_SEASON_PAGES):
+                path = f"/leagues/{LEGEND_LEAGUE_ID}/seasons/{quote(season_id)}?limit=1000"
+                if after:
+                    path += f"&after={after}"
+                page = await self._guarded(self.coc.http.request(coc.http.Route("GET", base, path)))
+                if page is None:  # API error: try this season again next time
+                    items = []
+                    break
+                items += page.get("items") or []
+                after = ((page.get("paging") or {}).get("cursors") or {}).get("after")
+                if not after or not page.get("items"):
+                    break
+            if items:
+                stored = await ranks.store_season_finishes(self.db, season_id, items)
+                log.info("Stored the final ranking of Legend season %s (%d players)", season_id, stored)
+        self._cycle_done("season_finishes", datetime.now(UTC))
 
     # ------------------------------------------------------------------ capital raids
 

@@ -31,3 +31,14 @@ CREATE TABLE IF NOT EXISTS player_country_ranks (
     fetched_at   TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_country_ranks_location ON player_country_ranks (location_id);
+
+-- Final global rankings of finished Legend I seasons (GET /leagues/{legend}/seasons/{id}): every
+-- ranked player's finishing rank and trophies. Fetched once per season, after it ends.
+CREATE TABLE IF NOT EXISTS season_finishes (
+    season_id  TEXT    NOT NULL,  -- the API's id, e.g. "v2-2026-10-26T05:00:00Z"
+    player_tag TEXT    NOT NULL,
+    rank       INTEGER NOT NULL,
+    trophies   INTEGER NOT NULL,
+    PRIMARY KEY (season_id, player_tag)
+);
+CREATE INDEX IF NOT EXISTS idx_season_finishes_player ON season_finishes (player_tag);
