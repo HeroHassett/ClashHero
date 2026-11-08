@@ -29,6 +29,7 @@ from clashhero.cogs._info_embeds import (
 )
 from clashhero.constants import CLAN_TYPE_LABELS, WAR_FREQUENCY_LABELS
 from clashhero.repos import stats
+from clashhero.services.emojis import EMOJIS
 from clashhero.utils.fmt import clan_link, make_embed, player_link, role_name, table, ts
 from clashhero.utils.ranked import league_icon, league_name
 from clashhero.utils.resolve import (
@@ -142,6 +143,13 @@ class Info(BaseCog):
         e.add_field(name="Clan Points", value=str(c.points or 0))
         e.add_field(name="Capital Points", value=str(getattr(c, "capital_points", 0) or 0))
         dist = th_distribution(getattr(m, "town_hall", None) for m in c.members)
+        labels = (getattr(c, "_raw_data", None) or {}).get("labels") or []
+        if labels:
+            e.add_field(
+                name="Labels",
+                value=" · ".join(f"{EMOJIS.label(lb.get('name'))} {lb.get('name')}".strip() for lb in labels),
+                inline=False,
+            )
         e.add_field(name="Town Hall Spread", value=render_th_distribution(dist)[:1024], inline=False)
         await interaction.followup.send(embed=e)
 

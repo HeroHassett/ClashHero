@@ -3,6 +3,7 @@ background collector. Feature cogs in ``clashhero/cogs`` are discovered automati
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import pkgutil
 from datetime import UTC, datetime
@@ -15,6 +16,7 @@ from clashhero import cogs
 from clashhero.cogs._base import send_error
 from clashhero.config import Config, ConfigError
 from clashhero.db import Database
+from clashhero.services import emojis
 from clashhero.services.collector import Collector
 from clashhero.utils import ranked
 
@@ -49,6 +51,8 @@ class ClashHeroBot(commands.Bot):
     async def setup_hook(self) -> None:
         await self.db.connect()
         await self.connect_clash_api()
+
+        self._emoji_task = asyncio.create_task(self._sync_emojis())
 
         for ext in discover_extensions():
             await self.load_extension(ext)
@@ -100,6 +104,13 @@ class ClashHeroBot(commands.Bot):
                 log.warning("New ranked league tiers from the API: %s", ", ".join(added))
         except Exception:
             log.warning("Couldn't load ranked league tiers; using the built-in list", exc_info=True)
+
+    async def _sync_emojis(self) -> None:
+        """Load ClashHero's app emojis and upload missing official icons (league tiers, labels)."""
+        try:
+            await emojis.sync_official(self)
+        except Exception:
+            log.warning("Emoji sync failed; messages fall back to text", exc_info=True)
 
     async def on_ready(self) -> None:
         log.info("Ready as %s (id=%s)", self.user, getattr(self.user, "id", "?"))

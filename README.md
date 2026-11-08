@@ -79,6 +79,23 @@ The database lives in the `clashhero-data` volume; back it up by copying `/app/d
 out of the container. Without Docker, run `uv run clashhero` under a process manager such as
 systemd or launchd.
 
+## Custom emojis
+
+ClashHero uses its own Discord app emojis (shown as "from the ClashHero app"), with plain-text
+fallbacks when one isn't uploaded:
+
+- **Official icons** from the Clash API (ranked league tiers, clan and player labels) are uploaded
+  automatically the first time the bot starts.
+- **Game art** (troops, heroes, pets, spells, equipment, Town Halls) isn't in the API. Download it
+  from Supercell's Fan Kit, put the icons in a folder named after each unit (`Barbarian King.png`,
+  `Rage Spell.png`, `Town Hall 18.png`), and upload them:
+
+  ```bash
+  uv run clashhero-emojis path/to/icons        # or: docker compose exec clashhero clashhero-emojis /path
+  ```
+
+  Unit grids, profiles and Town Hall spreads then show the icons automatically.
+
 ## Game updates
 
 Clash of Clans changes often (a new Town Hall, new ranked tiers, new troop levels). The bot is

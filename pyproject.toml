@@ -22,6 +22,7 @@ dev = [
 [project.scripts]
 clashhero = "clashhero.__main__:main"
 clashhero-check = "clashhero.healthcheck:main"
+clashhero-emojis = "clashhero.services.emojis:main"
 
 [build-system]
 requires = ["hatchling"]

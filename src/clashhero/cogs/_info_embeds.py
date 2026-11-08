@@ -26,6 +26,7 @@ from coc import (
 )
 from discord.utils import escape_markdown
 
+from clashhero.services.emojis import EMOJIS
 from clashhero.services.snapshots import home_units
 from clashhero.utils.fmt import clan_link, pad, role_name, ts
 from clashhero.utils.ranked import league_name
@@ -92,7 +93,12 @@ def th_distribution(town_halls: Iterable[int | None]) -> list[tuple[int, int]]:
 
 def render_th_distribution(dist: Sequence[tuple[int, int]]) -> str:
     total = sum(n for _, n in dist) or 1
-    return "\n".join(f"`TH{th:>2}` {'▰' * n} **{n}** ({n * 100 // total}%)" for th, n in dist) or "—"
+    return (
+        "\n".join(
+            f"{EMOJIS.town_hall(th)}`TH{th:>2}` {'▰' * n} **{n}** ({n * 100 // total}%)" for th, n in dist
+        )
+        or "—"
+    )
 
 
 # ------------------------------------------------------------------ unit progress
@@ -387,6 +393,11 @@ def chip_grid(
     the columns line up."""
     if not cells:
         return []
+    icons = [unit_icon(name) for name, _, _ in cells]
+    if all(icons):  # every unit has an uploaded icon: icon + level chip, more per row
+        lw = chip_width(f"{lv}{mark}" for _, lv, mark in cells)
+        chips = [f"{icon}{chip(f'{lv}{mark}', lw)}" for icon, (_, lv, mark) in zip(icons, cells, strict=True)]
+        return grid(chips, 4)
     for per_row in range(max(1, min(max_per_row, len(cells))), 0, -1):
         widths = [
             tuple(chip_width(cell[k] for cell in cells[c::per_row]) for k in range(3)) for c in range(per_row)
@@ -577,9 +588,15 @@ def fit(text: str, limit: int = FIELD_LIMIT, sep: str = SEP) -> str:
     return (text[:cut] if cut > 0 else text[: limit - 2]) + " …"
 
 
+def unit_icon(name: str) -> str:
+    """Uploaded emoji for a unit (spells may be listed without their " Spell" suffix)."""
+    return EMOJIS.unit(name) or EMOJIS.unit(f"{name} Spell")
+
+
 def unit_chips(units: Iterable[tuple[str, int]]) -> str:
-    """``Barbarian King `95` · Archer Queen `95``` for the profile page."""
-    return fit(SEP.join(f"{escape_markdown(name)} {chip(level)}" for name, level in units))
+    """``Barbarian King `95` · Archer Queen `95``` for the profile page (icon instead of the name
+    when one is uploaded)."""
+    return fit(SEP.join(f"{unit_icon(name) or escape_markdown(name)} {chip(level)}" for name, level in units))
 
 
 def profile_parts(
@@ -596,7 +613,10 @@ def profile_parts(
     ``p`` is a coc.py Player; the rest comes from the database (linked Discord user, last seen,
     season donations given/received, earlier names)."""
     weapon = getattr(p, "town_hall_weapon", None)
-    th = [header(f"Town Hall {p.town_hall}", "🏠"), *([f"weapon {chip(weapon)}"] if weapon else [])]
+    th = [
+        header(f"Town Hall {p.town_hall}", EMOJIS.town_hall(p.town_hall) or "🏠"),
+        *([f"weapon {chip(weapon)}"] if weapon else []),
+    ]
     lines = [SEP.join([*th, f"level {chip(p.exp_level)}"])]
     clan = getattr(p, "clan", None)
     if clan:
@@ -610,7 +630,8 @@ def profile_parts(
     fields.append(
         (
             f"{ICONS['trophy']} Trophies",
-            f"{chip(f'{p.trophies:,}')} best {chip(f'{p.best_trophies:,}')}\n{league}",
+            f"{chip(f'{p.trophies:,}')} best {chip(f'{p.best_trophies:,}')}\n"
+            f"{EMOJIS.league(league)} {league}".rstrip(),
             True,
         )
     )
