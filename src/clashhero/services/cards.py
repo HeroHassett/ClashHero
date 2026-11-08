@@ -1240,6 +1240,7 @@ MAX_DAY_ROWS = 30
 INK: RGB = (30, 22, 18)  # outline and shadow of game text, window outlines
 WHITE: RGB = (255, 255, 255)
 PALE_YELLOW: RGB = (247, 242, 180)
+NAME_YELLOW: RGB = (255, 238, 96)  # the player's own name in the game's battle log
 FRAME_TOP: RGB = (106, 87, 74)
 FRAME_BOTTOM: RGB = (72, 58, 49)
 CREAM_TOP: RGB = (245, 238, 226)
@@ -1472,7 +1473,7 @@ def _render_day(
         day_short = f"{d:%b %d}"
     except ValueError:
         day_short = str(day)
-    _day_player_bar(canvas, draw, trophy, player_name, trophies, rank, day_short)
+    _day_player_bar(canvas, draw, trophy, player_name, trophies, rank, today)
 
     offense = sum(b.trophies for b in attacks)
     defense = sum(b.trophies for b in defenses)
@@ -1563,8 +1564,10 @@ def _day_frame(canvas: Image.Image, draw: ImageDraw.ImageDraw, height: int, body
 
 
 def _day_player_bar(
-    canvas, draw, trophy: _TrophyIcon, name: str, trophies: int | None, rank: int | None, day: str
+    canvas, draw, trophy: _TrophyIcon, name: str, trophies: int | None, rank: int | None, today: bool
 ):
+    """As in the game: ``#rank`` (when known) and the player's name in yellow on the left,
+    ``Total: 4990`` and a trophy on the right (``EOD:`` for a past day). No thousands commas."""
     x0, x1, y0 = INNER_L, INNER_R, BAR_Y
     box = (_px(x0), _px(y0), _px(x1), _px(y0 + BAR_H))
     ledge = (box[0], box[1] + _px(3), box[2], box[3] + _px(3))
@@ -1582,22 +1585,19 @@ def _day_player_bar(
     right = _px(x1 - 14)
     icon = 36
     trophy.draw(canvas, draw, right - _px(icon / 2), cy, icon)
-    day_w = _game_text(draw, right - _px(icon + 6), cy, f"Day: {day}", size, anchor="r")
+    value = str(trophies) if trophies is not None else "—"
+    value_w = _game_text(draw, right - _px(icon + 6), cy, value, size, anchor="r")
+    label_right = right - _px(icon + 6) - value_w - _px(12)
+    label_w = _game_text(draw, label_right, cy, "Total:" if today else "EOD:", size, anchor="r")
 
-    eod = f"EOD: {trophies:,}" if trophies is not None else "EOD: —"
+    x = _px(x0 + 18)
     if rank:
-        eod += f" (#{rank:,})"
-    mid = _px((x0 + x1) / 2 + 40)
-    eod_runs = _runs(eod, _game_fonts(size))
-    eod_w = _runs_width(eod_runs)
-    eod_x = min(mid - eod_w / 2, right - _px(icon + 6) - day_w - _px(24) - eod_w)
-    _game_text(draw, eod_x, cy, eod_runs, size)
-
-    name_room = eod_x - _px(24) - _px(x0 + 18)
+        x += _game_text(draw, x, cy, f"#{rank}", size) + _px(10)
+    name_room = label_right - label_w - _px(28) - x
     runs, name_size = _fit_game(name, size, 18, name_room)
     if not runs:
         runs, name_size = _fit_game("?", size, size, name_room)
-    _game_text(draw, _px(x0 + 18), cy, runs, name_size)
+    _game_text(draw, x, cy, runs, name_size, NAME_YELLOW)
 
 
 def _day_band(canvas, draw, trophy: _TrophyIcon, title: str, offense: int, defense: int) -> None:
@@ -1617,7 +1617,7 @@ def _day_band(canvas, draw, trophy: _TrophyIcon, title: str, offense: int, defen
     top_cy = _px(y0 + 33)
     title_end = _px(x0 + 18) + _game_text(draw, _px(x0 + 18), top_cy, title, 23, PALE_YELLOW)
     big = 36
-    net = f"{offense + defense:+d}"
+    net = str(offense + defense)  # the game shows a positive day total without a plus sign
     net_w = _runs_width(_runs(net, _game_fonts(26)))
     right = max(_px(cols[0][1] - 12), title_end + _px(24) + net_w + _px(big + 4))
     trophy.draw(canvas, draw, right - _px(big / 2), top_cy, big)
