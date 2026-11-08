@@ -85,7 +85,7 @@ def test_slot_styles():
     assert cards.slot_style(hit(-25, stars=2), "defense") == "grey"
     assert cards.slot_style(hit(0, stars=3), "defense") == "red"  # below Legend I a 3-star defense earns 0
     assert cards.slot_style(hit(12, stars=2), "defense") == "grey"  # below Legend I: a gain
-    assert cards.slot_style(B(trophies=-40, autofill=True), "defense") == "grey"
+    assert cards.slot_style(B(trophies=-40, autofill=True), "defense") == "auto"  # blue-grey, as in game
 
 
 def _slot_pixel(im: Image.Image, col: int, row: int) -> tuple[int, int, int]:

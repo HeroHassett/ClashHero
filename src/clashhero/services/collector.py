@@ -33,6 +33,7 @@ from clashhero.services.battlelog import (
     Battle,
     Cursor,
     battle_trophies,
+    legend_trophies,
     note_unknown_types,
     parse_battles,
     take_new,
@@ -65,6 +66,8 @@ log = logging.getLogger(__name__)
 
 RANK_POLL_SECONDS = 30 * 60  # global top-200 ranking (current and end-of-day ranks)
 COUNTRY_RANK_POLL_SECONDS = 3 * 60 * 60  # every country's top 200 (flags and local ranks)
+# Auto defenses can reach the API's trophy count a while after the 05:00 UTC reset.
+LATE_AUTOFILL_WINDOW = timedelta(hours=2)
 
 PlayerSource = Callable[[], Awaitable[Iterable[str]]]
 
@@ -632,6 +635,19 @@ class Collector:
             if b.key in fresh_keys and b.battle_type != "ranked"  # see below
         )
         residual = total - explained
+        fresh_rule = [
+            i
+            for i, b in enumerate(missing)
+            if b.key in fresh_keys and b.battle_type == "legend" and legend_trophies(b) is not None
+        ]
+        if residual and fresh_rule and abs(residual) <= len(fresh_rule):
+            # The API reports destruction as a whole number (95.6% shows as 95), so the rule can be
+            # a trophy off per battle: give the difference to this poll's battles, newest first,
+            # instead of leaving a phantom 1-trophy battle behind.
+            step = 1 if residual > 0 else -1
+            for i in reversed(fresh_rule[-abs(residual) :]):
+                values[i] += step
+            residual = 0
         if defenses_gain(new.league):
             # Below Legend I the API's trophy count doesn't follow tournament battles (it stays put
             # all week), so trophy changes can't be matched to battles: the battle log, scored by
@@ -651,7 +667,8 @@ class Collector:
                 # No matching battle ever appeared (e.g. a battle type this version doesn't know
                 # yet): record the change the old, inferred way.
                 cursor.pending_delta, cursor.pending_since = 0, None
-                await self._record_inferred(replace(new, trophies=new.trophies - residual), new, now)
+                if not await self._record_late_autofill(new, residual, now):
+                    await self._record_inferred(replace(new, trophies=new.trophies - residual), new, now)
         else:
             cursor.pending_delta, cursor.pending_since = 0, None
         if not missing:
@@ -721,7 +738,20 @@ class Collector:
         for day in sorted({legend_day_id(b.occurred_at) for b in missing}):
             await self._rebuild_legend_day(new.tag, day)
 
-    async def _record_autofill(self, old: PlayerSnap, crossing: Crossing, residual: int) -> None:
+    async def _record_late_autofill(self, p: PlayerSnap, residual: int, now: datetime) -> bool:
+        """A Legend I trophy drop with no battle behind it, first seen shortly after the daily reset:
+        the game's auto defenses for the day that just ended (the API can show them a while after
+        the reset, so they miss the reset check). Recorded on that day if it ended short of its
+        defenses. Returns whether it was recorded."""
+        if residual >= 0 or not is_legend_one(p.league):
+            return False
+        reset = legend_day_bounds(now)[0]
+        if now - reset > LATE_AUTOFILL_WINDOW:
+            return False
+        prev_day = legend_day_id(reset - timedelta(seconds=1))
+        return await self._record_autofill(p, Crossing(day=True, week=False, prev_day=prev_day), residual)
+
+    async def _record_autofill(self, old: PlayerSnap, crossing: Crossing, residual: int) -> bool:
         """Record the defenses the game auto-filled for the legend day that just ended.
 
         Legend I: missing = daily cap (8, or 7 on a promotion day) minus real defenses; each is
@@ -732,13 +762,13 @@ class Collector:
         """
         day = crossing.prev_day
         if day is None or not is_tracked_ranked(old.league):
-            return
+            return False
         tag = old.tag
         rows = await self.db.fetchall(
             "SELECT kind, battle_type FROM legend_events WHERE player_tag = ? AND legend_day = ?", (tag, day)
         )
         if any(r["battle_type"] == "autofill" for r in rows):
-            return
+            return False
         real_defenses = sum(1 for r in rows if r["kind"] == "defense")
         day_start, day_end = legend_day_bounds(datetime.fromisoformat(f"{day}T12:00:00+00:00"))
         if is_legend_one(old.league):
@@ -747,25 +777,25 @@ class Collector:
             )
             count = (daily_attack_cap(old.league, first_day=bool(first_day)) or 0) - real_defenses
             if count <= 0:
-                return
+                return False
             if crossing.week:
                 if not rows:  # no battles that day: shielded or not tracked; nothing to estimate
-                    return
+                    return False
                 avg = await self.db.fetchval(
                     "SELECT AVG(trophies) FROM legend_events WHERE player_tag = ? AND kind = 'defense' "
                     "AND season_id = ? AND (battle_type IS NULL OR battle_type != 'autofill')",
                     (tag, game_season(day_start).id),
                 )
                 if avg is None:
-                    return
+                    return False
                 total = round(avg * count)
             else:
                 if residual >= 0:  # no unexplained loss: shielded day, or nothing was filled
-                    return
+                    return False
                 total = residual
         else:
             if crossing.week or residual <= 0:
-                return
+                return False
             avg = await self.db.fetchval(
                 "SELECT AVG(trophies) FROM legend_events WHERE player_tag = ? AND kind = 'defense' "
                 "AND occurred_at >= ? AND trophies > 0",
@@ -791,6 +821,7 @@ class Collector:
                 (tag, day, game_season(day_start).id, value, running, _iso(at)),
             )
         await self._rebuild_legend_day(tag, day)
+        return True
 
     async def _rebuild_legend_day(self, player_tag: str, day: str) -> None:
         """Start/end trophies for a legend day from its recorded battles."""

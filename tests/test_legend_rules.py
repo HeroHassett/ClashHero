@@ -149,3 +149,66 @@ async def test_first_legend_one_day_has_seven_hits(setup):  # noqa: F811
     await col._poll_player("#A", at(9, 5, 2))
     assert (await day_stats(bot.db, "#A", "2026-11-09")).cap == 7
     assert (await day_stats(bot.db, "#A", "2026-11-10")).cap == 8
+
+
+async def test_rounding_difference_goes_to_the_battle(setup):  # noqa: F811
+    """The API rounds destruction down (95.6% shows as 95), so a 2-star 95% defense can cost 31,
+    not the rule's 30: the battle takes the extra trophy; no phantom 1-trophy battle."""
+    bot, coc, col = setup
+    coc.http = FakeHttp()
+    coc.http.items = [battle("20261107T100000.000Z", opp="#OLD")]
+    coc.player = ranked_player(5000)
+    await col._poll_player("#A", at(7, 11))
+    coc.http.items = [
+        battle("20261107T120000.000Z", attack=False, opp="#D", stars=2, pct=95)
+    ] + coc.http.items
+    coc.player = ranked_player(5000 - 31)
+    await col._poll_player("#A", at(7, 12, 5))
+    rows = await bot.db.fetchall("SELECT opponent_tag, trophies FROM legend_events WHERE kind = 'defense'")
+    assert [(r["opponent_tag"], r["trophies"]) for r in rows] == [("#D", -31)]
+    await col._poll_player("#A", at(7, 13))  # nothing left over to carry or infer later
+    assert await bot.db.fetchval("SELECT COUNT(*) FROM legend_events WHERE battle_time IS NULL") == 0
+
+
+async def test_auto_defense_seen_after_the_reset(setup):  # noqa: F811
+    """The game fills a missing defense at the 05:00 reset, but the API's trophy count can show it
+    a while later: it's still that day's auto defense, not a new defense on the next day."""
+    bot, coc, col = setup
+    coc.http = FakeHttp()
+    log = [battle(f"20261107T{6 + i:02d}0000.000Z", opp=f"#A{i}") for i in range(8)]
+    log += [
+        battle(f"20261107T{14 + i:02d}0000.000Z", attack=False, opp=f"#D{i}", stars=2, pct=81)
+        for i in range(7)
+    ]  # 7 real defenses: one short
+    coc.http.items = list(reversed(log))
+    coc.player = ranked_player(4990)
+    await col._poll_player("#A", at(7, 23, 30))
+    await col._poll_player("#A", at(8, 5, 1))  # reset: no change visible yet
+    coc.player = ranked_player(4961)
+    await col._poll_player("#A", at(8, 5, 15))  # the drop shows up: carried while we wait
+    await col._poll_player("#A", at(8, 5, 46))  # no battle ever appears
+    auto = await bot.db.fetchall(
+        "SELECT legend_day, trophies FROM legend_events WHERE battle_type = 'autofill'"
+    )
+    assert [(r["legend_day"], r["trophies"]) for r in auto] == [("2026-11-07", -29)]
+    assert not (await day_stats(bot.db, "#A", "2026-11-08")).defenses
+    assert len((await day_stats(bot.db, "#A", "2026-11-07")).defenses) == 8
+
+
+async def test_late_drop_on_a_full_day_is_inferred(setup):  # noqa: F811
+    """After a day with all 8 defenses, a drop after the reset is a real (unseen) defense today."""
+    bot, coc, col = setup
+    coc.http = FakeHttp()
+    log = [
+        battle(f"20261107T{10 + i:02d}0000.000Z", attack=False, opp=f"#D{i}", stars=2, pct=81)
+        for i in range(8)
+    ]
+    coc.http.items = list(reversed(log))
+    coc.player = ranked_player(4990)
+    await col._poll_player("#A", at(7, 23, 30))
+    await col._poll_player("#A", at(8, 5, 1))
+    coc.player = ranked_player(4961)
+    await col._poll_player("#A", at(8, 5, 15))
+    await col._poll_player("#A", at(8, 5, 46))
+    assert await bot.db.fetchval("SELECT COUNT(*) FROM legend_events WHERE battle_type = 'autofill'") == 0
+    assert (await day_stats(bot.db, "#A", "2026-11-08")).defenses == [-29]

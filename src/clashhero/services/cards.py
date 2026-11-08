@@ -1315,6 +1315,14 @@ ROW_STYLES: dict[str, dict] = {
         "foot_w": 1.5,
         "top": (252, 193, 177),
     },
+    "auto": {  # the game's "Auto Defense" rows: a cool blue-grey (#c9ccd4), sampled
+        "stops": ((0.0, (196, 199, 208)), (0.1, (201, 204, 212)), (1.0, (203, 206, 214))),
+        "side": (190, 194, 203),
+        "side_w": 1.0,
+        "foot": (214, 216, 224),
+        "foot_w": 1.5,
+        "top": (226, 229, 236),
+    },
     "empty": {  # a pale sunken slot (#c9bfb7 to #dacfca), no shadow
         "stops": ((0.0, (201, 191, 183)), (0.18, (215, 205, 199)), (1.0, (218, 207, 202))),
         "side": (205, 195, 187),
@@ -1338,6 +1346,7 @@ TILE_STYLES: dict[str, dict] = {
         **ROW_STYLES["red"],
         "stops": ((0.0, (225, 157, 142)), (0.5, (216, 174, 161)), (1.0, (199, 135, 121))),
     },
+    "auto": ROW_STYLES["auto"],
     "empty": ROW_STYLES["empty"],
 }
 # The battle log's stars: silver-white with a thin dark outline when earned, mid grey when not.
@@ -1394,9 +1403,9 @@ def legend_day_height(rows: int) -> int:
 def slot_style(battle: ArmyBattle, kind: str) -> str:
     """The game's colours, in the list and the grid alike: gold for a 3-star attack, red for a
     0-star attack or a defense the attacker 3-starred, grey otherwise. Battles without star data
-    go by trophies (a max-trophy attack, a 40-trophy loss); auto-filled defenses are grey."""
+    go by trophies (a max-trophy attack, a 40-trophy loss); the game's auto defenses are blue-grey."""
     if battle.autofill:
-        return "grey"
+        return "auto"
     if kind == "attack":
         if battle.stars is None:
             return "gold" if battle.trophies >= MAX_HIT else "grey"
@@ -1894,8 +1903,11 @@ def _day_slot(canvas, draw, trophy: _TrophyIcon, box, kind: str, battle: ArmyBat
     _game_text(draw, _px(x0 + 418), cy, f"{battle.trophies:+d}", 14, anchor="r")
     name_x = _px(x0 + 6)
     label = "Attack" if kind == "attack" else "Defense"
-    if battle.autofill or not battle.detailed:
-        _game_text(draw, name_x, cy, "Auto-filled" if battle.autofill else label, 14)
+    if battle.autofill:  # as in the game: "Auto Defense", a little indented, no stars or %
+        _game_text(draw, name_x + _px(16), cy, "Auto Defense", 14)
+        return
+    if not battle.detailed:
+        _game_text(draw, name_x, cy, label, 14)
         return
     for i in range(3):
         _game_star(
