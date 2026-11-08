@@ -74,8 +74,8 @@ SEASON_FINISH_POLL_SECONDS = 6 * 60 * 60  # look for newly finished Legend I sea
 LEGEND_LEAGUE_ID = 29000022  # the API's Legend League, whose seasons hold final rankings
 MAX_SEASON_PAGES = 200  # 1000 players a page; a season had about 12k
 # ClashHero's own daily Legend I ranking: read every known Legend I player just before the reset.
-LEGEND_RANK_TIME = dtime(4, 48, tzinfo=UTC)
-LEGEND_RANK_CONCURRENCY = 8  # its own limit, so regular polling keeps going meanwhile
+LEGEND_RANK_TIME = dtime(4, 44, tzinfo=UTC)  # ~12k players took about 9 minutes
+LEGEND_RANK_CONCURRENCY = 10  # its own limit, so regular polling keeps going meanwhile
 LEGEND_RANK_STOP_BEFORE_RESET = timedelta(seconds=30)  # never read post-reset trophies
 
 PlayerSource = Callable[[], Awaitable[Iterable[str]]]
@@ -1158,6 +1158,7 @@ class Collector:
         base = self.coc.http.base_url
         sem = asyncio.Semaphore(LEGEND_RANK_CONCURRENCY)
         found: dict[str, int] = {}
+        read: set[str] = set()
         aborted = False
 
         async def one(tag: str) -> None:
@@ -1167,6 +1168,7 @@ class Collector:
             async with sem:
                 if aborted or datetime.now(UTC) >= stop_at:
                     return
+                read.add(tag)
                 try:
                     data = await self.coc.http.request(coc.http.Route("GET", base, f"/players/{quote(tag)}"))
                 except coc.Maintenance:
@@ -1181,6 +1183,10 @@ class Collector:
         if aborted:
             log.warning("Legend I ranking skipped: the API is in maintenance")
             return []
+        if missed := len(candidates) - len(read):
+            log.warning(
+                "Legend I ranking: %d of %d candidates not read before the reset", missed, len(candidates)
+            )
         return ranks.competition_ranks(found.items())
 
     # ------------------------------------------------------------------ capital raids
