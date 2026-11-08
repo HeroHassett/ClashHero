@@ -2159,27 +2159,37 @@ def _gradient_runs(canvas: Image.Image, x: int, baseline: int, runs: Sequence[Ru
     canvas.paste(gradient, (round(x + left), round(baseline + top)), mask)
 
 
-CLAN_BADGE = 56
-CLAN_NAME_W = 260
+CLAN_BADGE = 84
+CLAN_NAME_W = 300
 
 
 def _season_clan(canvas: Image.Image, draw: ImageDraw.ImageDraw, card: SeasonCard) -> int:
-    """The player's clan, right-aligned in the header: its badge with the name to its left (the
-    name alone without a badge). Returns the block's left edge (drawing scale)."""
+    """The player's clan, right-aligned in the header and mirroring the left side: its badge, and
+    to its left a gold "CLAN" eyebrow over the name in the title's Cinzel gradient (shrunk, then
+    cut, to fit; CJK falls back like the player name). Without a badge, the text alone. Returns
+    the block's left edge (drawing scale)."""
     right = _px(WIDTH - PAD)
-    cy = _px(HEADER_TOP + LOGO_SIZE / 2)
     badge = _contained_image(card.clan_badge, _px(CLAN_BADGE))
     if badge is not None:
         bx = right - badge.width
-        canvas.paste(badge, (bx, cy - badge.height // 2), badge)
-        right = bx - _px(12)
-    fonts = _text_fonts(18, 600)
-    runs = fit_runs(card.clan_name or "", fonts, _px(CLAN_NAME_W))
+        canvas.paste(badge, (bx, _px(HEADER_TOP + LOGO_SIZE / 2) - badge.height // 2), badge)
+        right = bx - _px(16)
+    name = (card.clan_name or "").strip()
+    if not name:
+        return right
+    runs: list[Run] = []
+    for size in range(30, 19, -1):
+        runs = _runs(name, (_cinzel(size), *_fallback_fonts(size)))
+        if _runs_width(runs) <= _px(CLAN_NAME_W):
+            break
+    else:
+        runs = fit_runs(name, (_cinzel(20), *_fallback_fonts(20)), _px(CLAN_NAME_W))
     if not runs:
         return right
     width = _runs_width(runs)
-    _draw_runs(draw, right - width, _baseline(fonts[0], cy), runs, TEXT)
-    return round(right - width)
+    _tracked(draw, right, _px(HEADER_TOP + 18), "CLAN", _inter(13, 600), GOLD, _px(1.9), "right")
+    _gradient_runs(canvas, round(right - width), _px(HEADER_TOP + 58), runs)
+    return round(right - max(width, _inter(13, 600).getlength("CLAN") + _px(1.9) * 3))
 
 
 def _season_header(canvas: Image.Image, draw: ImageDraw.ImageDraw, card: SeasonCard) -> None:
