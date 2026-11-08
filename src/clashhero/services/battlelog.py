@@ -12,6 +12,7 @@ collector splits the trophy delta it observes between polls across the new ranke
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -177,3 +178,44 @@ def army_link(share_code: str | None) -> str | None:
     if not share_code:
         return None
     return f"https://link.clashofclans.com/en?action=CopyArmy&army={share_code}"
+
+
+# ------------------------------------------------------------------ trophies per battle
+
+# Legend I trophies by stars, as a share of destruction %: matches the in-game numbers exactly
+# (e.g. 3★ = 40, 2★ 88% = 28, 1★ 56% = 11). Other ranked tiers aren't confirmed, so their
+# battles use the trophy change observed between polls instead.
+LEGEND_TROPHY_RATE = {1: 0.20, 2: 0.32, 3: 0.40}
+
+
+def legend_trophies(b: Battle) -> int | None:
+    """Signed trophies for a Legend I battle (+ attack, - defense), or None when unknown
+    (other battle types, or 0-star battles)."""
+    rate = LEGEND_TROPHY_RATE.get(b.stars) if b.battle_type == "legend" else None
+    if rate is None:
+        return None
+    value = math.floor(b.destruction * rate + 0.5)
+    return value if b.attack else -value
+
+
+def battle_trophies(battles: Sequence[Battle], fresh_keys: set[str], delta: int) -> list[int]:
+    """Trophies for each battle (oldest first).
+
+    Legend I battles use the stars/destruction rule. For the rest, the observed trophy change
+    ``delta`` (minus what the rule already explains) is split across the battles that are new
+    since the last read; older backfilled battles with no rule get 0.
+    """
+    known = [legend_trophies(b) for b in battles]
+    out = [k or 0 for k in known]
+    open_idx = [
+        i for i, (b, k) in enumerate(zip(battles, known, strict=True)) if k is None and b.key in fresh_keys
+    ]
+    if open_idx:
+        explained = sum(
+            k for b, k in zip(battles, known, strict=True) if k is not None and b.key in fresh_keys
+        )
+        for i, v in zip(
+            open_idx, assign_trophies([battles[i] for i in open_idx], delta - explained), strict=True
+        ):
+            out[i] = v
+    return out

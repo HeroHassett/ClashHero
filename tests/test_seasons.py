@@ -73,3 +73,13 @@ def test_ranked_week():
     assert (w.id, w.start, w.end) == ("2026-11-02", dt(2026, 11, 2, 5), dt(2026, 11, 9, 5))
     assert ranked_week(dt(2026, 11, 9, 4, 59)).id == "2026-11-02"
     assert ranked_week(dt(2026, 11, 9, 5)).id == "2026-11-09"
+
+
+def test_season_label_and_lookup():
+    from clashhero.utils.seasons import season_by_id, season_for_date, season_label
+
+    s = season_for_date("2026-11-03")
+    assert s.id == "2026-11-02" and season_label(s) == "Nov 2 – Nov 30, 2026"
+    assert season_for_date("2026-11").id == "2026-11-02"
+    assert season_for_date("not a date") is None
+    assert season_label(season_by_id("2026-12-28")) == "Dec 28 – Jan 25, 2026–2027"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import Sequence
 from datetime import UTC, datetime
 
@@ -41,15 +42,36 @@ def clan_link(tag: str) -> str:
     return f"https://link.clashofclans.com/?action=OpenClanProfile&tag={tag.lstrip('#')}"
 
 
+_ZERO_WIDTH = {"\u200b", "\u200c", "\u200d", "\u2060", "\ufe0e", "\ufe0f"}
+
+
+def display_width(text: str) -> int:
+    """Columns ``text`` takes in a monospace font: wide East Asian characters and most emoji
+    take 2, combining marks and zero-width characters take 0."""
+    width = 0
+    for ch in text:
+        if ch in _ZERO_WIDTH or unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+
+def pad(text: str, width: int, *, right: bool = False) -> str:
+    """ljust/rjust by display width instead of character count."""
+    fill = " " * max(0, width - display_width(text))
+    return fill + text if right else text + fill
+
+
 def table(rows: Sequence[Sequence[object]], headers: Sequence[str] | None = None) -> str:
-    """Monospace table in a code block, column widths fitted to content."""
+    """Monospace table in a code block, column widths fitted to content (by display width, so
+    names in Chinese, Japanese, Korean or with emoji stay aligned)."""
     data = [list(map(str, r)) for r in rows]
     if headers:
         data.insert(0, list(headers))
     if not data:
         return "```\n(no data)\n```"
-    widths = [max(len(r[i]) for r in data if i < len(r)) for i in range(len(data[0]))]
-    lines = [" ".join(c.ljust(widths[i]) for i, c in enumerate(r)).rstrip() for r in data]
+    widths = [max(display_width(r[i]) for r in data if i < len(r)) for i in range(len(data[0]))]
+    lines = [" ".join(pad(c, widths[i]) for i, c in enumerate(r)).rstrip() for r in data]
     if headers:
         lines.insert(1, " ".join("-" * w for w in widths))
     return "```\n" + "\n".join(lines) + "\n```"

@@ -10,6 +10,7 @@ import discord
 
 from clashhero.repos.legends import BoardEntry, DayStats, Hit, SeasonSummary, WeekDay, has_details
 from clashhero.utils.fmt import chunk_lines, player_link, signed, stars, table, ts
+from clashhero.utils.seasons import season_by_id, season_label
 
 ATTACK_COLOR = discord.Color.green()
 DEFENSE_COLOR = discord.Color.red()
@@ -222,7 +223,9 @@ def season_rows(summary: SeasonSummary) -> list[list[Any]]:
 def season_embed(
     *, name: str, tag: str, season_id: str, summary: SeasonSummary, color: discord.Color | None = None
 ) -> discord.Embed:
-    e = discord.Embed(title=f"{name} · Season ending {season_id}", url=player_link(tag), color=color)
+    e = discord.Embed(
+        title=f"{name} · Season {season_label(season_by_id(season_id))}", url=player_link(tag), color=color
+    )
     if not summary.days:
         e.description = "No legend data recorded for this season."
         return e

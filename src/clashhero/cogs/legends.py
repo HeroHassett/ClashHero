@@ -40,7 +40,15 @@ from clashhero.utils.resolve import (
     resolve_clans,
     resolve_player,
 )
-from clashhero.utils.seasons import game_season, legend_day_bounds, legend_day_id, ranked_week
+from clashhero.utils.seasons import (
+    game_season,
+    legend_day_bounds,
+    legend_day_id,
+    ranked_week,
+    season_by_id,
+    season_for_date,
+    season_label,
+)
 
 log = logging.getLogger(__name__)
 
@@ -634,11 +642,16 @@ class Legends(BaseCog):
         cur = game_season().id
         if cur not in seasons:
             seasons.insert(0, cur)
-        return [app_commands.Choice(name=s, value=s) for s in seasons if current in s][:25]
+        out = []
+        for s in seasons:
+            label = season_label(season_by_id(s))
+            if current.lower() in f"{label} {s}".lower():
+                out.append(app_commands.Choice(name=label, value=s))
+        return out[:25]
 
     @legends.command(name="logs", description="Day-by-day legend stats for a season")
     @app_commands.autocomplete(player=player_autocomplete, season=_season_autocomplete)
-    @app_commands.describe(season="Season start date (YYYY-MM-DD); defaults to the current season")
+    @app_commands.describe(season="Pick a season, or type any date in it (YYYY-MM-DD); default: current")
     async def legends_logs(
         self,
         interaction: discord.Interaction,
@@ -647,7 +660,13 @@ class Legends(BaseCog):
         season: str | None = None,
     ) -> None:
         tag = await self._resolve_player(interaction, player, user)
-        season_id = season or game_season().id
+        if season:
+            window = season_for_date(season)
+            if window is None:
+                raise ResolveError("Pick a season from the list, or type a date like 2026-11-02.")
+            season_id = window.id
+        else:
+            season_id = game_season().id
         summary = await repo.season_summary(self.db, tag, season_id)
         embed = E.season_embed(
             name=await _player_name(self.bot, tag),

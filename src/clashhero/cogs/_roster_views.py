@@ -20,7 +20,7 @@ from clashhero.repos import roster_scoring as scoring
 from clashhero.repos import rosters as repo
 from clashhero.services.outbox import send_server_log, send_to_channel
 from clashhero.utils.checks import has_permission
-from clashhero.utils.fmt import chunk_lines, make_embed, ts
+from clashhero.utils.fmt import chunk_lines, display_width, make_embed, pad, ts
 
 log = logging.getLogger(__name__)
 
@@ -380,13 +380,13 @@ def suggestion_table_lines(scored: Sequence[scoring.Scored], size: int, substitu
     """Monospace table lines (no code fences) with section markers for the picks."""
     shown = list(scored[:SUGGEST_MAX_ROWS])
     rows = [suggestion_row(i, s) for i, s in enumerate(shown, 1)]
-    widths = [max(len(r[i]) for r in [list(SUGGEST_HEADERS), *rows]) for i in range(len(SUGGEST_HEADERS))]
+    widths = [
+        max(display_width(r[i]) for r in [list(SUGGEST_HEADERS), *rows]) for i in range(len(SUGGEST_HEADERS))
+    ]
     right = {0, 2, 3, 4, 5, 6, 7, 8, 9}
 
     def fmt(cells: Sequence[str]) -> str:
-        return " ".join(
-            c.rjust(widths[i]) if i in right else c.ljust(widths[i]) for i, c in enumerate(cells)
-        ).rstrip()
+        return " ".join(pad(c, widths[i], right=i in right) for i, c in enumerate(cells)).rstrip()
 
     lines = [fmt(SUGGEST_HEADERS)]
     for i, row in enumerate(rows):

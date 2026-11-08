@@ -61,6 +61,29 @@ def previous_game_season(now: datetime | None = None, anchor: datetime | None = 
     return game_season(cur.start - timedelta(seconds=1), anchor)
 
 
+def season_label(season: Window) -> str:
+    """'Nov 2 – Nov 30, 2026' (the last day shown is the day the season resets)."""
+    s, e = season.start, season.end
+    year = f", {e.year}" if s.year == e.year else f", {s.year}–{e.year}"
+    return f"{s:%b} {s.day} – {e:%b} {e.day}{year}"
+
+
+def season_for_date(raw: str) -> Window | None:
+    """The season containing a typed date ('2026-11-03', '2026-11'), or None if unparseable."""
+    raw = raw.strip()
+    try:
+        day = datetime.fromisoformat(raw) if len(raw) > 7 else datetime.fromisoformat(f"{raw}-15")
+    except ValueError:
+        return None
+    if day.tzinfo is None:
+        day = day.replace(tzinfo=UTC)
+    return game_season(day.replace(hour=12))
+
+
+def season_by_id(season_id: str) -> Window:
+    return season_for_date(season_id) or game_season()
+
+
 # Ranked/legend tournaments share the 28-day cycle.
 legend_season = game_season
 

@@ -31,7 +31,7 @@ from clashhero.services.battlelog import (
     PENDING_TIMEOUT,
     Battle,
     Cursor,
-    assign_trophies,
+    battle_trophies,
     note_unknown_types,
     parse_battles,
     take_new,
@@ -357,7 +357,9 @@ class Collector:
             return
         new = PlayerSnap.from_coc(player)
         old = self._players.get(tag)
-        ranked_new: list[Battle] | None = None
+        logged: tuple[list[Battle], set[str]] | None = (
+            None  # (ranked battles in log, keys new since last read)
+        )
         if self._wants_battlelog(tag, old, new, now):
             battles = await self._fetch_battlelog(tag)
             if battles is not None:
@@ -365,11 +367,13 @@ class Collector:
                 fresh, cursor = take_new(battles, self._battle_cursors.get(tag))
                 self._battle_cursors[tag] = cursor
                 note_unknown_types(fresh)
-                ranked_new = [b for b in fresh if b.ranked]
+                logged = ([b for b in battles if b.ranked], {b.key for b in fresh})
         async with self.db.batch():
             await self._store_player(new, now)
+            if logged is not None:
+                await self._sync_battles(old, new, *logged, now)
             if old is not None:
-                await self._apply_player_diff(old, new, now, ranked_new)
+                await self._apply_player_diff(old, new, now, battle_log_read=logged is not None)
             else:
                 await self._ensure_name(new, now)
             await self._update_legend_day(new, now)
@@ -444,7 +448,7 @@ class Collector:
         )
 
     async def _apply_player_diff(
-        self, old: PlayerSnap, new: PlayerSnap, now: datetime, ranked_new: list[Battle] | None = None
+        self, old: PlayerSnap, new: PlayerSnap, now: datetime, *, battle_log_read: bool = False
     ) -> None:
         clan = new.clan_tag
         if old.clan_tag != new.clan_tag:
@@ -497,10 +501,8 @@ class Collector:
         if has_activity(old, new):
             await self._record_activity(new.tag, clan, now)
 
-        if ranked_new is not None:
-            await self._record_logged_battles(old, new, ranked_new, now)
-            return
-        await self._record_inferred(old, new, now)
+        if not battle_log_read:  # battle log unavailable this poll: infer from the trophy change
+            await self._record_inferred(old, new, now)
 
     async def _record_inferred(self, old: PlayerSnap, new: PlayerSnap, now: datetime) -> None:
         clan = new.clan_tag
@@ -518,34 +520,78 @@ class Collector:
                 )
                 self.dispatch(ev.LegendBattle(new.tag, new.name, clan, b.kind, b.trophies, running, now, day))
 
-    async def _record_logged_battles(
-        self, old: PlayerSnap, new: PlayerSnap, battles: list[Battle], now: datetime
+    async def _sync_battles(
+        self,
+        old: PlayerSnap | None,
+        new: PlayerSnap,
+        ranked_log: list[Battle],
+        fresh_keys: set[str],
+        now: datetime,
     ) -> None:
-        """Record ranked battles from the battle log, splitting the observed trophy change across
-        them. Trophy changes seen before their battles appear are carried until they do."""
+        """Make legend_events match the player's battle log for the current season.
+
+        Records every ranked battle in the log that isn't stored yet: on first sight this
+        backfills the last ~2 days, and it also fills gaps after downtime. Alerts are dispatched
+        only for battles that are new since the previous read. Trophies come from the Legend I
+        rule, or from the observed trophy change for other tiers; a change seen before its
+        battle appears is carried until it does.
+        """
         cursor = self._battle_cursors[new.tag]
-        delta = new.trophies - old.trophies
-        plausible = old.league == new.league and abs(delta) <= MAX_PLAUSIBLE_DELTA
-        if not battles:
+        season_start = game_season(now).start
+        ranked = sorted((b for b in ranked_log if b.occurred_at >= season_start), key=lambda b: b.timestamp)
+        delta = new.trophies - old.trophies if old is not None else 0
+        plausible = old is not None and old.league == new.league and abs(delta) <= MAX_PLAUSIBLE_DELTA
+        existing: dict[str, int] = {}
+        if ranked:
+            rows = await self.db.fetchall(
+                "SELECT battle_time, kind, opponent_tag, trophies FROM legend_events "
+                "WHERE player_tag = ? AND battle_time IS NOT NULL AND battle_time >= ?",
+                (new.tag, ranked[0].timestamp),
+            )
+            existing = {
+                f"{r['battle_time']}|{'A' if r['kind'] == 'attack' else 'D'}|{r['opponent_tag']}": r[
+                    "trophies"
+                ]
+                for r in rows
+            }
+        missing = [b for b in ranked if b.key not in existing]
+        fresh_missing = [b for b in missing if b.key in fresh_keys]
+
+        if not fresh_missing:
+            # Trophies may have moved before the battle shows up in the log: carry the change.
             if plausible and delta:
                 cursor.pending_delta += delta
                 cursor.pending_since = cursor.pending_since or _iso(now)
                 if abs(cursor.pending_delta) > MAX_PLAUSIBLE_DELTA:
                     cursor.pending_delta, cursor.pending_since = 0, None
-            if cursor.pending_delta and cursor.pending_since:
+            if cursor.pending_delta and cursor.pending_since and old is not None:
                 if now - datetime.fromisoformat(cursor.pending_since) >= PENDING_TIMEOUT:
-                    # Trophies moved but no matching battle ever appeared (for example a battle
-                    # type this version doesn't know yet): record it the old, inferred way.
+                    # No matching battle ever appeared (e.g. a battle type this version doesn't
+                    # know yet): record the change the old, inferred way.
                     pending = cursor.pending_delta
                     cursor.pending_delta, cursor.pending_since = 0, None
                     await self._record_inferred(replace(new, trophies=new.trophies - pending), new, now)
+            total = 0
+        else:
+            total = cursor.pending_delta + (delta if plausible else 0)
+            cursor.pending_delta, cursor.pending_since = 0, None
+        if not missing:
             return
-        total = cursor.pending_delta + (delta if plausible else 0)
-        cursor.pending_delta, cursor.pending_since = 0, None
-        trophies = assign_trophies(battles, total)
-        running = new.trophies - sum(trophies)
-        for b, t in zip(battles, trophies, strict=True):
-            running += t
+
+        values = battle_trophies(missing, fresh_keys, total)
+        trophies = {**existing, **{b.key: v for b, v in zip(missing, values, strict=True)}}
+        after: dict[str, int] = {}
+        running = new.trophies
+        for b in reversed(ranked):  # walk back from the current trophy count
+            after[b.key] = running
+            running -= trophies.get(b.key, 0)
+
+        # Trophy-change guesses covering the same window are superseded by the real battles.
+        await self.db.execute(
+            "DELETE FROM legend_events WHERE player_tag = ? AND battle_time IS NULL AND occurred_at >= ?",
+            (new.tag, _iso(missing[0].occurred_at - timedelta(minutes=15))),
+        )
+        for b, t in zip(missing, values, strict=True):
             at = b.occurred_at
             day = legend_day_id(at)
             event_id = await self.db.execute(
@@ -559,7 +605,7 @@ class Collector:
                     game_season(at).id,
                     b.kind,
                     t,
-                    running,
+                    after[b.key],
                     _iso(at),
                     b.battle_type,
                     b.opponent_tag,
@@ -571,26 +617,46 @@ class Collector:
                     b.timestamp,
                 ),
             )
-            self.dispatch(
-                ev.LegendBattle(
-                    new.tag,
-                    new.name,
-                    new.clan_tag,
-                    b.kind,
-                    t,
-                    running,
-                    at,
-                    day,
-                    event_id=event_id,
-                    battle_type=b.battle_type,
-                    opponent_tag=b.opponent_tag,
-                    opponent_name=b.opponent_name,
-                    opponent_th=b.opponent_th,
-                    stars=b.stars,
-                    destruction=b.destruction,
-                    army_share_code=b.army_share_code,
+            if b.key in fresh_keys:
+                self.dispatch(
+                    ev.LegendBattle(
+                        new.tag,
+                        new.name,
+                        new.clan_tag,
+                        b.kind,
+                        t,
+                        after[b.key],
+                        at,
+                        day,
+                        event_id=event_id,
+                        battle_type=b.battle_type,
+                        opponent_tag=b.opponent_tag,
+                        opponent_name=b.opponent_name,
+                        opponent_th=b.opponent_th,
+                        stars=b.stars,
+                        destruction=b.destruction,
+                        army_share_code=b.army_share_code,
+                    )
                 )
-            )
+        for day in sorted({legend_day_id(b.occurred_at) for b in missing}):
+            await self._rebuild_legend_day(new.tag, day)
+
+    async def _rebuild_legend_day(self, player_tag: str, day: str) -> None:
+        """Start/end trophies for a legend day from its recorded battles."""
+        rows = await self.db.fetchall(
+            "SELECT trophies, trophies_after, season_id FROM legend_events "
+            "WHERE player_tag = ? AND legend_day = ? ORDER BY occurred_at, id",
+            (player_tag, day),
+        )
+        if not rows:
+            return
+        start = rows[0]["trophies_after"] - rows[0]["trophies"]
+        await self.db.execute(
+            "INSERT INTO legend_days (player_tag, legend_day, season_id, start_trophies, end_trophies) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT (player_tag, legend_day) DO UPDATE SET "
+            "start_trophies = excluded.start_trophies, end_trophies = excluded.end_trophies",
+            (player_tag, day, rows[0]["season_id"], start, rows[-1]["trophies_after"]),
+        )
 
     async def _update_legend_day(self, p: PlayerSnap, now: datetime) -> None:
         if not is_tracked_ranked(p.league):

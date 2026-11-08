@@ -261,16 +261,16 @@ def legend_player(trophies, units=None, supers=(), clan="#C"):
     return p
 
 
-def battle(ts, attack=True, opp="#O"):
+def battle(ts, attack=True, opp="#O", kind="legend", stars=3, pct=100):
     return {
         "battleTimestamp": ts,
-        "battleType": "legend",
+        "battleType": kind,
         "attack": attack,
         "opponentPlayerTag": opp,
         "opponentName": "Opp",
         "opponentTownHallLevel": 17,
-        "stars": 3,
-        "destructionPercentage": 100,
+        "stars": stars,
+        "destructionPercentage": pct,
         "armyShareCode": "u1x2",
     }
 
@@ -280,15 +280,20 @@ async def test_battle_log_records_exact_battles(setup):
     coc.http = FakeHttp()
     coc.http.items = [battle("20261107T110000.000Z", opp="#OLD")]
     coc.player = legend_player(5000)
-    await col._poll_player("#A", NOW)  # baseline: old battle not reported
-    coc.http.items = [battle("20261107T120030.000Z", opp="#NEW")] + coc.http.items
-    coc.player = legend_player(5038)
+    await col._poll_player("#A", NOW)  # first sight: old battle backfilled silently, no alert
+    assert not [e for n, e in bot.events if n == "clash_legend_battle"]
+    old = await bot.db.fetchone("SELECT * FROM legend_events WHERE opponent_tag = '#OLD'")
+    assert (old["trophies"], old["trophies_after"]) == (40, 5000)
+    coc.http.items = [battle("20261107T120030.000Z", opp="#NEW", stars=2, pct=88)] + coc.http.items
+    coc.player = legend_player(5028)
     await col._poll_player("#A", NOW + timedelta(minutes=1))
     (e,) = [e for n, e in bot.events if n == "clash_legend_battle"]
-    assert (e.kind, e.trophies, e.trophies_after, e.opponent_tag, e.stars) == ("attack", 38, 5038, "#NEW", 3)
+    assert (e.kind, e.trophies, e.trophies_after, e.opponent_tag, e.stars) == ("attack", 28, 5028, "#NEW", 2)
     assert e.from_battle_log and e.event_id
-    row = await bot.db.fetchone("SELECT * FROM legend_events")
-    assert (row["opponent_tag"], row["army_share_code"], row["legend_day"]) == ("#NEW", "u1x2", "2026-11-07")
+    row = await bot.db.fetchone("SELECT * FROM legend_events WHERE opponent_tag = '#NEW'")
+    assert (row["army_share_code"], row["legend_day"]) == ("u1x2", "2026-11-07")
+    await col._poll_player("#A", NOW + timedelta(minutes=2))  # re-reading the log adds nothing
+    assert await bot.db.fetchval("SELECT COUNT(*) FROM legend_events") == 2
 
 
 async def test_trophies_before_battle_appears_are_carried(setup):
@@ -300,7 +305,8 @@ async def test_trophies_before_battle_appears_are_carried(setup):
     coc.player = legend_player(4984)  # trophies dropped, battle log not updated yet
     await col._poll_player("#A", NOW + timedelta(minutes=1))
     assert not [e for n, e in bot.events if n == "clash_legend_battle"]
-    coc.http.items = [battle("20261107T120000.000Z", attack=False, opp="#D")] + coc.http.items
+    # A lower-tier ("ranked") battle: no trophy rule, so the carried change is used.
+    coc.http.items = [battle("20261107T120000.000Z", attack=False, opp="#D", kind="ranked")] + coc.http.items
     await col._poll_player("#A", NOW + timedelta(minutes=12))  # periodic re-check finds it
     (e,) = [e for n, e in bot.events if n == "clash_legend_battle"]
     assert (e.kind, e.trophies, e.opponent_tag) == ("defense", -16, "#D")
