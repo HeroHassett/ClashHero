@@ -2740,3 +2740,180 @@ badge_cache = BadgeCache()
 
 async def fetch_badges(urls: Iterable[str | None]) -> dict[str, bytes | None]:
     return await badge_cache.fetch(urls)
+
+
+# ------------------------------------------------------------------ clan activity (/clan activity)
+
+
+@dataclass(frozen=True)
+class ActivityCard:
+    """One or more clans' activity by local hour of day.
+
+    ``buckets``: 24 counts, hour 0 first; ``tz``: the label for those hours ("UTC+02:00");
+    ``badge``: the clan badge (PNG/JPEG bytes) when it's a single clan."""
+
+    title: str
+    tags: str
+    buckets: tuple[int, ...]
+    tz: str
+    days: int = 7
+    badge: bytes | None = None
+
+
+ACT_TILES_TOP = 150
+ACT_TILE_H = 86
+ACT_CHART_TOP = ACT_TILES_TOP + ACT_TILE_H + 14
+ACT_CHART_H = 380
+ACT_HEIGHT = ACT_CHART_TOP + ACT_CHART_H + 28
+ACT_PLOT_L = PAD + 64  # y labels sit left of this
+ACT_PLOT_R = WIDTH - PAD - 26
+ACT_PLOT_TOP = ACT_CHART_TOP + 62  # room for the panel's heading and the peak label
+ACT_PLOT_BOTTOM = ACT_CHART_TOP + ACT_CHART_H - 46  # room for the hour labels
+ACT_BAR_FILL = 0.68  # share of an hour's slot the bar takes
+ACT_BADGE = 84
+
+
+def nice_ticks(top: int, target: int = 4) -> list[int]:
+    """Gridline values from 0 to at least ``top``: steps of 1, 2 or 5 x 10^n, about ``target``
+    of them (``top`` 0 gives [0, 1])."""
+    if top <= 0:
+        return [0, 1]
+    raw = top / target
+    mag = 10 ** math.floor(math.log10(raw)) if raw >= 1 else 1
+    step = next(m * mag for m in (1, 2, 5, 10) if m * mag >= raw)
+    return list(range(0, math.ceil(top / step) * step + 1, step))
+
+
+def busiest_window(buckets: Sequence[int], width: int = 3) -> int:
+    """First hour of the busiest ``width``-hour stretch (wrapping past midnight)."""
+    n = len(buckets)
+    return max(range(n), key=lambda h: (sum(buckets[(h + i) % n] for i in range(width)), -h))
+
+
+def render_activity(card: ActivityCard) -> bytes:
+    """PNG: header (logo, clan, hours' time zone, badge), three stat tiles, then a bar per hour."""
+    with _RENDER_LOCK:
+        image = _render_activity(card)
+    buf = io.BytesIO()
+    image.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _render_activity(card: ActivityCard) -> Image.Image:
+    buckets = list(card.buckets) + [0] * (24 - len(card.buckets))
+    buckets = buckets[:24]
+    canvas = Image.new("RGB", (_px(WIDTH), _px(ACT_HEIGHT)), BG)
+    draw = ImageDraw.Draw(canvas, "RGBA")
+    _backdrop(canvas)
+    _activity_header(canvas, draw, card)
+
+    total = sum(buckets)
+    peak = max(range(24), key=lambda h: (buckets[h], -h))
+    start = busiest_window(buckets)
+    tile_w = (WIDTH - 2 * PAD - 2 * STAT_GAP) / 3
+    tiles = [
+        ("ACTIONS", f"{total:,}", f"about {round(total / card.days):,} a day" if total else None),
+        ("BUSIEST HOUR", f"{peak:02d}:00" if total else "—", f"{buckets[peak]:,} actions" if total else None),
+        (
+            "BUSIEST 3 HOURS",
+            f"{start:02d}:00–{(start + 3) % 24:02d}:00" if total else "—",
+            f"{sum(buckets[(start + i) % 24] for i in range(3)):,} actions" if total else None,
+        ),
+    ]
+    for i, (label, value, aside) in enumerate(tiles):
+        _activity_tile(canvas, draw, PAD + i * (tile_w + STAT_GAP), tile_w, label, value, aside)
+
+    _card_panel(canvas, ACT_CHART_TOP, ACT_CHART_H)
+    _tracked(
+        draw,
+        _px(PAD + 22),
+        _px(ACT_CHART_TOP + 34),
+        f"ACTIONS BY HOUR · {card.tz}".upper(),
+        _inter(12, 700),
+        DIM,
+        _px(1.6),
+        "left",
+    )
+    _activity_bars(draw, buckets, peak if total else None)
+    return canvas.resize((WIDTH, ACT_HEIGHT), Image.Resampling.LANCZOS)
+
+
+def _activity_header(canvas: Image.Image, draw: ImageDraw.ImageDraw, card: ActivityCard) -> None:
+    _draw_logo(canvas, draw)
+    x = _px(PAD + LOGO_SIZE + 24)
+    right = _px(WIDTH - PAD)
+    badge = _contained_image(card.badge, _px(ACT_BADGE))
+    if badge is not None:
+        bx = right - badge.width
+        canvas.paste(badge, (bx, _px(HEADER_TOP + LOGO_SIZE / 2) - badge.height // 2), badge)
+        right = bx - _px(24)
+    max_w = right - x
+    _tracked(draw, x, _px(HEADER_TOP + 18), "CLAN ACTIVITY", _inter(13, 600), GOLD, _px(1.9), "left")
+    name = card.title.strip() or card.tags
+    runs: list[Run] = []
+    for size in range(34, 23, -1):
+        runs = _runs(name, (_cinzel(size), *_fallback_fonts(size)))
+        if _runs_width(runs) <= max_w:
+            break
+    else:
+        runs = fit_runs(name, (_cinzel(24), *_fallback_fonts(24)), max_w)
+    _gradient_runs(canvas, x, _px(HEADER_TOP + 58), runs)
+    sub = f"{card.tags} · last {card.days} days"
+    _draw_runs(draw, x, _px(HEADER_TOP + 88), fit_runs(sub, _text_fonts(17, 500), max_w), MUTED)
+
+
+def _activity_tile(canvas, draw, left: float, width: float, label: str, value: str, aside: str | None):
+    """A stat panel: a tracked label over a big value, with ``aside`` in small text after it."""
+    box = (_px(left), _px(ACT_TILES_TOP), _px(left + width), _px(ACT_TILES_TOP + ACT_TILE_H))
+    _panel(canvas, box, _px(RADIUS), _row_fill(box[2] - box[0], box[3] - box[1]), BORDER, _px(1))
+    _tracked(draw, _px(left + 18), _px(ACT_TILES_TOP + 28), label, _inter(12, 700), DIM, _px(1.6), "left")
+    font = _inter(30, 700)
+    base = _baseline(font, _px(ACT_TILES_TOP + 58))
+    draw.text((_px(left + 18), base), value, font=font, fill=TEXT, anchor="ls")
+    if aside:
+        vx = _px(left + 18) + font.getlength(value) + _px(10)
+        draw.text((vx, base), aside, font=_inter(15, 500), fill=MUTED, anchor="ls")
+
+
+def _activity_bars(draw: ImageDraw.ImageDraw, buckets: Sequence[int], peak: int | None) -> None:
+    """Recessive gridlines with their values, one bar per hour (rounded top, square base), the
+    busiest hour brighter with its count above it, and every third hour labelled below."""
+    ticks = nice_ticks(max(buckets))
+    top_value = ticks[-1]
+    plot_h = ACT_PLOT_BOTTOM - ACT_PLOT_TOP
+    small = _inter(13, 500)
+
+    def y_of(v: float) -> float:
+        return _px(ACT_PLOT_BOTTOM - plot_h * v / top_value)
+
+    for v in ticks:
+        y = y_of(v)
+        line = (*BORDER, 255) if v == 0 else (*BORDER, 150)
+        draw.line((_px(ACT_PLOT_L), y, _px(ACT_PLOT_R), y), fill=line, width=_px(1))
+        draw.text((_px(ACT_PLOT_L - 12), _baseline(small, y)), f"{v:,}", font=small, fill=DIM, anchor="rs")
+
+    slot = (ACT_PLOT_R - ACT_PLOT_L) / 24
+    bar_w = slot * ACT_BAR_FILL
+    for h, n in enumerate(buckets):
+        cx = ACT_PLOT_L + slot * (h + 0.5)
+        x0, x1 = _px(cx - bar_w / 2), _px(cx + bar_w / 2)
+        base = y_of(0)
+        if n:
+            color = GOLD_LIGHT if h == peak else GOLD
+            top = min(y_of(n), base - _px(3))
+            draw.rounded_rectangle(
+                (x0, top, x1, base), radius=_px(4), fill=color, corners=(True, True, False, False)
+            )
+        else:
+            draw.rectangle((x0, base - _px(2), x1, base), fill=(*SAME, 160))  # a stub: no activity
+        if h % 3 == 0:
+            label_font = _inter(13, 600)
+            draw.text(
+                (_px(cx), _px(ACT_PLOT_BOTTOM + 28)), f"{h:02d}:00", font=label_font, fill=MUTED, anchor="ms"
+            )
+    if peak is not None:
+        cx = ACT_PLOT_L + slot * (peak + 0.5)
+        font = _inter(15, 700)
+        draw.text(
+            (_px(cx), y_of(buckets[peak]) - _px(10)), f"{buckets[peak]:,}", font=font, fill=TEXT, anchor="ms"
+        )

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import io
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -29,6 +32,7 @@ from clashhero.cogs._info_embeds import (
 )
 from clashhero.constants import CLAN_TYPE_LABELS, WAR_FREQUENCY_LABELS
 from clashhero.repos import ranks, stats
+from clashhero.services import cards
 from clashhero.services.emojis import EMOJIS
 from clashhero.utils.fmt import clan_link, make_embed, player_link, role_name, table, ts
 from clashhero.utils.ranked import league_icon, league_name
@@ -39,6 +43,8 @@ from clashhero.utils.resolve import (
     resolve_player,
 )
 from clashhero.utils.seasons import game_season, previous_game_season
+
+log = logging.getLogger(__name__)
 
 SEASON_CHOICES = [
     app_commands.Choice(name="Current season", value="current"),
@@ -301,6 +307,10 @@ class Info(BaseCog):
         buckets = activity_histogram(rows, offset)
         sign = "+" if offset >= 0 else "-"
         tz = f"UTC{sign}{abs(offset) // 60:02d}:{abs(offset) % 60:02d}"
+        image = await self._activity_image(tags, buckets, tz)
+        if image is not None:
+            await interaction.response.send_message(file=image)
+            return
         e = await make_embed(
             self.bot,
             interaction.guild_id,
@@ -309,6 +319,22 @@ class Info(BaseCog):
         )
         e.set_footer(text=f"Last 7 days, hours in {tz}")
         await interaction.response.send_message(embed=e)
+
+    async def _activity_image(self, tags: list[str], buckets: list[int], tz: str) -> discord.File | None:
+        """The activity chart as an image, or None (logged) if it can't be drawn."""
+        try:
+            title, badge = f"{len(tags)} clans", None
+            if len(tags) == 1:
+                row = await self.db.get_clan_row(tags[0])
+                title = (row["name"] if row else None) or tags[0]
+                url = row["badge_url"] if row else None
+                badge = (await cards.fetch_badges([url])).get(url) if url else None
+            card = cards.ActivityCard(title, ", ".join(tags), tuple(buckets), tz, badge=badge)
+            png = await asyncio.to_thread(cards.render_activity, card)
+        except Exception:
+            log.exception("Couldn't draw the activity chart for %s", tags)
+            return None
+        return discord.File(io.BytesIO(png), filename="clan-activity.png")
 
     @clan.command(name="history", description="A player's join/leave history across tracked clans")
     @app_commands.autocomplete(player=player_autocomplete)
