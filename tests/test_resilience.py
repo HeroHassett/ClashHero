@@ -138,3 +138,39 @@ async def test_bot_uses_the_running_event_loop():
 
     bot = ClashHeroBot(Config("t", "e", "p", "k", Path(":memory:"), None, 60, 60, 120, 600, "INFO"))
     assert bot.coc.loop is asyncio.get_running_loop()
+
+
+def test_home_units_reads_raw_and_survives_unknown_levels():
+    from clashhero.services.snapshots import home_units
+
+    raw = {
+        "heroes": [
+            {"name": "Barbarian King", "level": 100, "village": "home"},
+            {"name": "Battle Machine", "level": 35, "village": "builderBase"},
+        ],
+        "heroEquipment": [{"name": "Giant Gauntlet", "level": 27, "village": "home"}],
+        "troops": [
+            {"name": "L.A.S.S.I", "level": 15, "village": "home"},
+            {"name": "Barbarian", "level": 13, "village": "home"},
+            {"name": "Super Barbarian", "level": 13, "village": "home"},
+        ],
+    }
+    p = NS(_raw_data=raw)
+    assert home_units(p, "heroes") == [("Barbarian King", 100)]
+    assert home_units(p, "equipment") == [("Giant Gauntlet", 27)]
+    assert home_units(p, "pets") == [("L.A.S.S.I", 15)]
+    assert home_units(p, "troops") == [("Barbarian", 13)]
+
+    class Stale:  # coc.py model whose bundled data is older than the game
+        @property
+        def pets(self):
+            raise IndexError("list index out of range")
+
+    assert home_units(Stale(), "pets") == []
+
+
+def test_cogs_dont_answer_errors_twice():
+    from clashhero.cogs._base import BaseCog
+
+    # The bot-wide tree.on_error replies; a cog-level handler would make Discord.py reply twice.
+    assert "cog_app_command_error" not in BaseCog.__dict__

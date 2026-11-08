@@ -23,6 +23,7 @@ from clashhero.cogs._info_embeds import (
 )
 from clashhero.constants import CLAN_TYPE_LABELS, WAR_FREQUENCY_LABELS
 from clashhero.repos import stats
+from clashhero.services.snapshots import home_units
 from clashhero.utils.fmt import chunk_lines, clan_link, make_embed, player_link, role_name, table, ts
 from clashhero.utils.ranked import league_icon, league_name
 from clashhero.utils.resolve import (
@@ -354,26 +355,18 @@ class Info(BaseCog):
             e.add_field(
                 name="Clan", value=f"[{p.clan.name}]({clan_link(p.clan.tag)}) · {role_name(_enum(p.role))}"
             )
-        e.add_field(name="Attacks / Defenses won", value=f"{p.attack_wins} / {p.defense_wins}")
+        if p.attack_wins or p.defense_wins:  # the API reports 0/0 for everyone since the ranked rework
+            e.add_field(name="Attacks / Defenses won", value=f"{p.attack_wins} / {p.defense_wins}")
         e.add_field(name="Capital Gold", value=f"{getattr(p, 'clan_capital_contributions', 0) or 0:,}")
 
-        heroes = [h for h in (p.heroes or []) if getattr(h, "is_home_base", True)]
-        if heroes:
-            e.add_field(
-                name="Heroes", value=" · ".join(f"{h.name} {h.level}" for h in heroes)[:1024], inline=False
-            )
-        equipment = getattr(p, "equipment", None) or []
-        if equipment:
-            e.add_field(
-                name="Equipment",
-                value=", ".join(f"{q.name} {q.level}" for q in equipment)[:1024],
-                inline=False,
-            )
-        pets = getattr(p, "pets", None) or []
-        if pets:
-            e.add_field(
-                name="Pets", value=", ".join(f"{q.name} {q.level}" for q in pets)[:1024], inline=False
-            )
+        for title, kind, sep in (
+            ("Heroes", "heroes", " · "),
+            ("Equipment", "equipment", ", "),
+            ("Pets", "pets", ", "),
+        ):
+            units = home_units(p, kind)
+            if units:
+                e.add_field(name=title, value=sep.join(f"{n} {lvl}" for n, lvl in units)[:1024], inline=False)
 
         link = await self.db.get_link(p.tag)
         if link:

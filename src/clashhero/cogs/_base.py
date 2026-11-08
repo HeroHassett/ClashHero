@@ -1,4 +1,6 @@
-"""Common base for feature cogs: shortcuts plus uniform, friendly error handling."""
+"""Common base for feature cogs, plus the friendly error replies used by the bot-wide handler
+(bot.tree.on_error = send_error). Cogs don't add their own handler: Discord.py calls both, which
+would answer an error twice."""
 
 from __future__ import annotations
 
@@ -37,11 +39,6 @@ class BaseCog(commands.Cog):
         return self.bot.collector
 
     parse_tag = staticmethod(parse_tag)
-
-    async def cog_app_command_error(
-        self, interaction: discord.Interaction, error: app_commands.AppCommandError
-    ) -> None:
-        await send_error(interaction, error)
 
 
 def error_message(error: BaseException) -> str | None:

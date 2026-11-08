@@ -377,3 +377,41 @@ def diff_settings(old: dict[str, Any], new: dict[str, Any]) -> list[tuple[str, A
     if not old or not new:
         return []
     return [(k, old[k], new[k]) for k in sorted(new) if k in old and old[k] != new[k]]
+
+
+_RAW_UNIT_KEYS = {"heroes": "heroes", "equipment": "heroEquipment", "spells": "spells", "troops": "troops"}
+_MODEL_UNIT_ATTRS = {
+    "heroes": "heroes",
+    "equipment": "equipment",
+    "pets": "pets",
+    "spells": "spells",
+    "troops": "home_troops",
+}
+
+
+def home_units(player: Any, kind: str) -> list[tuple[str, int]]:
+    """(name, level) for a player's home-village heroes, equipment, pets, spells or troops.
+
+    Reads the raw API payload, so units or levels newer than coc.py's bundled game data can't
+    break it (coc.py's own Player.heroes/.pets/... raise on levels it doesn't know). Troops exclude
+    pets and super troops.
+    """
+    raw = getattr(player, "_raw_data", None)
+    if isinstance(raw, dict):
+        if kind == "pets":
+            items = [u for u in raw.get("troops") or [] if u.get("name") in PETS_ORDER]
+        else:
+            items = raw.get(_RAW_UNIT_KEYS[kind]) or []
+            if kind == "troops":
+                skip = set(PETS_ORDER) | set(SUPER_TROOP_ORDER)
+                items = [u for u in items if u.get("name") not in skip]
+        return [
+            (u["name"], int(u.get("level") or 0))
+            for u in items
+            if u.get("name") and u.get("village", "home") == "home"
+        ]
+    try:
+        units = getattr(player, _MODEL_UNIT_ATTRS[kind], None) or []
+    except Exception:  # coc.py can't parse a level it doesn't know
+        return []
+    return [(u.name, u.level) for u in units if getattr(u, "is_home_base", True)]

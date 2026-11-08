@@ -19,6 +19,7 @@ from clashhero.cogs._base import send_error
 from clashhero.repos import roster_scoring as scoring
 from clashhero.repos import rosters as repo
 from clashhero.services.outbox import send_server_log, send_to_channel
+from clashhero.services.snapshots import home_units
 from clashhero.utils.checks import has_permission
 from clashhero.utils.fmt import chunk_lines, display_width, make_embed, pad, ts
 
@@ -58,7 +59,7 @@ async def player_info(bot, tag: str) -> dict[str, Any] | None:
     except coc.HTTPException as e:
         log.warning("Player lookup failed for %s: %s", tag, e)
         return None
-    heroes = sum(h.level for h in (p.heroes or []) if getattr(h, "is_home_base", True))
+    heroes = sum(level for _, level in home_units(p, "heroes"))
     return {"name": p.name, "town_hall": p.town_hall, "heroes_total": heroes}
 
 
