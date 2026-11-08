@@ -267,3 +267,30 @@ def test_profile_fits_field_limits():
     assert by_name["🐾 Pets"] == "Unicorn `10`"
     assert by_name["🛡️ Equipment"].endswith(" …")
     assert by_name["📝 Previous names"] == "Old\\_one"
+
+
+def test_profile_career_stats_from_achievements():
+    from clashhero.cogs._info_embeds import compact
+
+    achievements = {
+        "Gold Grab": 2_000_000_000, "Elixir Escapade": 1_250_000_000, "Heroic Heist": 74_451_474,
+        "Friend in Need": 385_903, "Sharing is caring": 18_282, "Siege Sharer": 6_128,
+        "War League Legend": 1_150, "Games Champion": 166_260, "Well Seasoned": 320_040,
+        "Aggressive Capitalism": 3_910_515, "Conqueror": 11_137, "Unbreakable": 746,
+    }  # fmt: skip
+    raw = {"achievements": [{"name": k, "value": v, "village": "home"} for k, v in achievements.items()]}
+    p = NS(
+        name="Alex", tag="#2PP", town_hall=18, town_hall_weapon=None, exp_level=300, trophies=5000,
+        best_trophies=6203, war_stars=4214, war_opted_in=True, clan=None, role=None,
+        attack_wins=0, defense_wins=0, clan_capital_contributions=5_160_621, _raw_data=raw,
+    )  # fmt: skip
+    _, fields = profile_parts(p)
+    by_name = {name: value for name, value, _ in fields}
+    assert by_name["⚔️ War"] == "`4,214★` wars\n`1,150★` CWL\nOpted in"
+    assert by_name["🏰 Capital gold"] == "`5.2M` contributed\n`3.9M` raided"
+    assert by_name["🎁 Donated · all time"] == "`385,903` troop space\n`18,282` spell space\n`6,128` sieges"
+    loot = by_name["💰 Loot · all time"].splitlines()
+    assert [line.rsplit(" ", 1)[1] for line in loot] == ["`2B+`", "`1.2B`", "`74.5M`"]
+    assert by_name["🎯 Events"] == "`166,260` Clan Games points\n`320,040` challenge points"
+    assert by_name["🗡️ Wins · all time"] == "`11,137` attacks\n`746` defenses"
+    assert compact(999_999) == "999,999" and compact(1_000_000) == "1M"

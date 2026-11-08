@@ -600,6 +600,54 @@ def unit_chips(units: Iterable[tuple[str, int]]) -> str:
     return fit(SEP.join(f"{unit_icon(name) or escape_markdown(name)} {chip(level)}" for name, level in units))
 
 
+# Lifetime stats come from achievements. The API stops counting at 2,000,000,000 (Gold Grab and
+# Elixir Escapade reach it), so values at the cap are shown as "2B+".
+ACHIEVEMENT_CAP = 2_000_000_000
+
+
+def achievement_values(p: Any) -> dict[str, int]:
+    """Achievement name -> value, from the raw API data (or coc.py's models)."""
+    items = (getattr(p, "_raw_data", None) or {}).get("achievements")
+    if items is None:
+        items = [{"name": a.name, "value": a.value} for a in getattr(p, "achievements", None) or []]
+    return {a["name"]: int(a.get("value") or 0) for a in items if a.get("name")}
+
+
+def compact(n: int) -> str:
+    """``18,282`` · ``74.5M`` · ``2B+`` (full numbers below a million)."""
+    plus = "+" if n >= ACHIEVEMENT_CAP else ""
+    for size, suffix in ((1_000_000_000, "B"), (1_000_000, "M")):
+        if n >= size:
+            return f"{n / size:.1f}".removesuffix(".0") + suffix + plus
+    return f"{n:,}"
+
+
+def career_fields(a: dict[str, int]) -> list[tuple[str, str, bool]]:
+    """Lifetime totals for the profile: donations, loot, Clan Games, wins (each only if known)."""
+    fields: list[tuple[str, str, bool]] = []
+
+    def lines(*rows: tuple[str, str]) -> str:
+        return "\n".join(f"{chip(compact(a[key]))} {label}" for key, label in rows if key in a)
+
+    if donated := lines(("Friend in Need", "troop space"), ("Sharing is caring", "spell space"),
+                        ("Siege Sharer", "sieges")):  # fmt: skip
+        fields.append(("🎁 Donated · all time", donated, True))
+    loot = [
+        f"{EMOJIS.get(emoji) or label} {chip(compact(a[key]))}"
+        for key, emoji, label in (
+            ("Gold Grab", "res_gold", "gold"),
+            ("Elixir Escapade", "res_elixir", "elixir"),
+            ("Heroic Heist", "res_dark_elixir", "dark elixir"),
+        )
+        if key in a
+    ]
+    if loot:
+        fields.append(("💰 Loot · all time", "\n".join(loot), True))
+    if games := lines(("Games Champion", "Clan Games points"), ("Well Seasoned", "challenge points")):
+        fields.append((f"{ICONS['games']} Events", games, True))
+    return fields
+
+
 def profile_parts(
     p: Any,
     *,
@@ -636,16 +684,28 @@ def profile_parts(
             True,
         )
     )
+    a = achievement_values(p)
     pref = getattr(p, "war_opted_in", None)
     pref_text = "Opted in" if pref else "Opted out" if pref is False else "Preference unknown"
-    fields.append((f"{ICONS['war']} War", f"{chip(f'{p.war_stars:,}★')}\n{pref_text}", True))
+    war = chip(f"{p.war_stars:,}★")
+    if (cwl := a.get("War League Legend")) is not None:
+        war = f"{war} wars\n{chip(f'{cwl:,}★')} CWL"
+    fields.append((f"{ICONS['war']} War", f"{war}\n{pref_text}", True))
     gold = getattr(p, "clan_capital_contributions", 0) or 0
-    fields.append((f"{ICONS['capital']} Capital", f"{chip(f'{gold:,}')} gold", True))
+    capital = f"{chip(compact(gold))} contributed"
+    if a.get("Aggressive Capitalism"):
+        capital += f"\n{chip(compact(a['Aggressive Capitalism']))} raided"
+    fields.append((f"{ICONS['capital']} Capital gold", capital, True))
     if season is not None:
         given, received = season
         fields.append(("🎁 Donations", f"{chip(f'{given:,}')} given\n{chip(f'{received:,}')} received", True))
-    if p.attack_wins or p.defense_wins:  # the API reports 0/0 for everyone since the ranked rework
-        fields.append(("🗡️ Wins", f"{chip(p.attack_wins)} attacks\n{chip(p.defense_wins)} defenses", True))
+    fields += career_fields(a)
+    # The API reports 0/0 wins for everyone since the ranked rework; achievements keep the totals.
+    attacks, defenses = a.get("Conqueror", p.attack_wins), a.get("Unbreakable", p.defense_wins)
+    if attacks or defenses:
+        fields.append(
+            ("🗡️ Wins · all time", f"{chip(f'{attacks:,}')} attacks\n{chip(f'{defenses:,}')} defenses", True)
+        )
     if discord_id:
         fields.append(("🔗 Discord", f"<@{discord_id}>" + (" ✅" if verified else ""), True))
     if last_seen:
