@@ -125,3 +125,16 @@ async def test_reregistering_a_player_source_replaces_it(setup):  # noqa: F811
     assert len(col._player_sources) == 1
     tags = await col.player_tags_to_poll()
     assert "#NEW" in tags and "#OLD" not in tags
+
+
+async def test_bot_uses_the_running_event_loop():
+    # coc.py binds to the loop current at construction; the bot must be built inside the loop it
+    # runs on (see __main__.run) or CWL war fetches fail with "attached to a different loop".
+    import asyncio
+    from pathlib import Path
+
+    from clashhero.bot import ClashHeroBot
+    from clashhero.config import Config
+
+    bot = ClashHeroBot(Config("t", "e", "p", "k", Path(":memory:"), None, 60, 60, 120, 600, "INFO"))
+    assert bot.coc.loop is asyncio.get_running_loop()

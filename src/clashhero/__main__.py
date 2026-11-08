@@ -13,6 +13,14 @@ from clashhero.bot import ClashHeroBot
 from clashhero.config import Config, ConfigError
 
 
+async def run(config: Config) -> None:
+    # Build the bot inside the running event loop: coc.py binds its client to the loop that
+    # exists when it's created, and features like fetching CWL wars or many players at once
+    # fail with "attached to a different loop" if that isn't the loop the bot runs on.
+    async with ClashHeroBot(config) as bot:
+        await bot.start(config.discord_token)
+
+
 def main() -> None:
     try:
         config = Config.from_env()
@@ -20,8 +28,7 @@ def main() -> None:
             level=config.log_level,
             format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
         )
-        bot = ClashHeroBot(config)
-        asyncio.run(bot.start(config.discord_token))
+        asyncio.run(run(config))
     except ConfigError as e:
         sys.exit(f"Configuration error: {e}")
     except coc.InvalidCredentials:
