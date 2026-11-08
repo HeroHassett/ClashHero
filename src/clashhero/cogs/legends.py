@@ -206,12 +206,9 @@ async def _season_image(
 
 
 def _week_trophies(week: Window, days: Sequence[repo.WeekDay], player) -> int | None:
-    """The tournament trophies: current while the week runs, else the week's last known."""
-    if week.contains(_now()) and player is not None and player["trophies"] is not None:
-        return player["trophies"]
-    known = [d.end if d.end is not None else d.start for d in days]
-    known = [t for t in known if t is not None]
-    return known[-1] if known else None
+    """The tournament total, as the game shows it: the week's attack plus defense trophies (the
+    API's trophy count doesn't follow tournament battles below Legend I)."""
+    return sum(d.stats.offense + d.stats.defense for d in days)
 
 
 async def _week_image(
@@ -433,8 +430,6 @@ async def _logs_day_view(bot, tag: str, day: str, guild_id: int | None) -> disco
     if league and not is_legend_one(league):
         week = ranked_week(datetime.fromisoformat(f"{day}T12:00:00+00:00"))
         days = await repo.week_days(bot.db, tag, week.start)
-        starts = [d.start for d in days if d.start is not None]
-        ends = [d.end for d in days if d.end is not None]
         s, e = week.start, week.end
         span = f"{s:%b} {s.day} – {e:%b} {e.day}"
         return E.legends_today_embed(
@@ -443,8 +438,8 @@ async def _logs_day_view(bot, tag: str, day: str, guild_id: int | None) -> disco
             attacks=[h for d in days for h in d.stats.hits("attack")],
             defenses=[h for d in days for h in d.stats.hits("defense")],
             cap=weekly_attack_cap(league),
-            start=starts[0] if starts else None,
-            end=ends[-1] if ends else None,
+            start=None,  # the tournament total is the trophies line; the API count doesn't move
+            end=None,
             footer=span,
             **common,
         )

@@ -187,9 +187,16 @@ def army_link(share_code: str | None) -> str | None:
 # ------------------------------------------------------------------ trophies per battle
 
 # Legend I trophies by stars, as a share of destruction %: matches the in-game numbers exactly
-# (e.g. 3★ = 40, 2★ 88% = 28, 1★ 56% = 11). Other ranked tiers aren't confirmed, so their
-# battles use the trophy change observed between polls instead.
+# (e.g. 3★ = 40, 2★ 88% = 28, 1★ 56% = 11).
 LEGEND_TROPHY_RATE = {1: 0.20, 2: 0.32, 3: 0.40}
+
+# Tiers below Legend I (battle type "ranked"): the attacker earns the same share of destruction
+# (0★: 0-4 trophies), and the defender gains what's left of 40 (0 against a triple). Matches the
+# game's Legend II battle log. The API's trophy count doesn't follow these battles (it stays put
+# all week), so this rule is the only source of their trophies. db/fixes.sql applies it to rows
+# stored before it existed; keep the two in step.
+RANKED_TROPHY_RATE = {0: 0.08, **LEGEND_TROPHY_RATE}
+RANKED_BATTLE_TROPHIES = 40
 
 
 def legend_trophies(b: Battle) -> int | None:
@@ -202,23 +209,41 @@ def legend_trophies(b: Battle) -> int | None:
     return value if b.attack else -value
 
 
+def ranked_trophies(b: Battle) -> int | None:
+    """Trophies gained in a battle below Legend I (attack or defense; both gain), or None for
+    other battle types."""
+    rate = RANKED_TROPHY_RATE.get(b.stars) if b.battle_type == "ranked" else None
+    if rate is None:
+        return None
+    gain = math.floor(b.destruction * rate + 0.5)
+    return gain if b.attack else RANKED_BATTLE_TROPHIES - gain
+
+
+def rule_trophies(b: Battle) -> int | None:
+    """Trophies from the stars/destruction rule (Legend I or the tiers below), or None."""
+    return legend_trophies(b) if b.battle_type == "legend" else ranked_trophies(b)
+
+
 def battle_trophies(
     battles: Sequence[Battle], fresh_keys: set[str], delta: int, *, defenses_gain: bool = False
 ) -> list[int]:
     """Trophies for each battle (oldest first).
 
-    Legend I battles use the stars/destruction rule. For the rest, the observed trophy change
-    ``delta`` (minus what the rule already explains) is split across the battles that are new
-    since the last read; older backfilled battles with no rule get 0.
+    Legend I and lower-tier ranked battles use the stars/destruction rule. For the rest, the
+    observed trophy change ``delta`` (minus what the Legend I rule already explains) is split
+    across the battles that are new since the last read; older backfilled battles with no rule
+    get 0. Lower-tier ranked battles never explain ``delta``: the API's count doesn't follow them.
     """
-    known = [legend_trophies(b) for b in battles]
+    known = [rule_trophies(b) for b in battles]
     out = [k or 0 for k in known]
     open_idx = [
         i for i, (b, k) in enumerate(zip(battles, known, strict=True)) if k is None and b.key in fresh_keys
     ]
     if open_idx:
         explained = sum(
-            k for b, k in zip(battles, known, strict=True) if k is not None and b.key in fresh_keys
+            k
+            for b, k in zip(battles, known, strict=True)
+            if k is not None and b.key in fresh_keys and b.battle_type == "legend"
         )
         split = assign_trophies(
             [battles[i] for i in open_idx], delta - explained, defenses_gain=defenses_gain

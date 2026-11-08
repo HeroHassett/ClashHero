@@ -204,7 +204,7 @@ async def test_week_attaches_the_grid(db, monkeypatch, spy):
     assert open_png(file.fp.read()).size == (1000, cards.ranked_week_height(5))
     assert embed.fields  # the text embed and its day table stay
     kw = spy["week"]
-    assert (kw["player_name"], kw["trophies"], kw["cap"]) == ("Amy", 975, 30)
+    assert (kw["player_name"], kw["trophies"], kw["cap"]) == ("Amy", 67, 30)  # the week's battles
     assert [(b.trophies, b.stars) for b in kw["attacks"]] == [(40, 3), (1, 0)]
     assert [(b.trophies, b.stars) for b in kw["defenses"]] == [(0, 3), (26, 1)]
 
@@ -234,7 +234,7 @@ async def test_day_shows_the_week_grid_below_legend_one(db, monkeypatch, spy):
     msg = await run(db, cog.Legends.legends_day, 0)
     assert "embed" not in msg and msg["file"].filename == "ranked-week.png"  # just the image
     kw = spy["week"]
-    assert (kw["cap"], kw["trophies"]) == (30, 975)
+    assert (kw["cap"], kw["trophies"]) == (30, 67)
     assert [(b.trophies, b.stars) for b in kw["attacks"]] == [(40, 3), (1, 0)]
 
 

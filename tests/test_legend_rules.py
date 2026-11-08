@@ -112,18 +112,33 @@ async def test_season_reset_without_battle_log_is_not_inferred(setup):  # noqa: 
     assert await bot.db.fetchval("SELECT COUNT(*) FROM legend_events") == 0
 
 
-async def test_lower_tier_autofill_gains(setup):  # noqa: F811
+async def test_lower_tier_battles_score_by_rule(setup):  # noqa: F811
+    """Below Legend I the API's trophy count stays put, so battles are scored by stars and
+    destruction (attacker: rate x destruction; defender: what's left of 40) and trophy changes are
+    never carried, inferred or autofilled."""
     bot, coc, col = setup
     coc.http = FakeHttp()
     coc.http.items = [battle("20261106T120000.000Z", attack=False, opp="#D", kind="ranked")]
-    coc.player = ranked_player(3000, "Electro League 32")
+    coc.player = ranked_player(1003, "Electro League 32")
     await col._poll_player("#A", at(6, 23))
-    coc.player = ranked_player(3030, "Electro League 32")  # autofilled defenses add trophies
-    await col._poll_player("#A", at(7, 5, 1))
+    coc.http.items = [
+        battle("20261107T060000.000Z", opp="#E", kind="ranked", stars=2, pct=81),  # +26
+        battle("20261107T061000.000Z", attack=False, opp="#F", kind="ranked", stars=1, pct=60),  # +28
+        battle("20261107T062000.000Z", opp="#G", kind="ranked", stars=0, pct=18),  # +1
+        *coc.http.items,
+    ]
+    coc.player = ranked_player(1030, "Electro League 32")  # the API count moves on its own
+    await col._poll_player("#A", at(7, 6, 30))
     rows = await bot.db.fetchall(
-        "SELECT trophies, legend_day FROM legend_events WHERE battle_type = 'autofill'"
+        "SELECT opponent_tag, trophies, battle_type FROM legend_events ORDER BY occurred_at"
     )
-    assert sum(r["trophies"] for r in rows) == 30 and {r["legend_day"] for r in rows} == {"2026-11-06"}
+    assert [(r["opponent_tag"], r["trophies"]) for r in rows] == [
+        ("#D", 0),
+        ("#E", 26),
+        ("#F", 28),
+        ("#G", 1),
+    ]
+    assert all(r["battle_type"] == "ranked" for r in rows)  # no autofill or inferred rows
 
 
 async def test_first_legend_one_day_has_seven_hits(setup):  # noqa: F811

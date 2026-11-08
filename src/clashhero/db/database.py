@@ -43,6 +43,7 @@ class Database:
         for script in self._schema_scripts():
             await self._conn.executescript(script)
         await self._add_missing_columns()
+        await self._conn.executescript(resources.files("clashhero.db").joinpath("fixes.sql").read_text())
         await self._conn.commit()
 
     @staticmethod

@@ -305,8 +305,10 @@ async def test_trophies_before_battle_appears_are_carried(setup):
     coc.player = legend_player(4984)  # trophies dropped, battle log not updated yet
     await col._poll_player("#A", NOW + timedelta(minutes=1))
     assert not [e for n, e in bot.events if n == "clash_legend_battle"]
-    # A lower-tier ("ranked") battle: no trophy rule, so the carried change is used.
-    coc.http.items = [battle("20261107T120000.000Z", attack=False, opp="#D", kind="ranked")] + coc.http.items
+    # A 0-star Legend I defense: no trophy rule, so the carried change is used.
+    coc.http.items = [
+        battle("20261107T120000.000Z", attack=False, opp="#D", stars=0, pct=40)
+    ] + coc.http.items
     await col._poll_player("#A", NOW + timedelta(minutes=12))  # periodic re-check finds it
     (e,) = [e for n, e in bot.events if n == "clash_legend_battle"]
     assert (e.kind, e.trophies, e.opponent_tag) == ("defense", -16, "#D")

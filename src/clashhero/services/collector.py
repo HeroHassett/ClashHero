@@ -613,8 +613,17 @@ class Collector:
         else:
             total = cursor.pending_delta + (delta if plausible else 0)
         values = battle_trophies(missing, fresh_keys, total, defenses_gain=defenses_gain(new.league))
-        explained = sum(v for b, v in zip(missing, values, strict=True) if b.key in fresh_keys)
+        explained = sum(
+            v
+            for b, v in zip(missing, values, strict=True)
+            if b.key in fresh_keys and b.battle_type != "ranked"  # see below
+        )
         residual = total - explained
+        if defenses_gain(new.league):
+            # Below Legend I the API's trophy count doesn't follow tournament battles (it stays put
+            # all week), so trophy changes can't be matched to battles: the battle log, scored by
+            # the stars/destruction rule, is the only source. Nothing to carry or infer.
+            residual = 0
 
         if crossing.day and old is not None:
             await self._record_autofill(old, crossing, residual)
@@ -640,7 +649,8 @@ class Collector:
         running = new.trophies
         for b in reversed(ranked):  # walk back from the current trophy count
             after[b.key] = running
-            running -= trophies.get(b.key, 0)
+            if b.battle_type != "ranked":  # lower-tier battles don't move the API's count
+                running -= trophies.get(b.key, 0)
 
         # Trophy-change guesses covering the same window are superseded by the real battles.
         await self.db.execute(
@@ -704,8 +714,8 @@ class Collector:
         Legend I: missing = daily cap (8, or 7 on a promotion day) minus real defenses; each is
         worth the season's average defense loss. On a normal day the unexplained trophy drop is the
         exact total; at a weekly/season reset that change is mixed with the reset itself, so the
-        expected amount is used instead. Below Legend I defenses gain trophies and there's no daily
-        cap, so an unexplained gain at a (non-weekly) daily reset is recorded as autofill.
+        expected amount is used instead. Below Legend I nothing is recorded: the API's trophy count
+        doesn't follow tournament battles there, so ``residual`` is always 0 (see _sync_battles).
         """
         day = crossing.prev_day
         if day is None or not is_tracked_ranked(old.league):
