@@ -452,3 +452,25 @@ async def test_past_day_shows_bod(db, monkeypatch):
     assert await cog._day_start(db, "#A", "2026-11-07", None) == 4945  # no start: the day before's end
     await cog._day_reply(bot, "#A", "2026-11-08", None)
     assert (calls[-1]["today"], calls[-1]["bod"]) == (True, None)  # today: "Total" on the right
+
+
+def test_bod_rank_renders():
+    """A past day with ranks on both sides: EOD (#rank) in the middle, BOD (#rank) on the right."""
+    png = cards.render_legend_day(
+        player_name="HeroHassett",
+        day="2026-11-07",
+        today=False,
+        trophies=4961,
+        cap=8,
+        attacks=[],
+        defenses=[],
+        eod=4961,
+        eod_rank=9013,
+        bod=4945,
+        bod_rank=8890,
+    )
+    without = cards.render_legend_day(
+        player_name="HeroHassett", day="2026-11-07", today=False, trophies=4961, cap=8,
+        attacks=[], defenses=[], eod=4961, eod_rank=9013, bod=4945,
+    )  # fmt: skip
+    assert png.startswith(b"\x89PNG") and png != without  # the rank is drawn

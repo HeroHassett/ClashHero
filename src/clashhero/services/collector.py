@@ -20,6 +20,7 @@ import logging
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from datetime import time as dtime
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -72,6 +73,10 @@ RESET_TROPHIES = 5000  # Legend I's season reset and weekly floor
 SEASON_FINISH_POLL_SECONDS = 6 * 60 * 60  # look for newly finished Legend I seasons
 LEGEND_LEAGUE_ID = 29000022  # the API's Legend League, whose seasons hold final rankings
 MAX_SEASON_PAGES = 200  # 1000 players a page; a season had about 12k
+# ClashHero's own daily Legend I ranking: read every known Legend I player just before the reset.
+LEGEND_RANK_TIME = dtime(4, 48, tzinfo=UTC)
+LEGEND_RANK_CONCURRENCY = 8  # its own limit, so regular polling keeps going meanwhile
+LEGEND_RANK_STOP_BEFORE_RESET = timedelta(seconds=30)  # never read post-reset trophies
 
 PlayerSource = Callable[[], Awaitable[Iterable[str]]]
 
@@ -142,6 +147,7 @@ class Collector:
         self.rank_loop = tasks.loop(seconds=RANK_POLL_SECONDS)(self._poll_ranks)
         self.country_rank_loop = tasks.loop(seconds=COUNTRY_RANK_POLL_SECONDS)(self._poll_country_ranks)
         self.season_finish_loop = tasks.loop(seconds=SEASON_FINISH_POLL_SECONDS)(self._poll_season_finishes)
+        self.legend_rank_loop = tasks.loop(time=LEGEND_RANK_TIME)(self._rank_legend_one)
         self._loops = (
             self.clan_loop,
             self.player_loop,
@@ -150,6 +156,7 @@ class Collector:
             self.rank_loop,
             self.country_rank_loop,
             self.season_finish_loop,
+            self.legend_rank_loop,
         )
         for loop in self._loops:
             loop.error(self._make_error_handler(loop))
@@ -1130,6 +1137,51 @@ class Collector:
                 stored = await ranks.store_season_finishes(self.db, season_id, items)
                 log.info("Stored the final ranking of Legend season %s (%d players)", season_id, stored)
         self._cycle_done("season_finishes", datetime.now(UTC))
+
+    async def _rank_legend_one(self) -> None:
+        """Rank every known Legend I player by trophies just before the 05:00 UTC reset and store
+        it as that legend day's end-of-day ranking (the API's daily ranking stops at 200)."""
+        now = datetime.now(UTC)
+        day = legend_day_id(now)
+        ranked = await self.build_legend_ranking(now)
+        if ranked:
+            stored = await ranks.store_full_ranking(self.db, day, ranked)
+            log.info("Ranked %d Legend I players for legend day %s", stored, day)
+            self._cycle_done("legend_ranking", datetime.now(UTC))
+
+    async def build_legend_ranking(self, now: datetime) -> list[tuple[str, int, int]]:
+        """(tag, rank, trophies) for every candidate still in Legend I, read before the reset."""
+        # Stop before the reset: a time budget measured on the wall clock from now on.
+        stop_at = datetime.now(UTC) + (legend_day_bounds(now)[1] - LEGEND_RANK_STOP_BEFORE_RESET - now)
+        since = legend_day_id(now - timedelta(days=14))
+        candidates = await ranks.legend_one_candidates(self.db, since)
+        base = self.coc.http.base_url
+        sem = asyncio.Semaphore(LEGEND_RANK_CONCURRENCY)
+        found: dict[str, int] = {}
+        aborted = False
+
+        async def one(tag: str) -> None:
+            nonlocal aborted
+            if aborted or datetime.now(UTC) >= stop_at:
+                return
+            async with sem:
+                if aborted or datetime.now(UTC) >= stop_at:
+                    return
+                try:
+                    data = await self.coc.http.request(coc.http.Route("GET", base, f"/players/{quote(tag)}"))
+                except coc.Maintenance:
+                    aborted = True
+                    return
+                except (coc.NotFound, coc.HTTPException):
+                    return
+            if is_legend_one(((data or {}).get("leagueTier") or {}).get("name")):
+                found[tag] = int(data.get("trophies") or 0)
+
+        await asyncio.gather(*(one(t) for t in sorted(candidates)), return_exceptions=True)
+        if aborted:
+            log.warning("Legend I ranking skipped: the API is in maintenance")
+            return []
+        return ranks.competition_ranks(found.items())
 
     # ------------------------------------------------------------------ capital raids
 

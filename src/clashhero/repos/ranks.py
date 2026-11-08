@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from clashhero.db.database import Database
@@ -59,7 +59,13 @@ async def current_rank(db: Database, tag: str, now: datetime | None = None) -> i
 
 
 async def eod_rank(db: Database, tag: str, legend_day: str) -> int | None:
-    """The player's global rank at the end of ``legend_day`` (last fetch before the reset)."""
+    """The player's global rank at the end of ``legend_day``: from ClashHero's own full Legend I
+    ranking when that day has one, else from the API's top 200 (last fetch before the reset)."""
+    full = await db.fetchval(
+        "SELECT rank FROM legend_day_full_ranks WHERE player_tag = ? AND legend_day = ?", (tag, legend_day)
+    )
+    if full is not None:
+        return full
     return await db.fetchval(
         "SELECT rank FROM legend_day_ranks WHERE player_tag = ? AND legend_day = ?", (tag, legend_day)
     )
@@ -87,7 +93,16 @@ async def store_country_rankings(
     if not code or not name or not isinstance(loc_id, int):
         return 0
     rows = [
-        (i["tag"], loc_id, code, name, int(i["rank"]), int(i.get("trophies") or 0), now.isoformat())
+        (
+            i["tag"],
+            loc_id,
+            code,
+            name,
+            int(i["rank"]),
+            int(i.get("trophies") or 0),
+            now.isoformat(),
+            (i.get("leagueTier") or {}).get("name"),
+        )
         for i in items
         if i.get("tag") and isinstance(i.get("rank"), int)
     ]
@@ -97,10 +112,11 @@ async def store_country_rankings(
         await db.execute("DELETE FROM player_country_ranks WHERE location_id = ?", (loc_id,))
         await db.executemany(
             "INSERT INTO player_country_ranks (player_tag, location_id, country_code, country_name, "
-            "rank, trophies, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (player_tag) DO "
-            "UPDATE SET location_id = excluded.location_id, country_code = excluded.country_code, "
-            "country_name = excluded.country_name, rank = excluded.rank, "
-            "trophies = excluded.trophies, fetched_at = excluded.fetched_at",
+            "rank, trophies, fetched_at, league) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT "
+            "(player_tag) DO UPDATE SET location_id = excluded.location_id, "
+            "country_code = excluded.country_code, country_name = excluded.country_name, "
+            "rank = excluded.rank, trophies = excluded.trophies, fetched_at = excluded.fetched_at, "
+            "league = excluded.league",
             rows,
         )
     return len(rows)
@@ -159,3 +175,56 @@ async def best_finish(db: Database, tag: str) -> Finish | None:
         (tag,),
     )
     return Finish(row["rank"], row["trophies"], row["season_id"]) if row else None
+
+
+# ------------------------------------------------------------------ ClashHero's daily Legend I ranking
+
+FULL_RANK_DAYS = 62  # how long daily rankings are kept (/legends day reaches 60 days back)
+
+
+def competition_ranks(players: Iterable[tuple[str, int]]) -> list[tuple[str, int, int]]:
+    """(tag, rank, trophies) by trophies, highest first; equal trophies share a rank (1, 2, 2, 4)."""
+    ordered = sorted(players, key=lambda p: (-p[1], p[0]))
+    out: list[tuple[str, int, int]] = []
+    for i, (tag, trophies) in enumerate(ordered):
+        rank = out[-1][1] if out and out[-1][2] == trophies else i + 1
+        out.append((tag, rank, trophies))
+    return out
+
+
+async def legend_one_candidates(db: Database, since_day: str) -> set[str]:
+    """Players who are probably in Legend I: last finished season's finishers, Legend I players in
+    the country and global leaderboards, tracked Legend I players, recent Legend I opponents, and
+    whoever the previous daily ranking found. The job checks each one's current league."""
+    queries = (
+        "SELECT player_tag FROM season_finishes WHERE season_id = "
+        "(SELECT MAX(season_id) FROM season_finishes)",
+        "SELECT player_tag FROM player_country_ranks WHERE league = 'Legend I'",
+        "SELECT player_tag FROM player_ranks",
+        "SELECT player_tag FROM players WHERE league = 'Legend I'",
+        "SELECT DISTINCT opponent_tag FROM legend_events WHERE battle_type = 'legend' "
+        "AND opponent_tag IS NOT NULL AND legend_day >= ?",
+        "SELECT player_tag FROM legend_day_full_ranks WHERE legend_day = "
+        "(SELECT MAX(legend_day) FROM legend_day_full_ranks)",
+    )
+    tags: set[str] = set()
+    for q in queries:
+        params = (since_day,) if "?" in q else ()
+        tags.update(r[0] for r in await db.fetchall(q, params) if r[0])
+    return tags
+
+
+async def store_full_ranking(db: Database, legend_day: str, ranked: Iterable[tuple[str, int, int]]) -> int:
+    """Store one legend day's full Legend I ranking ((tag, rank, trophies)) and drop old days."""
+    rows = [(tag, legend_day, rank, trophies) for tag, rank, trophies in ranked]
+    if not rows:
+        return 0
+    cutoff = (date.fromisoformat(legend_day) - timedelta(days=FULL_RANK_DAYS)).isoformat()
+    async with db.batch():
+        await db.execute("DELETE FROM legend_day_full_ranks WHERE legend_day = ?", (legend_day,))
+        await db.executemany(
+            "INSERT INTO legend_day_full_ranks (player_tag, legend_day, rank, trophies) VALUES (?, ?, ?, ?)",
+            rows,
+        )
+        await db.execute("DELETE FROM legend_day_full_ranks WHERE legend_day < ?", (cutoff,))
+    return len(rows)

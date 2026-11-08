@@ -42,3 +42,14 @@ CREATE TABLE IF NOT EXISTS season_finishes (
     PRIMARY KEY (season_id, player_tag)
 );
 CREATE INDEX IF NOT EXISTS idx_season_finishes_player ON season_finishes (player_tag);
+
+-- ClashHero's own daily Legend I ranking: every known Legend I player's trophies, read just before
+-- the 05:00 UTC reset and ranked (the API publishes only the top 200 each day). Kept ~60 days.
+CREATE TABLE IF NOT EXISTS legend_day_full_ranks (
+    player_tag TEXT    NOT NULL,
+    legend_day TEXT    NOT NULL,
+    rank       INTEGER NOT NULL,
+    trophies   INTEGER NOT NULL,
+    PRIMARY KEY (player_tag, legend_day)
+);
+CREATE INDEX IF NOT EXISTS idx_full_ranks_day ON legend_day_full_ranks (legend_day);

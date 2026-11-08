@@ -108,3 +108,61 @@ async def test_collector_fetches_each_finished_season_once(setup):  # noqa: F811
     calls.clear()
     await col._poll_season_finishes()
     assert len(calls) == 1  # already stored: only the season list is read
+
+
+def test_competition_ranks():
+    ranked = ranks.competition_ranks([("#C", 5000), ("#A", 5100), ("#B", 5000), ("#D", 4990)])
+    assert ranked == [("#A", 1, 5100), ("#B", 2, 5000), ("#C", 2, 5000), ("#D", 4, 4990)]
+
+
+async def test_full_ranking_wins_over_the_top_200(db):
+    await ranks.store_rankings(db, items(("#A", 150)), "2026-11-07", NOW)
+    assert await ranks.eod_rank(db, "#A", "2026-11-07") == 150
+    await ranks.store_full_ranking(db, "2026-11-07", [("#A", 149, 5300), ("#B", 9013, 4961)])
+    assert await ranks.eod_rank(db, "#A", "2026-11-07") == 149
+    assert await ranks.eod_rank(db, "#B", "2026-11-07") == 9013
+    # Old days are dropped after ~2 months.
+    await ranks.store_full_ranking(db, "2027-01-20", [("#B", 1, 6000)])
+    assert await ranks.eod_rank(db, "#B", "2026-11-07") is None
+
+
+async def test_legend_one_candidates(db):
+    await ranks.store_season_finishes(db, "v2-2026-09-28T05:00:00Z", items(("#OLD", 1)))
+    await ranks.store_season_finishes(db, "v2-2026-10-26T05:00:00Z", items(("#FIN", 1)))
+    await ranks.store_country_rankings(
+        db, US, [{"tag": "#US1", "rank": 1, "trophies": 5100, "leagueTier": {"name": "Legend I"}},
+                 {"tag": "#US2", "rank": 2, "trophies": 900, "leagueTier": {"name": "Legend II"}}], NOW
+    )  # fmt: skip
+    await ranks.store_rankings(db, items(("#TOP", 1)), "2026-11-07", NOW)
+    await db.execute(
+        "INSERT INTO legend_events (player_tag, legend_day, season_id, kind, trophies, trophies_after, "
+        "occurred_at, battle_type, opponent_tag) VALUES ('#ME', '2026-11-07', 's', 'attack', 40, 5000, "
+        "'x', 'legend', '#OPP')"
+    )
+    tags = await ranks.legend_one_candidates(db, "2026-11-01")
+    assert {"#FIN", "#US1", "#TOP", "#OPP"} <= tags
+    assert not {"#OLD", "#US2"} & tags  # an older season; a Legend II player
+
+
+async def test_collector_ranks_legend_one(setup):  # noqa: F811
+    from datetime import UTC, datetime
+
+    import coc
+
+    bot, coc_client, col = setup
+    await ranks.store_season_finishes(bot.db, "v2-new", items(("#A", 1), ("#B", 2), ("#GONE", 3), ("#II", 4)))
+    league = {"#A": ("Legend I", 5100), "#B": ("Legend I", 5200), "#II": ("Legend II", 1003)}
+
+    class Http(FakeHttp):
+        async def request(self, route):
+            tag = "#" + route.url.split("%23")[-1]
+            if tag not in league:
+                raise coc.NotFound(type("R", (), {"status": 404, "reason": "nf"})(), {})
+            name, trophies = league[tag]
+            return {"tag": tag, "trophies": trophies, "leagueTier": {"name": name}}
+
+    coc_client.http = Http()
+    ranked = await col.build_legend_ranking(datetime(2026, 11, 8, 4, 48, tzinfo=UTC))
+    assert ranked == [("#B", 1, 5200), ("#A", 2, 5100)]  # Legend II and missing players left out
+    # Past the reset deadline nothing more is read.
+    assert await col.build_legend_ranking(datetime(2026, 11, 8, 4, 59, 45, tzinfo=UTC)) == []

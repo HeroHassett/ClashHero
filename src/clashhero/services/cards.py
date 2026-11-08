@@ -1770,6 +1770,7 @@ def render_legend_day(
     eod_rank: int | None = None,
     flag: bytes | None = None,
     bod: int | None = None,
+    bod_rank: int | None = None,
 ) -> bytes:
     """PNG of a legend day as the game's Legend League battle log (list view).
 
@@ -1780,11 +1781,24 @@ def render_legend_day(
     one); ``attacks``/``defenses``: chronological; ``trophy_icon``: image bytes for the trophy (a
     cup is drawn without it); ``flag``: the player's country flag (image bytes), top left;
     ``bod``: a past day's trophies at the beginning of the day, shown as "BOD" on the right (today
-    shows the "Total" there; the date is already in the band)."""
+    shows the "Total" there; the date is already in the band), with ``bod_rank``, the global rank
+    at the end of the day before."""
     with _RENDER_LOCK:
         battles = list(attacks), list(defenses)
         image = _render_day(
-            player_name, day, today, trophies, cap, *battles, trophy_icon, rank, eod, eod_rank, flag, bod
+            player_name,
+            day,
+            today,
+            trophies,
+            cap,
+            *battles,
+            trophy_icon,
+            rank,
+            eod,
+            eod_rank,
+            flag,
+            bod,
+            bod_rank,
         )
     buf = io.BytesIO()
     image.save(buf, "PNG")
@@ -1805,6 +1819,7 @@ def _render_day(
     eod_rank: int | None = None,
     flag: bytes | None = None,
     bod: int | None = None,
+    bod_rank: int | None = None,
 ) -> Image.Image:
     rows = legend_day_rows(len(attacks), len(defenses), cap)
     height = legend_day_height(rows)
@@ -1823,7 +1838,9 @@ def _render_day(
         right = ("Total:", str(trophies) if trophies is not None else "\u2014")
     else:  # the date is in the band; the right shows where the day began
         right = ("BOD:", str(bod) if bod is not None else "\u2014")
-    _day_player_bar(canvas, draw, trophy, player_name, rank, right, eod, eod_rank)
+    _day_player_bar(
+        canvas, draw, trophy, player_name, rank, right, eod, eod_rank, None if today else bod_rank
+    )
     _toggle(canvas, draw, DAY_TOGGLE, grid=False)
     offense = sum(b.trophies for b in attacks)
     defense = sum(b.trophies for b in defenses)
@@ -1849,10 +1866,11 @@ def _day_player_bar(
     right: tuple[str, str],
     eod: int | None,
     eod_rank: int | None,
+    right_rank: int | None = None,
 ) -> None:
     """The player bar: ``#rank`` (when known) in white and the name in pale yellow on the left;
     ``EOD: 5062 (#2451)`` in the middle (the rank only when known); ``right`` (``Total: 4931``
-    for today, ``BOD: 4945`` for a past day) and a big trophy on the right. Numbers without
+    for today, ``BOD: 4945 (#9013)`` for a past day) and a big trophy on the right. Numbers without
     thousands separators, as in the game; the name shrinks, then is cut, to fit."""
     _paste_bar(canvas, DAY_BAR, "grey")
     x0, y0, x1, y1 = DAY_BAR
@@ -1860,8 +1878,13 @@ def _day_player_bar(
     icon_cx = 838.5
     trophy.draw(canvas, draw, _px(icon_cx), cy, 35)
     label, value = right
-    value_w = _game_text(draw, _px(icon_cx - 22), cy, value, BAR_NUMBER, PALE_YELLOW, anchor="r")
-    label_right = _px(icon_cx - 22) - value_w - _px(8)
+    value_right = _px(icon_cx - 22)
+    if right_rank:  # BOD's rank: the end-of-day rank of the day before
+        value_right -= _game_text(
+            draw, value_right, cy, f"(#{right_rank})", BAR_NUMBER - 1, anchor="r"
+        ) + _px(6)
+    value_w = _game_text(draw, value_right, cy, value, BAR_NUMBER, PALE_YELLOW, anchor="r")
+    label_right = value_right - value_w - _px(8)
     limit = label_right - _game_text(draw, label_right, cy, label, 19, anchor="r")
 
     if eod is not None:

@@ -324,7 +324,7 @@ async def _day_reply(
     else:
         today = day == legend_day_id(now)
         trophies = end if end is not None else start
-        bod = None
+        bod = bod_rank = None
         if today:  # EOD: the end of the previous day (today's start), with its rank
             eod = start
             eod_rank = await ranks.eod_rank(
@@ -336,6 +336,8 @@ async def _day_reply(
             eod = trophies
             eod_rank = await ranks.eod_rank(bot.db, tag, day)
             bod = await _day_start(bot.db, tag, day, start)
+            prev_day = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
+            bod_rank = await ranks.eod_rank(bot.db, tag, prev_day)
         estimate = is_legend_one(league)
         try:
             png = await asyncio.to_thread(
@@ -353,6 +355,7 @@ async def _day_reply(
                 eod_rank=eod_rank,
                 flag=flag,
                 bod=bod,
+                bod_rank=bod_rank,
             )
             file = discord.File(io.BytesIO(png), filename="legend-day.png")
         except Exception:
