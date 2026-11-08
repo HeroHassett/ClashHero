@@ -54,14 +54,14 @@ LIVE_KINDS: dict[str, str] = {
 }
 
 # In-game wording for the API's clan setting codes.
-CLAN_TYPE_LABELS = {"open": "Anyone Can Join", "inviteOnly": "Invite Only", "closed": "Closed"}
+CLAN_TYPE_LABELS = {"open": "Anyone can join", "inviteOnly": "Invite only", "closed": "Closed"}
 WAR_FREQUENCY_LABELS = {
     "always": "Always",
-    "moreThanOncePerWeek": "Twice a Week",
-    "oncePerWeek": "Once a Week",
+    "moreThanOncePerWeek": "Twice a week",
+    "oncePerWeek": "Once a week",
     "lessThanOncePerWeek": "Rarely",
     "never": "Never",
-    "unknown": "Not Set",
+    "unknown": "Not set",
 }
 
 ROLE_NAMES = {"leader": "Leader", "coLeader": "Co-Leader", "admin": "Elder", "member": "Member"}

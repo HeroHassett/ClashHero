@@ -202,8 +202,8 @@ def test_clan_settings_embed():
         ],
     )
     lines = embed.description.splitlines()
-    assert "**Clan type**: Anyone Can Join → **Invite Only**" in lines
-    assert "**War frequency**: Always → **Once a Week**" in lines
+    assert "**Clan type**: Anyone can join → **Invite only**" in lines
+    assert "**War frequency**: Always → **Once a week**" in lines
     assert "**Required Town Hall**: TH12 → **TH14**" in lines
     assert "**Required trophies**: 1,000 → **2,400**" in lines
     assert "**Public war log**: Yes → **No**" in lines
@@ -299,7 +299,7 @@ async def test_clan_settings_log(cog, sent):
     await cog.on_clash_clan_settings(ev.ClanSettingsChanged("#C", "Clan", (("type", "open", "closed"),)))
     [(_, tag, log_type, embed, _)] = sent
     assert (tag, log_type) == ("#C", "clan_settings")
-    assert "Anyone Can Join → **Closed**" in embed.description
+    assert "Anyone can join → **Closed**" in embed.description
 
 
 async def test_join_and_leave_have_profile_button(cog, sent):
