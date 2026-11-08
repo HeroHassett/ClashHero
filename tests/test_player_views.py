@@ -1,5 +1,6 @@
 """Player pages (/player info, units, upgrades, rushed) and their page buttons."""
 
+import re
 from types import SimpleNamespace as NS
 
 import discord
@@ -14,7 +15,6 @@ from coc import (
 )
 
 from clashhero.cogs._info_embeds import (
-    FIELD_LIMIT,
     MORE_NOT_SHOWN,
     UnitLevel,
     chip_grid,
@@ -232,125 +232,101 @@ def test_pack_blocks_splits_under_limits():
     assert pack_blocks([]) == [""]
 
 
-def test_profile_fits_field_limits():
+def profile_player(**extra):
     raw = {
         "heroes": [{"name": "Archer Queen", "level": 95, "village": "home"}],
-        "heroEquipment": [{"name": f"Equipment {i:02d}", "level": 27, "village": "home"} for i in range(80)],
-        "troops": [{"name": "Unicorn", "level": 10, "village": "home"}],
+        "achievements": [
+            {"name": n, "value": v}
+            for n, v in {
+                "Gold Grab": 2_000_000_000,
+                "Elixir Escapade": 1_250_000_000,
+                "Heroic Heist": 74_451_474,
+                "Friend in Need": 385_903,
+                "Sharing is caring": 18_282,
+                "Siege Sharer": 6_128,
+                "Conqueror": 11_137,
+                "Unbreakable": 746,
+                "War League Legend": 1_150,
+                "Games Champion": 166_260,
+                "Well Seasoned": 320_040,
+                "Aggressive Capitalism": 3_910_515,
+                "Most Valuable Clanmate": 5_160_621,
+            }.items()
+        ],
     }
-    p = NS(
-        name="Alex",
-        tag="#2PP",
-        town_hall=17,
-        town_hall_weapon=None,
-        exp_level=245,
-        trophies=5321,
-        best_trophies=6012,
-        war_stars=1234,
-        war_opted_in=False,
-        clan=NS(name="Best_Clan", tag="#2QQ"),
-        role=NS(value="coLeader"),
-        attack_wins=0,
-        defense_wins=0,
-        clan_capital_contributions=1234567,
+    fields = dict(
+        name="Alex", tag="#2PP", town_hall=18, town_hall_weapon=None, exp_level=239, trophies=4961,
+        best_trophies=5249, war_stars=685, war_opted_in=True, clan=NS(name="Best_Clan", tag="#2QQ"),
+        role=NS(value="admin"), attack_wins=0, defense_wins=0, clan_capital_contributions=5_160_621,
         _raw_data=raw,
-    )
-    desc, fields = profile_parts(p, discord_id=42, verified=True, season=(1200, 300), names=["Old_one"])
-    assert desc.startswith("🏠 **Town Hall 17** · level `245`")
-    assert "[Best\\_Clan](" in desc and "Co-Leader" in desc
-    assert len(fields) <= 25
-    assert all(len(value) <= FIELD_LIMIT for _, value, _ in fields)
-    by_name = {name: value for name, value, _ in fields}
-    assert by_name["🏆 Trophies"].startswith("`5,321` best `6,012`")
-    assert by_name["⚔️ War"] == "`1,234★`\nOpted out"
-    assert by_name["🔗 Discord"] == "<@42> ✅"
-    assert by_name["🐾 Pets"] == "Unicorn `10`"
-    assert by_name["🛡️ Equipment"].endswith(" …")
-    assert by_name["📝 Previous names"] == "Old\\_one"
-
-
-def test_profile_career_stats_from_achievements():
-    from clashhero.cogs._info_embeds import compact
-
-    achievements = {
-        "Gold Grab": 2_000_000_000, "Elixir Escapade": 1_250_000_000, "Heroic Heist": 74_451_474,
-        "Friend in Need": 385_903, "Sharing is caring": 18_282, "Siege Sharer": 6_128,
-        "War League Legend": 1_150, "Games Champion": 166_260, "Well Seasoned": 320_040,
-        "Aggressive Capitalism": 3_910_515, "Conqueror": 11_137, "Unbreakable": 746,
-    }  # fmt: skip
-    raw = {"achievements": [{"name": k, "value": v, "village": "home"} for k, v in achievements.items()]}
-    p = NS(
-        name="Alex", tag="#2PP", town_hall=18, town_hall_weapon=None, exp_level=300, trophies=5000,
-        best_trophies=6203, war_stars=4214, war_opted_in=True, clan=None, role=None,
-        attack_wins=0, defense_wins=0, clan_capital_contributions=5_160_621, _raw_data=raw,
     )  # fmt: skip
-    _, fields = profile_parts(p)
-    by_name = {name: value for name, value, _ in fields}
-    assert by_name["⚔️ War"] == "`4,214★` wars\n`1,150★` CWL\nOpted in"
-    assert by_name["🏰 Capital gold"] == "`5.2M` contributed\n`3.9M` raided"
-    assert by_name["🎁 Donated · all time"] == "`385,903` troop space\n`18,282` spell space\n`6,128` sieges"
-    loot = by_name["💰 Loot · all time"].splitlines()
-    assert [line.rsplit(" ", 1)[1] for line in loot] == ["`2B+`", "`1.2B`", "`74.5M`"]
-    assert by_name["🎯 Events"] == "`166,260` Clan Games points\n`320,040` challenge points"
-    assert by_name["🗡️ Wins · all time"] == "`11,137` attacks\n`746` defenses"
-    assert compact(999_999) == "999,999" and compact(1_000_000) == "1M"
+    return NS(**{**fields, **extra})
+
+
+def test_profile_one_stat_per_line():
+    desc, fields = profile_parts(
+        profile_player(), discord_id=42, verified=True, season=(4, 118), names=["Old_one"]
+    )
+    assert fields == []  # everything is in the description: no inline columns to wrap
+    lines = desc.splitlines()
+    assert lines[0] == "TH **18** XP **239** 🏆 **4,961** ⭐ **685**"
+    for expected in (
+        "**Season Stats**",
+        "🏰 **Donated** 4",
+        "🏰 **Received** 118",
+        "🗡️ **Attacks Won** 0",
+        "🏆 **Best Trophies** 5,249 (all-time high)",
+        "**Achievement Stats**",
+        "**Total Loot** Gold 2B+ Elixir 1.2B DE 74.5M",
+        "🏰 **Troops Donated** 385,903",
+        "🧪 **Spells Donated** 18,282",
+        "🪵 **Siege Donated** 6,128",
+        "🗡️ **Attacks Won** 11,137",
+        "🛡️ **Defense Won** 746",
+        "⭐ **CWL War Stars** 1,150",
+        "🎯 **Clan Games Points** 166,260",
+        "🏰 **Capital Gold Looted** 3,910,515",
+        "🏰 **Capital Gold Contributed** 5,160,621",
+        "🔗 **Discord** <@42> ✅",
+        "**Previous Names** Old\\_one",
+    ):
+        assert expected in lines, expected
+    assert "[Best\\_Clan](" in desc and "(Elder)" in desc
+    assert len(desc) <= 4096
+    # No line long enough to wrap on a phone (emoji markup aside).
+    plain = [re.sub(r"<a?:\w+:\d+>|\[|\]\([^)]*\)", "", line) for line in lines]
+    assert max(len(line) for line in plain if not line.startswith("**Heroes")) <= 45
 
 
 def test_profile_uses_game_symbols_once_uploaded(monkeypatch):
     from clashhero.services.emojis import EMOJIS
 
     icons = (
-        "ui_castle ui_spell_donation wall_wrecker ui_sword ui_shield ui_war_star ui_cwl_star"
-        " res_capital_gold ui_xp ui_clan_games res_trophy res_gold"
+        "ui_donate_troops ui_donate_spells ui_donate_sieges ui_sword ui_shield ui_war_star ui_cwl_star"
+        " res_capital_gold ui_xp ui_clan_games res_trophy res_gold ui_stopwatch"
     ).split()
     monkeypatch.setattr(EMOJIS, "_by_name", {n: f"<:{n}:1>" for n in icons})
-    raw = {
-        "achievements": [
-            {"name": n, "value": v}
-            for n, v in {
-                "Friend in Need": 10,
-                "Sharing is caring": 5,
-                "Siege Sharer": 2,
-                "War League Legend": 7,
-                "Games Champion": 9,
-                "Conqueror": 3,
-                "Unbreakable": 1,
-            }.items()
-        ]
-    }
-    p = NS(
-        name="Alex", tag="#2PP", town_hall=18, town_hall_weapon=None, exp_level=300, trophies=5000,
-        best_trophies=6203, war_stars=40, war_opted_in=True, clan=None, role=None,
-        attack_wins=0, defense_wins=0, clan_capital_contributions=12, _raw_data=raw,
-    )  # fmt: skip
-    desc, fields = profile_parts(p, season=(4, 0))
-    by_name = dict((n, v) for n, v, _ in fields)
-    assert "<:ui_xp:1> level `300`" in desc
-    assert by_name["<:ui_castle:1> Donations"] == "<:ui_castle:1> `4` given\n<:ui_castle:1> `0` received"
-    assert by_name["<:ui_castle:1> Donated · all time"] == (
-        "<:ui_castle:1> `10` troop space\n"
-        "<:ui_spell_donation:1> `5` spell space\n"
-        "<:wall_wrecker:1> `2` sieges"
-    )
-    assert by_name["<:ui_war_star:1> War"] == "<:ui_war_star:1> `40` wars\n<:ui_cwl_star:1> `7` CWL\nOpted in"
-    assert (
-        by_name["<:ui_sword:1> Wins · all time"] == "<:ui_sword:1> `3` attacks\n<:ui_shield:1> `1` defenses"
-    )
-    assert by_name["<:res_capital_gold:1> Capital gold"] == "<:res_capital_gold:1> `12` contributed"
-    assert by_name["<:ui_clan_games:1> Events"] == "<:ui_clan_games:1> `9` Clan Games points"
-    assert by_name["<:res_trophy:1> Trophies"].startswith("<:res_trophy:1> `5,000` best `6,203`")
+    desc, _ = profile_parts(profile_player(), season=(4, 0), last_seen="2026-11-08T03:26:07+00:00")
+    lines = desc.splitlines()
+    assert lines[0].startswith("TH **18** <:ui_xp:1> **239** <:res_trophy:1> **4,961** <:ui_war_star:1>")
+    for expected in (
+        "<:ui_donate_troops:1> **Donated** 4",
+        "<:ui_donate_troops:1> **Troops Donated** 385,903",
+        "<:ui_donate_spells:1> **Spells Donated** 18,282",
+        "<:ui_donate_sieges:1> **Siege Donated** 6,128",
+        "<:ui_sword:1> **Attacks Won** 11,137",
+        "<:ui_shield:1> **Defense Won** 746",
+        "<:ui_cwl_star:1> **CWL War Stars** 1,150",
+        "<:res_capital_gold:1> **Capital Gold Contributed** 5,160,621",
+    ):
+        assert expected in lines, expected
+    assert any(line.startswith("<:ui_stopwatch:1> **Last Seen** <t:") for line in lines)
 
 
-def test_profile_shows_country_rank():
+def test_profile_shows_country_flag():
     from clashhero.repos.ranks import CountryRank
 
-    p = NS(
-        name="Alex", tag="#2PP", town_hall=18, town_hall_weapon=None, exp_level=300, trophies=5100,
-        best_trophies=6203, war_stars=40, war_opted_in=True, clan=None, role=None,
-        attack_wins=0, defense_wins=0, clan_capital_contributions=0, _raw_data={},
-    )  # fmt: skip
-    _, fields = profile_parts(p, country=CountryRank(57, "US", "United States"))
-    trophies = next(v for n, v, _ in fields if n.endswith("Trophies"))
-    assert trophies.endswith("\n🇺🇸 United States")
-    _, fields = profile_parts(p)
-    assert "🇺🇸" not in next(v for n, v, _ in fields if n.endswith("Trophies"))
+    desc, _ = profile_parts(profile_player(), country=CountryRank(57, "US", "United States"))
+    assert desc.splitlines()[1].endswith("🇺🇸 United States")
+    assert "#57" not in desc  # the flag only; ranks shown are global
+    assert "🇺🇸" not in profile_parts(profile_player())[0]

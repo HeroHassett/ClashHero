@@ -632,38 +632,10 @@ def with_icon(icon: str, text: str) -> str:
     return f"{icon} {text}" if icon else text
 
 
-def career_fields(a: dict[str, int]) -> list[tuple[str, str, bool]]:
-    """Lifetime totals for the profile: donations, loot, Clan Games, wins (each only if known)."""
-    fields: list[tuple[str, str, bool]] = []
-
-    def lines(*rows: tuple[str, str, str]) -> str:  # (achievement, icon, label)
-        return "\n".join(
-            with_icon(icon, f"{chip(compact(a[k]))} {label}") for k, icon, label in rows if k in a
-        )
-
-    if donated := lines(
-        ("Friend in Need", sym("ui_castle"), "troop space"),
-        ("Sharing is caring", sym("ui_spell_donation"), "spell space"),
-        ("Siege Sharer", EMOJIS.unit("Wall Wrecker"), "sieges"),
-    ):
-        fields.append((f"{sym('ui_castle', '🎁')} Donated · all time", donated, True))
-    loot = [
-        f"{sym(emoji, label)} {chip(compact(a[key]))}"
-        for key, emoji, label in (
-            ("Gold Grab", "res_gold", "gold"),
-            ("Elixir Escapade", "res_elixir", "elixir"),
-            ("Heroic Heist", "res_dark_elixir", "dark elixir"),
-        )
-        if key in a
-    ]
-    if loot:
-        fields.append((f"{sym('res_gold', '💰')} Loot · all time", "\n".join(loot), True))
-    if games := lines(
-        ("Games Champion", sym("ui_clan_games"), "Clan Games points"),
-        ("Well Seasoned", sym("ui_challenge_points"), "challenge points"),
-    ):
-        fields.append((f"{sym('ui_clan_games', ICONS['games'])} Events", games, True))
-    return fields
+def _stat(icon: str, label: str, value: str) -> str:
+    """One profile line: ``{icon} **Label** value`` (one stat per line, so nothing wraps mid-value
+    on phones)."""
+    return with_icon(icon, f"**{label}** {value}")
 
 
 def profile_parts(
@@ -676,86 +648,103 @@ def profile_parts(
     names: Sequence[str] = (),
     country: Any = None,
 ) -> tuple[str, list[tuple[str, str, bool]]]:
-    """(description, [(field name, value, inline)]) for /player info.
+    """(description, fields) for /player info: everything is in the description, in sections
+    (season, other, all-time achievement stats, heroes), one stat per line. ``fields`` is kept for
+    the caller's sake and is empty.
 
     ``p`` is a coc.py Player; the rest comes from the database (linked Discord user, last seen,
     season donations given/received, earlier names, ``country``: a ``repos.ranks.CountryRank``
     when the player is in their country's top 200)."""
+    a = achievement_values(p)
+    trophy, castle = sym("res_trophy", "🏆"), sym("ui_donate_troops", "🏰")
+    sword, shield = sym("ui_sword", "🗡️"), sym("ui_shield", "🛡️")
+    league = league_name(p) or "Unranked"
+
+    # Header: Town Hall, XP level, trophies, war stars; then league (and country when known).
     weapon = getattr(p, "town_hall_weapon", None)
-    th = [
-        header(f"Town Hall {p.town_hall}", EMOJIS.town_hall(p.town_hall) or "🏠"),
-        *([f"weapon {chip(weapon)}"] if weapon else []),
+    th = f"{EMOJIS.town_hall(p.town_hall) or 'TH'} **{p.town_hall}**"
+    if weapon:
+        th += f" (weapon {weapon})"
+    head = [
+        th,
+        f"{sym('ui_xp', 'XP')} **{p.exp_level}**",
+        f"{trophy} **{p.trophies:,}**",
+        f"{sym('ui_war_star', '⭐')} **{p.war_stars:,}**",
     ]
-    lines = [SEP.join([*th, with_icon(sym("ui_xp"), f"level {chip(p.exp_level)}")])]
+    lines = [" ".join(head), f"{EMOJIS.league(league)} {league}".strip()]
+    if country:
+        lines[-1] += f"{SEP}{flag_emoji(country.country_code)} {country.country_name}"
+
+    # Season: donations from our tracking, wins as the API reports them.
+    lines += ["", "**Season Stats**"]
+    if season is not None:
+        given, received = season
+        lines.append(_stat(castle, "Donated", f"{given:,}"))
+        lines.append(_stat(castle, "Received", f"{received:,}"))
+    lines.append(_stat(sword, "Attacks Won", f"{p.attack_wins or 0:,}"))
+    lines.append(_stat(shield, "Defense Won", f"{p.defense_wins or 0:,}"))
+
+    # Other: the all-time trophy high (the API's bestTrophies, not a season finish), clan, etc.
+    lines += ["", "**Other Stats**"]
+    lines.append(_stat(trophy, "Best Trophies", f"{p.best_trophies:,} (all-time high)"))
     clan = getattr(p, "clan", None)
     if clan:
         role = role_name(_enum(getattr(p, "role", None)) or None)
-        lines.append(f"{ICONS['clan']} [{escape_markdown(clan.name)}]({clan_link(clan.tag)}){SEP}{role}")
+        clan_text = f"[{escape_markdown(clan.name)}]({clan_link(clan.tag)}) ({role})"
     else:
-        lines.append(f"{ICONS['clan']} Not in a clan")
-
-    fields: list[tuple[str, str, bool]] = []
-    league = league_name(p) or "Unranked"
-    trophy = sym("res_trophy")
-    fields.append(
-        (
-            f"{trophy or ICONS['trophy']} Trophies",
-            with_icon(trophy, f"{chip(f'{p.trophies:,}')} best {chip(f'{p.best_trophies:,}')}")
-            + f"\n{EMOJIS.league(league)} {league}".rstrip()
-            + (f"\n{flag_emoji(country.country_code)} {country.country_name}" if country else ""),
-            True,
-        )
-    )
-    a = achievement_values(p)
+        clan_text = "Not in a clan"
+    lines.append(_stat(ICONS["clan"], "Clan", clan_text))
     pref = getattr(p, "war_opted_in", None)
-    pref_text = "Opted in" if pref else "Opted out" if pref is False else "Preference unknown"
-
-    def stars(icon: str, n: int) -> str:  # the star emoji replaces the ★ once it's uploaded
-        return with_icon(icon, chip(f"{n:,}" if icon else f"{n:,}★"))
-
-    war = stars(sym("ui_war_star"), p.war_stars)
-    if (cwl := a.get("War League Legend")) is not None:
-        war = f"{war} wars\n{stars(sym('ui_cwl_star'), cwl)} CWL"
-    fields.append((f"{sym('ui_war_star', ICONS['war'])} War", f"{war}\n{pref_text}", True))
-    coin = sym("res_capital_gold")
-    gold = getattr(p, "clan_capital_contributions", 0) or 0
-    capital = with_icon(coin, f"{chip(compact(gold))} contributed")
-    if a.get("Aggressive Capitalism"):
-        capital += "\n" + with_icon(coin, f"{chip(compact(a['Aggressive Capitalism']))} raided")
-    fields.append((f"{coin or ICONS['capital']} Capital gold", capital, True))
-    if season is not None:
-        given, received = season
-        castle = sym("ui_castle")
-        fields.append(
-            (
-                f"{castle or '🎁'} Donations",
-                with_icon(castle, f"{chip(f'{given:,}')} given")
-                + "\n"
-                + with_icon(castle, f"{chip(f'{received:,}')} received"),
-                True,
-            )
-        )
-    fields += career_fields(a)
-    # The API reports 0/0 wins for everyone since the ranked rework; achievements keep the totals.
-    attacks, defenses = a.get("Conqueror", p.attack_wins), a.get("Unbreakable", p.defense_wins)
-    if attacks or defenses:
-        wins = (
-            with_icon(sym("ui_sword"), f"{chip(f'{attacks:,}')} attacks")
-            + "\n"
-            + with_icon(sym("ui_shield"), f"{chip(f'{defenses:,}')} defenses")
-        )
-        fields.append((f"{sym('ui_sword', '🗡️')} Wins · all time", wins, True))
-    if discord_id:
-        fields.append(("🔗 Discord", f"<@{discord_id}>" + (" ✅" if verified else ""), True))
+    war_pref = "Opted in" if pref else "Opted out" if pref is False else "Unknown"
+    lines.append(_stat(sym("ui_war_star", "⚔️"), "War", war_pref))
     if last_seen:
-        fields.append((f"{sym('ui_stopwatch', '👀')} Last seen", ts(last_seen), True))
-    for title, kind in (("Heroes", "heroes"), ("Equipment", "equipment"), ("Pets", "pets")):
-        units = home_units(p, kind)
-        if units:
-            fields.append((f"{sym(f'ui_{kind}', ICONS[kind])} {title}", unit_chips(units), False))
+        lines.append(_stat(sym("ui_stopwatch", "⏱️"), "Last Seen", ts(last_seen)))
+    if discord_id:
+        lines.append(_stat("🔗", "Discord", f"<@{discord_id}>" + (" ✅" if verified else "")))
+
+    # All time, from achievements (the API caps loot at 2B: shown as "2B+").
+    achievements = []
+    loot = [
+        f"{sym(emoji, label)} {compact(a[key])}"
+        for key, emoji, label in (
+            ("Gold Grab", "res_gold", "Gold"),
+            ("Elixir Escapade", "res_elixir", "Elixir"),
+            ("Heroic Heist", "res_dark_elixir", "DE"),
+        )
+        if key in a
+    ]
+    if loot:
+        achievements.append(f"**Total Loot** {' '.join(loot)}")
+    for key, icon, label in (
+        ("Friend in Need", castle, "Troops Donated"),
+        ("Sharing is caring", sym("ui_donate_spells", "🧪"), "Spells Donated"),
+        ("Siege Sharer", sym("ui_donate_sieges", "🪵"), "Siege Donated"),
+        ("Conqueror", sword, "Attacks Won"),
+        ("Unbreakable", shield, "Defense Won"),
+        ("War League Legend", sym("ui_cwl_star", "⭐"), "CWL War Stars"),
+        ("Games Champion", sym("ui_clan_games", "🎯"), "Clan Games Points"),
+        ("Well Seasoned", sym("ui_challenge_points", "🎯"), "Challenge Points"),
+        ("Aggressive Capitalism", sym("res_capital_gold", "🏰"), "Capital Gold Looted"),
+    ):
+        if key in a:
+            achievements.append(_stat(icon, label, f"{a[key]:,}"))
+    contributed = getattr(p, "clan_capital_contributions", None)
+    if contributed is not None or "Most Valuable Clanmate" in a:
+        value = a.get("Most Valuable Clanmate", contributed or 0)
+        achievements.append(_stat(sym("res_capital_gold", "🏰"), "Capital Gold Contributed", f"{value:,}"))
+    if achievements:
+        lines += ["", "**Achievement Stats**", *achievements]
+
+    heroes = home_units(p, "heroes")
+    if heroes:
+        lines += [
+            "",
+            "**Heroes**",
+            " ".join(f"{unit_icon(n) or escape_markdown(n)} {lvl}" for n, lvl in heroes),
+        ]
     if names:
-        fields.append(("📝 Previous names", fit(SEP.join(escape_markdown(n) for n in names[-10:])), False))
-    return "\n".join(lines), fields
+        lines += ["", f"**Previous Names** {escape_markdown(', '.join(names[-5:]))}"]
+    return "\n".join(lines), []
 
 
 def _enum(v: Any) -> str:
