@@ -10,6 +10,7 @@ trophies are known. Everything here handles both.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import io
 import logging
 import re
@@ -28,10 +29,11 @@ from clashhero.cogs._info_embeds import summarize_army
 from clashhero.cogs.army import army_embed_fields
 from clashhero.events import LegendBattle
 from clashhero.repos import legends as repo
+from clashhero.repos import ranks
 from clashhero.services import cards
 from clashhero.services import icons as unit_icons
 from clashhero.services.army import parse_army
-from clashhero.services.battlelog import army_link
+from clashhero.services.battlelog import army_link, estimate_legend_result
 from clashhero.services.emojis import EMOJIS
 from clashhero.services.outbox import send_clan_log, send_to_channel, update_live_message
 from clashhero.utils.checks import has_permission, manager
@@ -109,21 +111,31 @@ async def _day_card(bot, tag: str, day: str, guild_id: int | None) -> discord.Em
     )
 
 
-def army_battles(hits: Sequence[repo.Hit], *, armies: bool = True) -> list[cards.ArmyBattle]:
-    """Battles for the image cards, with each army code decoded when ``armies``."""
-    return [
-        cards.ArmyBattle(
-            trophies=h.trophies,
-            opponent=h.opponent_name or h.opponent_tag,
-            opponent_th=h.opponent_th,
-            occurred_at=h.occurred_at,
-            stars=h.stars,
-            destruction=h.destruction,
-            army=parse_army(h.army_share_code) if armies and h.army_share_code else None,
-            autofill=h.autofill,
+def army_battles(
+    hits: Sequence[repo.Hit], *, armies: bool = True, estimate: bool = False
+) -> list[cards.ArmyBattle]:
+    """Battles for the image cards, with each army code decoded when ``armies``. With
+    ``estimate`` (Legend I), battles inferred from trophy changes get the stars and % their
+    trophies imply, when that's unambiguous."""
+    out = []
+    for h in hits:
+        stars, pct, estimated = h.stars, h.destruction, False
+        if estimate and not h.detailed and not h.autofill and (guess := estimate_legend_result(h.trophies)):
+            (stars, pct), estimated = guess, True
+        out.append(
+            cards.ArmyBattle(
+                trophies=h.trophies,
+                opponent=h.opponent_name or h.opponent_tag,
+                opponent_th=h.opponent_th,
+                occurred_at=h.occurred_at,
+                stars=stars,
+                destruction=pct,
+                army=parse_army(h.army_share_code) if armies and h.army_share_code else None,
+                autofill=h.autofill,
+                estimated=estimated,
+            )
         )
-        for h in hits
-    ]
+    return out
 
 
 def season_card(
@@ -184,6 +196,30 @@ def season_card(
     )
 
 
+async def _player_clan(bot, player) -> tuple[str | None, bytes | None]:
+    """The player's clan name and badge image: the stored clan, else one API call. (None, None)
+    when they have no clan; the badge is None when it can't be fetched. Never raises."""
+    clan_tag = player["clan_tag"] if player else None
+    if not clan_tag:
+        return None, None
+    name = badge_url = None
+    try:
+        row = await bot.db.get_clan_row(clan_tag)
+        if row is not None:
+            name, badge_url = row["name"], row["badge_url"]
+        client = getattr(bot, "coc", None)
+        if (not name or not badge_url) and client is not None:
+            clan = await client.get_clan(clan_tag)
+            badge = getattr(clan, "badge", None)
+            name = name or clan.name
+            badge_url = badge_url or getattr(badge, "medium", None) or getattr(badge, "url", None)
+        badge = (await cards.fetch_badges([badge_url])).get(badge_url) if badge_url else None
+    except Exception:
+        log.debug("Couldn't look up clan %s", clan_tag, exc_info=True)
+        badge = None
+    return name or None, badge if name else None
+
+
 async def _season_image(
     bot, tag: str, name: str, season_id: str, summary: repo.SeasonSummary
 ) -> discord.File | None:
@@ -198,6 +234,9 @@ async def _season_image(
             now=_now(),
             trophies_now=player["trophies"] if player else None,
         )
+        clan_name, clan_badge = await _player_clan(bot, player)
+        if clan_name:
+            card = dataclasses.replace(card, clan_name=clan_name, clan_badge=clan_badge)
         png = await asyncio.to_thread(cards.render_legend_season, card)
     except Exception:
         log.exception("Couldn't draw the legend season card for %s in %s", tag, season_id)
@@ -212,7 +251,12 @@ def _week_trophies(week: Window, days: Sequence[repo.WeekDay], player) -> int | 
 
 
 async def _week_image(
-    tag: str, name: str, league: str | None, days: Sequence[repo.WeekDay], trophies: int | None
+    tag: str,
+    name: str,
+    league: str | None,
+    days: Sequence[repo.WeekDay],
+    trophies: int | None,
+    rank: int | None = None,
 ) -> discord.File | None:
     """The weekly-tournament grid (the game's battle log for tiers below Legend I), or None
     (logged) if it can't be drawn."""
@@ -225,6 +269,7 @@ async def _week_image(
             attacks=army_battles([h for d in days for h in d.stats.hits("attack")], armies=False),
             defenses=army_battles([h for d in days for h in d.stats.hits("defense")], armies=False),
             trophy_icon=await unit_icons.fetch_trophy_icon(),
+            rank=rank,
         )
     except Exception:
         log.exception("Couldn't draw the ranked week card for %s", tag)
@@ -245,16 +290,27 @@ async def _day_reply(
     start = row["start_trophies"] if row else None
     end = row["end_trophies"] if row else None
     league = await repo.player_league(bot.db, tag)
+    now = _now()
+    rank = await ranks.current_rank(bot.db, tag, now=now)
     file = None
     if league and not is_legend_one(league):
         week = ranked_week(datetime.fromisoformat(f"{day}T12:00:00+00:00"))
         days = await repo.week_days(bot.db, tag, week.start)
-        file = await _week_image(tag, name, league, days, _week_trophies(week, days, player))
+        file = await _week_image(tag, name, league, days, _week_trophies(week, days, player), rank)
     else:
-        today = day == legend_day_id(_now())
+        today = day == legend_day_id(now)
         trophies = end if end is not None else start
-        if today and player is not None and player["trophies"] is not None:
-            trophies = player["trophies"]
+        if today:  # EOD: the end of the previous day (today's start), with its rank
+            eod = start
+            eod_rank = await ranks.eod_rank(
+                bot.db, tag, (date.fromisoformat(day) - timedelta(days=1)).isoformat()
+            )
+            if player is not None and player["trophies"] is not None:
+                trophies = player["trophies"]
+        else:
+            eod = trophies
+            eod_rank = await ranks.eod_rank(bot.db, tag, day)
+        estimate = is_legend_one(league)
         try:
             png = await asyncio.to_thread(
                 cards.render_legend_day,
@@ -263,9 +319,12 @@ async def _day_reply(
                 today=today,
                 trophies=trophies,
                 cap=stats.cap,
-                attacks=army_battles(stats.hits("attack"), armies=False),
-                defenses=army_battles(stats.hits("defense"), armies=False),
+                attacks=army_battles(stats.hits("attack"), armies=False, estimate=estimate),
+                defenses=army_battles(stats.hits("defense"), armies=False, estimate=estimate),
                 trophy_icon=await unit_icons.fetch_trophy_icon(),
+                rank=rank,
+                eod=eod,
+                eod_rank=eod_rank,
             )
             file = discord.File(io.BytesIO(png), filename="legend-day.png")
         except Exception:
@@ -460,7 +519,36 @@ async def _logs_day_view(bot, tag: str, day: str, guild_id: int | None) -> disco
         start=start,
         end=end,
         footer=_day_label(day),
+        estimate=is_legend_one(league),
         **common,
+    )
+
+
+async def _logs_season_view(
+    bot, tag: str, name: str, season_id: str, summary: repo.SeasonSummary, guild_id: int | None
+) -> discord.Embed:
+    """The season's history: won battles and a day-by-day table."""
+    player = await bot.db.get_player_row(tag)
+    window = season_by_id(season_id)
+    now = _now()
+    today = None
+    if window.contains(now):
+        today = (date.fromisoformat(legend_day_id(now)) - window.start.date()).days
+    trophies = player["trophies"] if today is not None and player is not None else None
+    if trophies is None:
+        ends = [d.end if d.end is not None else d.start for d in summary.days]
+        trophies = next((t for t in reversed(ends) if t is not None), None)
+    return E.season_logs_embed(
+        name=name,
+        tag=tag,
+        town_hall=player["town_hall"] if player else None,
+        league=player["league"] if player else None,
+        trophies=trophies,
+        window=window,
+        summary=summary,
+        today=today,
+        now=now,
+        color=await guild_color(bot, guild_id),
     )
 
 
@@ -480,8 +568,7 @@ async def render_legend_view(
     if view == "day":
         embed = await _logs_day_view(bot, tag, day, guild_id)
     else:
-        color = await guild_color(bot, guild_id)
-        embed = E.season_embed(name=name, tag=tag, season_id=season_id, summary=summary, color=color)
+        embed = await _logs_season_view(bot, tag, name, season_id, summary, guild_id)
     file = await _season_image(bot, tag, name, season_id, summary)
     if file is not None:
         embed.set_image(url="attachment://legend-season.png")
@@ -1081,7 +1168,8 @@ class Legends(BaseCog):
         )
         file = None
         if not is_legend_one(league):  # Legend I is shown day by day (/legends day), as in the game
-            file = await _week_image(tag, name, league, days, _week_trophies(week, days, row))
+            rank = await ranks.current_rank(self.db, tag, now=_now())
+            file = await _week_image(tag, name, league, days, _week_trophies(week, days, row), rank)
         if file is None:
             await interaction.followup.send(embed=embed)
             return

@@ -597,7 +597,8 @@ class ArmyBattle:
 
     ``army``: the army used (the attacker's on a defense, the player's own on an attack), None
     when no army code was recorded. ``stars`` and ``destruction`` are None for battles inferred
-    from trophy changes. ``autofill``: a defense the game filled in at the daily reset."""
+    from trophy changes, or ``estimated`` from the trophies (Legend I). ``autofill``: a defense the
+    game filled in at the daily reset."""
 
     trophies: int
     opponent: str | None = None
@@ -607,6 +608,7 @@ class ArmyBattle:
     destruction: int | None = None
     army: Army | None = None
     autofill: bool = False
+    estimated: bool = False
 
     @property
     def detailed(self) -> bool:
@@ -1243,6 +1245,7 @@ MAX_DAY_ROWS = 30
 INK: RGB = (26, 19, 16)  # outline and drop shadow of the game's text
 WHITE: RGB = (255, 255, 255)
 PALE_YELLOW: RGB = (248, 245, 200)  # band title, the total, the player's name (#f9f7cc)
+ESTIMATE_TEXT: RGB = (222, 214, 205)  # the dimmed label of a row whose stars are estimated
 
 # The window (colours sampled from the game, averaged over small areas).
 GW_OUTLINE: RGB = (12, 6, 5)  # hairline around the whole window
@@ -1723,16 +1726,21 @@ def render_legend_day(
     defenses: Sequence[ArmyBattle],
     trophy_icon: bytes | None = None,
     rank: int | None = None,
+    eod: int | None = None,
+    eod_rank: int | None = None,
 ) -> bytes:
     """PNG of a legend day as the game's Legend League battle log (list view).
 
-    ``trophies``: end-of-day trophies (current trophies for today); ``cap``: the daily
-    attack/defense cap (None for tiers without one); ``attacks``/``defenses``: chronological;
-    ``trophy_icon``: image bytes for the trophy (a cup is drawn without it); ``rank``: the
-    player's rank, shown before the name when known."""
+    ``trophies``: the player's trophies now (the "Total", shown for today); ``eod``: the trophies
+    at the end of the previous day for today (the day's start), at the end of that day for a past
+    day; ``eod_rank``: the global rank at that end of day; ``rank``: the player's global rank now
+    (each shown only when known); ``cap``: the daily attack/defense cap (None for tiers without
+    one); ``attacks``/``defenses``: chronological; ``trophy_icon``: image bytes for the trophy (a
+    cup is drawn without it)."""
     with _RENDER_LOCK:
+        battles = list(attacks), list(defenses)
         image = _render_day(
-            player_name, day, today, trophies, cap, list(attacks), list(defenses), trophy_icon, rank
+            player_name, day, today, trophies, cap, *battles, trophy_icon, rank, eod, eod_rank
         )
     buf = io.BytesIO()
     image.save(buf, "PNG")
@@ -1749,6 +1757,8 @@ def _render_day(
     defenses: list[ArmyBattle],
     trophy_icon: bytes | None,
     rank: int | None,
+    eod: int | None = None,
+    eod_rank: int | None = None,
 ) -> Image.Image:
     rows = legend_day_rows(len(attacks), len(defenses), cap)
     height = legend_day_height(rows)
@@ -1756,14 +1766,14 @@ def _render_day(
     draw = ImageDraw.Draw(canvas, "RGBA")
     trophy = _TrophyIcon(trophy_icon)
     _window(canvas, draw, height)
-    _day_player_bar(canvas, draw, trophy, player_name, trophies, rank, today)
-    _toggle(canvas, draw, DAY_TOGGLE, grid=False)
-
     try:
         d = day if isinstance(day, date) else date.fromisoformat(day)
         day_short = f"{d:%b %d}"
     except ValueError:
         day_short = str(day)
+    right = ("Total:", str(trophies) if trophies is not None else "\u2014") if today else ("Day:", day_short)
+    _day_player_bar(canvas, draw, trophy, player_name, rank, right, eod, eod_rank)
+    _toggle(canvas, draw, DAY_TOGGLE, grid=False)
     offense = sum(b.trophies for b in attacks)
     defense = sum(b.trophies for b in defenses)
     title = "Current League Day" if today else f"League Day · {day_short}"
@@ -1777,26 +1787,46 @@ def _render_day(
 
 
 def _day_player_bar(
-    canvas, draw, trophy: _TrophyIcon, name: str, trophies: int | None, rank: int | None, today: bool
+    canvas,
+    draw,
+    trophy: _TrophyIcon,
+    name: str,
+    rank: int | None,
+    right: tuple[str, str],
+    eod: int | None,
+    eod_rank: int | None,
 ) -> None:
-    """``#rank`` (when known) in white and the name in pale yellow on the left; ``Total:`` (``EOD:``
-    for a past day; the game only shows the current one) with the number and a big trophy on the
-    right. No thousands separators, as in the game."""
+    """The player bar: ``#rank`` (when known) in white and the name in pale yellow on the left;
+    ``EOD: 5062 (#2451)`` in the middle (the rank only when known); ``right`` (``Total: 4931``
+    for today, ``Day: Nov 07`` for a past day) and a big trophy on the right. Numbers without
+    thousands separators, as in the game; the name shrinks, then is cut, to fit."""
     _paste_bar(canvas, DAY_BAR, "grey")
     x0, y0, x1, y1 = DAY_BAR
     cy = _px((y0 + y1) / 2 - 1)
     icon_cx = 838.5
     trophy.draw(canvas, draw, _px(icon_cx), cy, 35)
-    value = str(trophies) if trophies is not None else "—"
+    label, value = right
     value_w = _game_text(draw, _px(icon_cx - 22), cy, value, 14, PALE_YELLOW, anchor="r")
     label_right = _px(icon_cx - 22) - value_w - _px(8)
-    label_w = _game_text(draw, label_right, cy, "Total:" if today else "EOD:", 19, anchor="r")
+    limit = label_right - _game_text(draw, label_right, cy, label, 19, anchor="r")
+
+    if eod is not None:
+        parts = [("EOD:", 19, WHITE, 0), (str(eod), 14, PALE_YELLOW, _px(8))]
+        if eod_rank:
+            parts.append((f"(#{eod_rank})", 14, WHITE, _px(6)))
+        widths = [_runs_width(_runs(t, _game_fonts(sz))) + gap for t, sz, _, gap in parts]
+        group = sum(widths)
+        x = min(_px(480) - group / 2, limit - _px(24) - group)
+        limit = x
+        for (text, sz, fill, gap), w in zip(parts, widths, strict=True):
+            _game_text(draw, x + gap, cy, text, sz, fill)
+            x += w
 
     x = _px(x0 + 13)
     if rank:
         x += _game_text(draw, x, cy, f"#{rank}", 20) + _px(5)
-    room = label_right - label_w - _px(24) - x
-    runs, size = _fit_game(name, 20, 14, room)
+    room = limit - _px(20) - x
+    runs, size = _fit_game(name, 20, 12, room)
     if not runs:
         runs, size = _fit_game("?", 20, 20, room)
     _game_text(draw, x, cy, runs, size, PALE_YELLOW)
@@ -1825,16 +1855,20 @@ def _day_slot(canvas, draw, trophy: _TrophyIcon, box, kind: str, battle: ArmyBat
     trophy.draw(canvas, draw, _px(x0 + 440.5), _px(y0 + 17), 27)
     _game_text(draw, _px(x0 + 418), cy, f"{battle.trophies:+d}", 14, anchor="r")
     name_x = _px(x0 + 6)
+    label = "Attack" if kind == "attack" else "Defense"
     if battle.autofill or not battle.detailed:
-        label = "Auto-filled" if battle.autofill else "Attack" if kind == "attack" else "Defense"
-        _game_text(draw, name_x, cy, label, 14)
+        _game_text(draw, name_x, cy, "Auto-filled" if battle.autofill else label, 14)
         return
     for i in range(3):
         _game_star(
             canvas, draw, _px(x0 + 288.25 + 21 * i), _px(y0 + 15.5), _px(11.2), i < (battle.stars or 0)
         )
     pct_right = _px(x0 + 272.5)
-    pct_w = _game_text(draw, pct_right, cy, f"{battle.destruction or 0}%", 14.5, anchor="r")
+    pct = f"~{battle.destruction or 0}%" if battle.estimated else f"{battle.destruction or 0}%"
+    pct_w = _game_text(draw, pct_right, cy, pct, 14.5, anchor="r")
+    if battle.estimated:  # stars and % estimated from the trophies: no opponent known
+        _game_text(draw, name_x, cy, label, 14, ESTIMATE_TEXT)
+        return
     room = pct_right - max(pct_w, _px(40)) - _px(10) - name_x
     runs, size = _fit_game(battle.opponent or "?", 14.5, 11, room)
     if not runs:
@@ -2041,6 +2075,8 @@ class SeasonCard:
     defenses: int = 0
     attack_stars: StarCounts = StarCounts()
     defense_stars: StarCounts = StarCounts()
+    clan_name: str | None = None  # the player's clan, shown top right with its badge
+    clan_badge: bytes | None = None
 
     @property
     def played_days(self) -> int:
@@ -2123,10 +2159,35 @@ def _gradient_runs(canvas: Image.Image, x: int, baseline: int, runs: Sequence[Ru
     canvas.paste(gradient, (round(x + left), round(baseline + top)), mask)
 
 
+CLAN_BADGE = 56
+CLAN_NAME_W = 260
+
+
+def _season_clan(canvas: Image.Image, draw: ImageDraw.ImageDraw, card: SeasonCard) -> int:
+    """The player's clan, right-aligned in the header: its badge with the name to its left (the
+    name alone without a badge). Returns the block's left edge (drawing scale)."""
+    right = _px(WIDTH - PAD)
+    cy = _px(HEADER_TOP + LOGO_SIZE / 2)
+    badge = _contained_image(card.clan_badge, _px(CLAN_BADGE))
+    if badge is not None:
+        bx = right - badge.width
+        canvas.paste(badge, (bx, cy - badge.height // 2), badge)
+        right = bx - _px(12)
+    fonts = _text_fonts(18, 600)
+    runs = fit_runs(card.clan_name or "", fonts, _px(CLAN_NAME_W))
+    if not runs:
+        return right
+    width = _runs_width(runs)
+    _draw_runs(draw, right - width, _baseline(fonts[0], cy), runs, TEXT)
+    return round(right - width)
+
+
 def _season_header(canvas: Image.Image, draw: ImageDraw.ImageDraw, card: SeasonCard) -> None:
     _draw_logo(canvas, draw)
     x = _px(PAD + LOGO_SIZE + 24)
     max_w = _px(WIDTH - PAD) - x
+    if card.clan_name:
+        max_w = min(max_w, _season_clan(canvas, draw, card) - _px(28) - x)
     total = len(card.days)
     if card.today is not None:
         eyebrow = f"LEGEND SEASON · DAY {card.today + 1} / {total}"

@@ -298,7 +298,8 @@ async def test_day_card_is_attached(day, spy):
     kw = spy["render"]
     assert (kw["player_name"], kw["day"], kw["today"], kw["cap"]) == ("Amy", DAY, True, 8)
     assert kw["trophies"] == 5062  # today: the player's current trophies
-    assert [(b.trophies, b.stars) for b in kw["attacks"]] == [(40, 3), (40, None)]
+    # The second attack was inferred from a trophy change: in Legend I its 40 trophies mean 3 stars.
+    assert [(b.trophies, b.stars, b.estimated) for b in kw["attacks"]] == [(40, 3, False), (40, 3, True)]
     assert [(b.opponent, b.trophies) for b in kw["defenses"]] == [("Raider", -20)]
     assert kw["trophy_icon"] == png()
 

@@ -279,7 +279,8 @@ async def test_refresh_shows_the_day(day):
 async def test_historical_data(day):
     edit = await press(day, "season")
     e = edit["embed"]
-    assert e.title.startswith("Amy · Season") and "11-07" in e.description  # the day-by-day table
+    assert e.title == f"Amy ({TAG})" and "Legend Season Logs (2 Nov – 30 Nov 2026)" in e.description
+    assert "DAY" in e.description and "+60²" in e.description  # the day-by-day table
     assert [f.filename for f in edit["attachments"]] == ["legend-season.png"]
     assert _current(edit) == ["View Historical Data"]
 

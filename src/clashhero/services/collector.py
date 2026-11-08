@@ -27,6 +27,7 @@ import coc
 from discord.ext import tasks
 
 from clashhero import events as ev
+from clashhero.repos import ranks
 from clashhero.services.battlelog import (
     PENDING_TIMEOUT,
     Battle,
@@ -61,6 +62,8 @@ if TYPE_CHECKING:
     from clashhero.bot import ClashHeroBot
 
 log = logging.getLogger(__name__)
+
+RANK_POLL_SECONDS = 30 * 60  # global top-200 ranking (current and end-of-day ranks)
 
 PlayerSource = Callable[[], Awaitable[Iterable[str]]]
 
@@ -128,7 +131,8 @@ class Collector:
         self.player_loop = tasks.loop(seconds=cfg.player_poll_seconds)(self._poll_players)
         self.war_loop = tasks.loop(seconds=cfg.war_poll_seconds)(self._poll_wars)
         self.raid_loop = tasks.loop(seconds=cfg.raid_poll_seconds)(self._poll_raids)
-        self._loops = (self.clan_loop, self.player_loop, self.war_loop, self.raid_loop)
+        self.rank_loop = tasks.loop(seconds=RANK_POLL_SECONDS)(self._poll_ranks)
+        self._loops = (self.clan_loop, self.player_loop, self.war_loop, self.raid_loop, self.rank_loop)
         for loop in self._loops:
             loop.error(self._make_error_handler(loop))
 
@@ -981,6 +985,16 @@ class Collector:
         return group
 
     # ------------------------------------------------------------------ capital raids
+
+    async def _poll_ranks(self) -> None:
+        """Global top 200 (the only ranks the API publishes): current rank, and each legend day's
+        end-of-day rank (the last fetch before the 05:00 UTC reset)."""
+        now = datetime.now(UTC)
+        route = coc.http.Route("GET", self.coc.http.base_url, "/locations/global/rankings/players?limit=200")
+        data = await self._guarded(self.coc.http.request(route))
+        if data and data.get("items"):
+            await ranks.store_rankings(self.db, data["items"], legend_day_id(now), now)
+            self._cycle_done("ranks", now)
 
     async def _poll_raids(self) -> None:
         tags = await self.db.all_clan_tags()

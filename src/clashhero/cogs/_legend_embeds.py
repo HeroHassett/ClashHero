@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 import discord
 
 from clashhero.repos.legends import BoardEntry, DayStats, Hit, SeasonSummary, WeekDay, has_details
+from clashhero.services.battlelog import estimate_legend_result
 from clashhero.services.emojis import EMOJIS
 from clashhero.utils.fmt import chunk_lines, display_width, pad, player_link, signed, stars, table, ts
-from clashhero.utils.seasons import season_by_id, season_label
+from clashhero.utils.seasons import Window, season_by_id, season_label
 from clashhero.utils.style import SEP
 
 ATTACK_COLOR = discord.Color.green()
@@ -478,21 +479,27 @@ def _clip(text: str, columns: int) -> str:
     return out + "…"
 
 
-def battle_lines(hits: Sequence[Hit]) -> list[str]:
-    """One monospace line per battle: ``+28  ★★☆   86%  name``, columns aligned; battles
-    inferred from trophy changes and auto-filled defenses say so instead of stars and %."""
+def battle_lines(hits: Sequence[Hit], *, estimate: bool = False) -> list[str]:
+    """One monospace line per battle: ``+28  ★★☆   86%  name``, columns aligned. Battles inferred
+    from trophy changes say so; with ``estimate`` (Legend I, where the trophies fix the stars)
+    they show the likely stars and ``~90%``. Auto-filled defenses say so instead of stars and %."""
     width = max([3, *(len(signed(h.trophies)) for h in hits)])
-    lines = []
+    rows: list[tuple[str, str, str | None, str]] = []
     for h in hits:
         t = signed(h.trophies).rjust(width)
         if h.autofill:
-            lines.append(f"{t}  ···  {'—'.center(4)}  auto-filled (no defense received)")
+            rows.append((t, "···", None, "auto-filled (no defense received)"))
         elif not h.detailed:
-            lines.append(f"{t}  ···  {'—'.center(4)}  inferred from trophies")
+            guess = estimate_legend_result(h.trophies) if estimate else None
+            if guess:
+                rows.append((t, _stars(guess[0]), f"~{guess[1]}%", "inferred from trophies"))
+            else:
+                rows.append((t, "···", None, "inferred from trophies"))
         else:
             name = _clip(h.opponent_name or h.opponent_tag or "?", NAME_COLUMNS)
-            lines.append(f"{t}  {_stars(h.stars or 0)}  {f'{h.destruction or 0}%':>4}  {name}")
-    return lines
+            rows.append((t, _stars(h.stars or 0), f"{h.destruction or 0}%", name))
+    pw = max([4, *(len(pct) for _, _, pct, _ in rows if pct)])
+    return [f"{t}  {st}  {pct.rjust(pw) if pct else '—'.center(pw)}  {text}" for t, st, pct, text in rows]
 
 
 def summary_block(
@@ -541,6 +548,7 @@ def legends_today_embed(
     now: datetime | None = None,
     color: discord.Color | None = None,
     limit: int = LOGS_DESC_LIMIT,
+    estimate: bool = False,
 ) -> discord.Embed:
     """The /legends logs "today" view: the player's line, a summary block, then each attack and
     defense as a line (the newest kept when it's too long, with "… N earlier")."""
@@ -558,7 +566,8 @@ def legends_today_embed(
     a_head = f"{sym('ui_sword', '⚔️')} **Attacks {count(a_values, cap)} ({signed(sum(a_values))})**"
     d_head = f"{sym('ui_shield', '🛡️')} **Defenses {count(d_values, cap)} ({signed(sum(d_values))})**"
     summary = "```\n" + summary_block(attacks, defenses, cap, start, end) + "\n```"
-    a_lines, d_lines = battle_lines(attacks), battle_lines(defenses)
+    a_lines = battle_lines(attacks, estimate=estimate)
+    d_lines = battle_lines(defenses, estimate=estimate)
     dropped = [0, 0]
 
     def build() -> str:
@@ -583,5 +592,88 @@ def legends_today_embed(
     hits = [*attacks, *defenses]
     note = f" · {source_note(hits)}" if hits and not all(h.detailed or h.autofill for h in hits) else ""
     e.set_footer(text=f"{footer} · Net {signed(sum(a_values) + sum(d_values))}{note}")
+    e.timestamp = now or datetime.now().astimezone()
+    return e
+
+
+# ------------------------------------------------------------------ /legends logs: the season's history
+
+SUPERSCRIPT = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
+
+
+def season_span(window: Window) -> str:
+    """``2 Nov – 30 Nov 2026`` (the last day shown is the day the season resets)."""
+    s, e = window.start, window.end
+    first = f"{s.day} {s:%b}" + ("" if s.year == e.year else f" {s.year}")
+    return f"{first} – {e.day} {e:%b %Y}"
+
+
+def season_table(summary: SeasonSummary, window: Window) -> list[str]:
+    """``DAY ATK DEF +/- INIT FINAL`` lines, right-aligned: one per tracked day, the attack and
+    defense totals with their battle count as superscript digits (``+268⁸``)."""
+    first = window.start.date()
+    rows = [["DAY", "ATK", "DEF", "+/-", "INIT", "FINAL"]]
+    for d in summary.days:
+        s = d.stats
+        rows.append(
+            [
+                str((date.fromisoformat(d.day) - first).days + 1),
+                signed(s.offense) + str(len(s.attacks)).translate(SUPERSCRIPT),
+                signed(s.defense) + str(len(s.defenses)).translate(SUPERSCRIPT),
+                signed(s.net),
+                str(d.start) if d.start is not None else "?",
+                str(d.end) if d.end is not None else "?",
+            ]
+        )
+    widths = [max(display_width(r[i]) for r in rows) for i in range(len(rows[0]))]
+    return ["  ".join(pad(c, widths[i], right=True) for i, c in enumerate(r)) for r in rows]
+
+
+def season_logs_embed(
+    *,
+    name: str,
+    tag: str,
+    town_hall: int | None,
+    league: str | None,
+    trophies: int | None,
+    window: Window,
+    summary: SeasonSummary,
+    today: int | None,
+    now: datetime | None = None,
+    color: discord.Color | None = None,
+    limit: int = LOGS_DESC_LIMIT,
+) -> discord.Embed:
+    """The /legends logs history view: the player's line, the attacks and defenses won, and a
+    day-by-day table (the newest days kept when it's too long). ``today``: the day's index in
+    the season while it runs, None once it's over."""
+    e = discord.Embed(title=f"{name} ({tag})", url=player_link(tag), color=color)
+    line = []
+    if town_hall:
+        th = EMOJIS.town_hall(town_hall)
+        line.append(f"{th} {town_hall}" if th else f"TH{town_hall}")
+    if trophies is not None:
+        line.append(f"{EMOJIS.league(league) or '🏆'} {trophies}")
+    span = season_span(window)
+    attacks_won = sum(1 for h in summary.attack_hits if h.stars is not None and h.stars >= 1)
+    defenses_won = sum(1 for h in summary.defense_hits if h.stars == 0 and not h.autofill)
+    won = (
+        f"• {attacks_won} attack{'s' if attacks_won != 1 else ''} and "
+        f"{defenses_won} defense{'s' if defenses_won != 1 else ''} won"
+    )
+    head = [" ".join(line)] if line else []
+    head += [f"**Legend Season Logs ({span})**", won]
+    rows = season_table(summary, window)
+    if len(rows) == 1:
+        e.description = "\n".join([*head, "No legend days recorded for this season."])
+    else:
+        body, dropped = rows[1:], 0
+        while True:
+            text = "\n".join([*head, "```", rows[0], *body[dropped:], "```"])
+            if len(text) <= limit or len(body) - dropped <= 1:
+                break
+            dropped += 1
+        e.description = text
+    days = (window.end.date() - window.start.date()).days
+    e.set_footer(text=f"Day {today + 1 if today is not None else days}/{days} ({span})")
     e.timestamp = now or datetime.now().astimezone()
     return e

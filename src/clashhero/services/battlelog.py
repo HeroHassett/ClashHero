@@ -251,3 +251,19 @@ def battle_trophies(
         for i, v in zip(open_idx, split, strict=True):
             out[i] = v
     return out
+
+
+def estimate_legend_result(trophies: int) -> tuple[int, int] | None:
+    """(stars, destruction %) a Legend I battle most likely had, from its trophy change alone, for
+    battles inferred from trophy changes (the battle log can lag behind for defenses). The amount
+    fixes the stars except at the edges: 40 is a triple; 21-32 two stars (0.32 x 99% is the most a
+    2-star can earn); 5-15 one star; 0-4, 16-20 and 33-39 are ambiguous or not from the rule (None).
+    The % is the trophies' share of the band, kept under 100 when it isn't a triple."""
+    t = abs(trophies)
+    if t == 40:
+        return 3, 100
+    if 21 <= t <= 32:
+        return 2, min(99, round(t / 0.32))
+    if 5 <= t <= 15:
+        return 1, min(99, round(t / 0.2))
+    return None

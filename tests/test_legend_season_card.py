@@ -299,7 +299,11 @@ async def test_logs_fall_back_to_the_text_embed(season_db, monkeypatch, caplog):
 
 async def test_logs_for_a_past_season_by_date(season_db):
     msg = await run_logs(season_db, season="2026-10-20")
-    assert msg["embed"].description == "No legend data recorded for this season."  # the history view
+    e = msg["embed"]  # the history view
+    assert e.description.endswith("No legend days recorded for this season.")
+    assert "Legend Season Logs (5 Oct – 2 Nov 2026)" in e.description and e.footer.text.startswith(
+        "Day 28/28"
+    )
     assert msg["file"].filename == "legend-season.png"  # an empty season still gets its card
     current = [b.item for b in msg["view"].children if b.item.style.name == "primary"]
     assert [b.label for b in current] == ["View Historical Data"]
