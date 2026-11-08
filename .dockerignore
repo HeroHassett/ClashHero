@@ -1,0 +1,8 @@
+.env
+.venv
+.git
+data
+coc_api_info.md
+tests
+docs
+**/__pycache__

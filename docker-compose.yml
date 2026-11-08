@@ -1,0 +1,15 @@
+# Run ClashHero in the background, restarting automatically:
+#   docker compose up -d --build
+#   docker compose logs -f
+services:
+  clashhero:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_PATH: /app/data/clashhero.db
+    volumes:
+      - clashhero-data:/app/data
+
+volumes:
+  clashhero-data:
