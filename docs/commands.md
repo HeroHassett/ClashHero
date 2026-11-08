@@ -295,6 +295,4 @@ settings need **Manage Server** or the matching manager role set with `/config r
 
 ---
 
-This page is generated from the bot's code. This material is unofficial and is not endorsed by
-Supercell. For more information see Supercell's Fan Content Policy:
-[www.supercell.com/fan-content-policy](https://www.supercell.com/fan-content-policy).
+This page is generated from the bot's code, so it always matches what the bot can do.

@@ -1,0 +1,146 @@
+---
+home: true
+title: ClashHero
+description: Legend tracking, CWL rosters, war stats, live logs, reminders and more for Clash of Clans clans, free in your Discord server.
+---
+{% capture i_open %}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{% endcapture %}
+<section class="hero">
+  <div class="wrap">
+    <img class="hero-banner" src="{{ '/assets/img/banner.webp' | relative_url }}" alt="ClashHero" width="2000" height="707">
+    <h1>Run your clan, not spreadsheets</h1>
+    <p class="lead">ClashHero brings legend tracking, CWL rosters, war stats, live logs and reminders into your Discord server, so leaders spend less time managing and more time attacking.</p>
+    <div class="hero-actions">
+      <a class="btn btn-primary" href="{{ site.invite_url }}">
+        {{ i_open }}<path d="M12 5v14M5 12h14"/></svg>
+        Add to Discord
+      </a>
+      <a class="btn btn-ghost" href="{{ '/commands' | relative_url }}">Browse commands</a>
+    </div>
+    <div class="pills">
+      <span class="pill"><strong>170+</strong> slash commands</span>
+      <span class="pill"><strong>Free</strong> with no paywalls</span>
+      <span class="pill"><strong>Official</strong> Clash of Clans API only</span>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="eyebrow">Features</span>
+      <h2>Everything a clan leader keeps track of</h2>
+      <p>ClashHero watches your clans around the clock and keeps the numbers ready when you need them.</p>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <div class="icon">{{ i_open }}<path d="M3 18h18M4 18 3 7l5 4 4-7 4 7 5-4-1 11"/></svg></div>
+        <h3>Legend &amp; ranked tracking</h3>
+        <p>Every ranked attack and defense with opponent, stars, destruction and the army used. Alerts by DM or channel, plus day, week and season logs and live leaderboards.</p>
+      </div>
+      <div class="card">
+        <div class="icon">{{ i_open }}<rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4h6v3H9zM9 12l2 2 4-4M9 17h6"/></svg></div>
+        <h3>CWL rosters</h3>
+        <p>Sign-up buttons, eligibility rules and groups, with lineups suggested from your members' real CWL and war hit rates. Automatic reminders for anyone who hasn't signed up.</p>
+      </div>
+      <div class="card">
+        <div class="icon">{{ i_open }}<path d="m14.5 17.5 6-6V5h-6.5l-6 6M13 19l6-6M16 16l4 4M19 21l2-2M9.5 17.5l-6-6V5H10l6 6M11 19l-6-6M8 16l-4 4M5 21l-2-2"/></svg></div>
+        <h3>War &amp; CWL stats</h3>
+        <p>Hit rates by Town Hall difference, missed attacks, defense holds, target calling, CWL standings and round-by-round history for every member.</p>
+      </div>
+      <div class="card">
+        <div class="icon">{{ i_open }}<path d="M4 6h16M4 12h10M4 18h7"/><circle cx="18" cy="17" r="3"/></svg></div>
+        <h3>Live logs</h3>
+        <p>Joins and leaves (and where members went), donations, upgrades, super troop boosts, war attacks, raids, Clan Games and clan setting changes, posted as they happen.</p>
+      </div>
+      <div class="card">
+        <div class="icon">{{ i_open }}<path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg></div>
+        <h3>Smart reminders</h3>
+        <p>Ping only the members with attacks left before war, CWL, raid weekend or Clan Games ends, filtered by Town Hall, clan role and war type.</p>
+      </div>
+      <div class="card">
+        <div class="icon">{{ i_open }}<path d="M3 21h18M5 21V9l3-2V4h2v2l2-1 2 1V4h2v3l3 2v12M10 21v-5h4v5"/></svg></div>
+        <h3>Base tracking</h3>
+        <p>A base library with copy links and voting, and a record of which layouts you've already used in this month's CWL, round by round.</p>
+      </div>
+      <div class="card">
+        <div class="icon">{{ i_open }}<circle cx="12" cy="12" r="8"/><path d="M12 8v8M9.5 10.5c0-1 1-1.5 2.5-1.5s2.5.6 2.5 1.6c0 2.2-5 1.2-5 3.4 0 1 1 1.6 2.5 1.6s2.5-.5 2.5-1.5"/></svg></div>
+        <h3>Capital &amp; Clan Games</h3>
+        <p>Raid weekend summaries, capital gold contributions and Clan Games progress, tracked automatically with no manual counting.</p>
+      </div>
+      <div class="card">
+        <div class="icon">{{ i_open }}<path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/><path d="m9 12 2 2 4-4"/></svg></div>
+        <h3>Autoroles &amp; moderation</h3>
+        <p>Roles by clan role, Town Hall, league and war lineup, nicknames from templates, and ban or weighted strike records that alert you when a flagged player joins.</p>
+      </div>
+      <div class="card">
+        <div class="icon">{{ i_open }}<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg></div>
+        <h3>Boards &amp; exports</h3>
+        <p>Leaderboards posted daily, weekly or at season end, a personal <code>/todo</code> for every member, and CSV exports for the spreadsheet fans.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="eyebrow">Getting started</span>
+      <h2>Up and running in a minute</h2>
+    </div>
+    <div class="steps">
+      <div class="step">
+        <h3>Add ClashHero</h3>
+        <p>Invite the bot to your server with the <a href="{{ site.invite_url }}">Add to Discord</a> button.</p>
+      </div>
+      <div class="step">
+        <h3>Connect your clan</h3>
+        <p>Run <code>/setup clan</code> with your clan tag. Tracking starts right away.</p>
+      </div>
+      <div class="step">
+        <h3>Link accounts</h3>
+        <p>Members run <code>/link create</code> with their player tag, then check <code>/todo</code> and <code>/help</code>.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="section-head">
+      <span class="eyebrow">Built to be trusted</span>
+      <h2>Your clan, your data</h2>
+    </div>
+    <div class="trust">
+      <div>
+        <h3>No account access</h3>
+        <p>ClashHero only reads Supercell's official public API. It never asks for or signs in to anyone's game account.</p>
+      </div>
+      <div>
+        <h3>Free, no paywalls</h3>
+        <p>Every feature is available to every server. There are no premium tiers.</p>
+      </div>
+      <div>
+        <h3>Delete anytime</h3>
+        <p>See what's stored with <code>/privacy mydata</code> and remove it with <code>/privacy delete</code>. Read the <a href="{{ '/privacy-policy' | relative_url }}">privacy policy</a>.</p>
+      </div>
+      <div>
+        <h3>Ready for updates</h3>
+        <p>ClashHero tells you when the Clash API is down for maintenance and picks up again on its own. Check <code>/status</code> anytime.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="cta">
+      <img src="{{ '/assets/img/logo-256.jpg' | relative_url }}" alt="" width="88" height="88">
+      <h2>Ready to lead smarter?</h2>
+      <p>Add ClashHero to your server and let it handle the bookkeeping.</p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="{{ site.invite_url }}">Add to Discord</a>
+        <a class="btn btn-ghost" href="mailto:{{ site.contact_email }}">Contact us</a>
+      </div>
+    </div>
+  </div>
+</section>

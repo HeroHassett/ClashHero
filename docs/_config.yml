@@ -1,2 +1,17 @@
 title: ClashHero
-description: A Discord bot for running Clash of Clans clans.
+description: Clan management for Clash of Clans, right in your Discord server.
+url: https://herohassett.github.io
+baseurl: /ClashHero
+
+invite_url: https://discord.com/oauth2/authorize?client_id=1568779035805356042&scope=bot+applications.commands&permissions=403164224
+github_url: https://github.com/HeroHassett/ClashHero
+contact_email: clashherobot@gmail.com
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
+
+exclude:
+  - README.md
