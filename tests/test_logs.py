@@ -400,3 +400,25 @@ def test_log_list_lines_groups_by_clan():
     ]
     assert log_list_lines([], [], {}) == []
     assert log_list_lines([], server_rows, {})[0] == "🖥️ **Server**"
+
+
+def test_missing_post_permissions():
+    assert logs_mod.missing_post_permissions(discord.Permissions.all()) == []
+    perms = discord.Permissions(view_channel=True, send_messages=False, embed_links=False)
+    assert logs_mod.missing_post_permissions(perms) == ["Send Messages", "Embed Links"]
+
+
+def test_check_can_post_refuses_a_channel_the_bot_cant_post_in():
+    class Channel:
+        mention = "#bots"
+
+        def __init__(self, perms):
+            self.perms = perms
+
+        def permissions_for(self, member):
+            return self.perms
+
+    logs_mod.check_can_post(Channel(discord.Permissions.all()), object())  # fine
+    logs_mod.check_can_post(Channel(discord.Permissions.none()), None)  # no member info: allowed
+    with pytest.raises(ResolveError, match="View Channel, Send Messages, Embed Links"):
+        logs_mod.check_can_post(Channel(discord.Permissions.none()), object())

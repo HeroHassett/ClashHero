@@ -47,6 +47,30 @@ def parse_color(raw: str | None) -> int | None:
         raise ResolveError(f"`{raw}` isn't a hex color like `#00ff88`.") from e
 
 
+POST_PERMISSIONS = (
+    ("view_channel", "View Channel"),
+    ("send_messages", "Send Messages"),
+    ("embed_links", "Embed Links"),
+)
+
+
+def missing_post_permissions(perms: discord.Permissions) -> list[str]:
+    """The permissions a log channel needs that the bot doesn't have there."""
+    return [label for attr, label in POST_PERMISSIONS if not getattr(perms, attr)]
+
+
+def check_can_post(channel, me) -> None:
+    """Refuse a log channel the bot couldn't post in (otherwise every post would silently fail)."""
+    if me is None or not hasattr(channel, "permissions_for"):
+        return
+    missing = missing_post_permissions(channel.permissions_for(me))
+    if missing:
+        raise ResolveError(
+            f"I can't post in {channel.mention}: I'm missing **{', '.join(missing)}** there. "
+            "Give the ClashHero role those permissions in the channel settings, then try again."
+        )
+
+
 def log_list_lines(clan_rows, server_rows, clan_names: dict[str, str]) -> list[str]:
     """/logs list body: one block per clan (header with name and tag), then server logs."""
     lines: list[str] = []
@@ -141,6 +165,7 @@ class Logs(BaseCog):
             )
             return
         target = channel or interaction.channel
+        check_can_post(target, interaction.guild and interaction.guild.me)
         await self.db.set_clan_log(
             interaction.guild_id,
             tag,
@@ -151,7 +176,11 @@ class Logs(BaseCog):
         )
         ping = f", pinging {ping_role.mention}" if ping_role else ""
         await interaction.response.send_message(
-            embed=ok_embed(f"**{log_type.name}** for {label} will post in {target.mention}{ping}."),
+            embed=ok_embed(
+                f"**{log_type.name}** for {label} will post in {target.mention}{ping}.\n"
+                "Nothing is posted right away: posts start with the next matching event in the "
+                "game (a join or leave shows up about a minute after it happens)."
+            ),
             ephemeral=True,
         )
 
@@ -172,6 +201,7 @@ class Logs(BaseCog):
             )
             return
         target = channel or interaction.channel
+        check_can_post(target, interaction.guild and interaction.guild.me)
         await self.db.set_server_log(interaction.guild_id, log_type.value, target.id)
         await interaction.response.send_message(
             embed=ok_embed(f"**{log_type.name}** will post in {target.mention}."), ephemeral=True

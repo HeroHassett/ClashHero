@@ -18,7 +18,8 @@ async def _channel(bot: ClashHeroBot, channel_id: int) -> discord.abc.Messageabl
     if ch is None:
         try:
             ch = await bot.fetch_channel(channel_id)
-        except (discord.NotFound, discord.Forbidden):
+        except (discord.NotFound, discord.Forbidden) as e:
+            log.warning("Log channel %s can't be reached: %s", channel_id, e)
             return None
     return ch  # type: ignore[return-value]
 
