@@ -65,12 +65,14 @@ class AccountTodo:
 # ------------------------------------------------------------------ pure helpers
 
 
-def ranked_item(league: str | None, today_attacks: int, week_attacks: int, now: datetime) -> TodoItem | None:
+def ranked_item(
+    league: str | None, today_attacks: int, week_attacks: int, now: datetime, first_day: bool = False
+) -> TodoItem | None:
     """Legend I: today vs the daily cap. Legend II/III: this week vs the weekly cap. Other tracked
     tiers: today's count with no cap. None when untracked or nothing is left."""
     if not is_tracked_ranked(league):
         return None
-    if (cap := daily_attack_cap(league)) is not None:
+    if (cap := daily_attack_cap(league, first_day=first_day)) is not None:
         item = TodoItem("ranked", league, today_attacks, cap, legend_day_bounds(now)[1], "today")
     elif (cap := weekly_attack_cap(league)) is not None:
         item = TodoItem("ranked", league, week_attacks, cap, ranked_week(now).end, "this week")
@@ -147,10 +149,17 @@ async def ranked_items(
         (today, week.start.date().isoformat(), week.end.date().isoformat(), *tags),
     )
     counts = {r["player_tag"]: (r["today"] or 0, r["week"] or 0) for r in rows}
+    promoted = {
+        r["player_tag"]
+        for r in await db.fetchall(
+            f"SELECT player_tag FROM legend_promotions WHERE legend_day = ? AND player_tag IN ({_in(tags)})",
+            (today, *tags),
+        )
+    }
     out: dict[str, list[TodoItem]] = {}
     for tag in tags:
         day_n, week_n = counts.get(tag, (0, 0))
-        item = ranked_item(players[tag]["league"], day_n, week_n, now)
+        item = ranked_item(players[tag]["league"], day_n, week_n, now, first_day=tag in promoted)
         if item is not None:
             out[tag] = [item]
     return out

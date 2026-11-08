@@ -6,7 +6,12 @@ The legacy ``league`` field now reads "Unranked" for everyone, and coc.py 4.0 do
 ``raw_attribute=True``).
 
 Tournament rules (adjust here if Supercell changes them):
-- Legend I runs 4-week tournaments (the 28-day game season); 8 attacks + 8 defenses per day.
+- Legend I runs 4-week tournaments (the 28-day game season); 8 attacks + 8 defenses per day, or
+  7 + 7 on a player's first Legend I day after promotion. Defenses lose trophies. Trophies reset
+  to 5000 at season end, and anyone under 5000 is set back to 5000 at each weekly reset.
+- In every tier below Legend I, defenses *gain* trophies (+0 to +40).
+- Defenses a player didn't receive by the daily reset are auto-filled by the game with their
+  average defense (season average in Legend I, tournament average elsewhere).
 - Every other tier runs weekly tournaments (Monday 05:00 UTC to Monday 05:00 UTC).
 - Legend II allows 30 attacks per week and Legend III 24 ("battles" in Supercell's wording).
 - Per-battle tracking covers Dragon League 28 and up.
@@ -78,9 +83,18 @@ def set_tiers(names: Sequence[str]) -> list[str]:
     return added
 
 
-def daily_attack_cap(name: str | None) -> int | None:
+FIRST_DAY_CAP = 7  # first Legend I day after promotion
+
+
+def daily_attack_cap(name: str | None, first_day: bool = False) -> int | None:
     """Attacks (and defenses) allowed per legend day, or None when the tier has no daily cap."""
-    return DAILY_ATTACK_CAP.get(name.lower()) if name else None
+    cap = DAILY_ATTACK_CAP.get(name.lower()) if name else None
+    return FIRST_DAY_CAP if cap is not None and first_day else cap
+
+
+def defenses_gain(name: str | None) -> bool:
+    """True for tiers where a defense gains trophies (every tracked tier below Legend I)."""
+    return is_tracked_ranked(name) and not is_legend_one(name)
 
 
 def weekly_attack_cap(name: str | None) -> int | None:

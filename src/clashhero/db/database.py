@@ -414,6 +414,12 @@ class Database:
         rows = await self.fetchall("SELECT key, data FROM snapshot_cache WHERE key LIKE ?", (prefix + "%",))
         return {r["key"]: json.loads(r["data"]) for r in rows}
 
+    async def load_snapshot_times(self, prefix: str) -> dict[str, str]:
+        rows = await self.fetchall(
+            "SELECT key, updated_at FROM snapshot_cache WHERE key LIKE ?", (prefix + "%",)
+        )
+        return {r["key"]: r["updated_at"] for r in rows}
+
     async def save_snapshot(self, key: str, data: dict, now_iso: str) -> None:
         await self.execute(
             "INSERT INTO snapshot_cache (key, data, updated_at) VALUES (?, ?, ?) "

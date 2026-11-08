@@ -18,10 +18,13 @@ def test_duration():
 
 
 def test_presence():
-    status, activity = presence_for(True, 3)
+    status, activity = presence_for(True, 3, 2, 1)
     assert status is discord.Status.idle and "maintenance" in activity.name
-    status, activity = presence_for(False, 1)
-    assert status is discord.Status.online and activity.name == "1 clan · /help"
+    status, activity = presence_for(False, 1, 1, 0)
+    assert status is discord.Status.online and activity.name == "/help for commands"
+    status, activity = presence_for(False, 1, 1, 1)
+    assert activity.name == "1 clan in 1 server"
+    assert presence_for(False, 12, 1234, 1)[1].name == "12 clans in 1,234 servers"
 
 
 def test_status_fields():

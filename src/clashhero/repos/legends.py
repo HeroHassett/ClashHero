@@ -41,6 +41,7 @@ class Hit:
     stars: int | None = None
     destruction: int | None = None
     army_share_code: str | None = None
+    autofill: bool = False  # a defense the game filled in at the daily reset (no real battle)
 
     @property
     def detailed(self) -> bool:
@@ -64,6 +65,7 @@ class Hit:
             stars=_col(r, "stars"),
             destruction=_col(r, "destruction"),
             army_share_code=_col(r, "army_share_code"),
+            autofill=_col(r, "battle_type") == "autofill",
         )
 
 
@@ -396,10 +398,23 @@ async def week_days(db: Database, player_tag: str, week_start: datetime) -> list
     return out
 
 
+async def first_legend_days(db: Database, legend_day: str, tags: Sequence[str]) -> set[str]:
+    """Players whose first Legend I day after promotion is ``legend_day`` (7 hits, not 8)."""
+    if not tags:
+        return set()
+    rows = await db.fetchall(
+        "SELECT player_tag FROM legend_promotions WHERE legend_day = ? "
+        f"AND player_tag IN ({','.join('?' * len(tags))})",
+        (legend_day, *tags),
+    )
+    return {r["player_tag"] for r in rows}
+
+
 async def day_stats(db: Database, player_tag: str, legend_day: str) -> DayStats:
     rows = await day_events(db, legend_day, [player_tag])
     stats = aggregate_day(rows).get(player_tag, DayStats(player_tag))
-    stats.cap = daily_attack_cap(await player_league(db, player_tag))
+    first = player_tag in await first_legend_days(db, legend_day, [player_tag])
+    stats.cap = daily_attack_cap(await player_league(db, player_tag), first_day=first)
     return stats
 
 
@@ -453,8 +468,10 @@ async def board_entries(db: Database, tags: Sequence[str], legend_day: str) -> l
         list(tags),
     )
     stats = aggregate_day(await day_events(db, legend_day, list(tags)))
+    first = await first_legend_days(db, legend_day, list(tags))
     for p in players:
-        stats.setdefault(p["player_tag"], DayStats(p["player_tag"])).cap = daily_attack_cap(p["league"])
+        cap = daily_attack_cap(p["league"], first_day=p["player_tag"] in first)
+        stats.setdefault(p["player_tag"], DayStats(p["player_tag"])).cap = cap
     return sort_board(
         BoardEntry(
             p["player_tag"],

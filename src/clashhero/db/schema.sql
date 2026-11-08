@@ -193,6 +193,13 @@ CREATE TABLE IF NOT EXISTS legend_days (
     PRIMARY KEY (player_tag, legend_day)
 );
 
+-- Legend days on which a player was first seen in Legend I after promotion (7-hit day).
+CREATE TABLE IF NOT EXISTS legend_promotions (
+    player_tag TEXT NOT NULL,
+    legend_day TEXT NOT NULL,
+    PRIMARY KEY (player_tag, legend_day)
+);
+
 -- Wars (regular, friendly and CWL rounds) seen for tracked clans.
 CREATE TABLE IF NOT EXISTS wars (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,

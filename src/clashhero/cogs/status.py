@@ -30,10 +30,20 @@ LOOP_LABELS = (
 )
 
 
-def presence_for(in_maintenance: bool, clans: int) -> tuple[discord.Status, discord.BaseActivity]:
+def _plural(n: int, word: str) -> str:
+    return f"{n:,} {word}{'' if n == 1 else 's'}"
+
+
+def presence_for(
+    in_maintenance: bool, clans: int, servers: int = 1, phase: int = 0
+) -> tuple[discord.Status, discord.BaseActivity]:
+    """What the member list shows under the bot's name. Rotates between a help hint and what's
+    being watched; maintenance always wins."""
     if in_maintenance:
-        return discord.Status.idle, discord.Game("🛠️ Clash API maintenance")
-    label = f"{clans} clan{'s' if clans != 1 else ''} · /help"
+        return discord.Status.idle, discord.CustomActivity(name="🛠️ Clash API maintenance")
+    if phase % 2 == 0:
+        return discord.Status.online, discord.CustomActivity(name="/help for commands")
+    label = f"{_plural(clans, 'clan')} in {_plural(servers, 'server')}"
     return discord.Status.online, discord.Activity(type=discord.ActivityType.watching, name=label)
 
 
@@ -65,7 +75,8 @@ class Status(BaseCog):
     def __init__(self, bot) -> None:
         super().__init__(bot)
         self.started_at = datetime.now(UTC)
-        self._shown: tuple[bool, int] | None = None
+        self._shown: tuple | None = None
+        self._phase = 0
 
     async def cog_load(self) -> None:
         self.presence_loop.start()
@@ -76,8 +87,15 @@ class Status(BaseCog):
     async def _clan_count(self) -> int:
         return await self.db.fetchval("SELECT COUNT(DISTINCT clan_tag) FROM guild_clans", (), 0)
 
-    async def refresh_presence(self, force: bool = False) -> None:
-        state = (self.collector.in_maintenance, await self._clan_count())
+    async def refresh_presence(self, force: bool = False, rotate: bool = False) -> None:
+        if rotate:
+            self._phase += 1
+        state = (
+            self.collector.in_maintenance,
+            await self._clan_count(),
+            len(self.bot.guilds),
+            self._phase % 2,
+        )
         if state == self._shown and not force:
             return
         status, activity = presence_for(*state)
@@ -89,7 +107,7 @@ class Status(BaseCog):
 
     @tasks.loop(minutes=5)
     async def presence_loop(self) -> None:
-        await self.refresh_presence()
+        await self.refresh_presence(rotate=True)
 
     @presence_loop.before_loop
     async def _wait(self) -> None:

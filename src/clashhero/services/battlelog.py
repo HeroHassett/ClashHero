@@ -155,12 +155,16 @@ def _even_split(total: int, n: int) -> list[int]:
     return [sign * (base + (1 if i < rem else 0)) for i in range(n)]
 
 
-def assign_trophies(battles: Sequence[Battle], delta: int) -> list[int]:
+def assign_trophies(battles: Sequence[Battle], delta: int, *, defenses_gain: bool = False) -> list[int]:
     """Split an observed trophy change across ``battles`` (ranked, oldest first).
 
-    Attacks only gain and defenses only lose, so gains go to attacks and losses to defenses.
-    When both happen between two polls only the net change is known, so the split is approximate.
+    In Legend I attacks gain and defenses lose, so gains go to attacks and losses to defenses.
+    Below Legend I both attacks and defenses gain, so a gain is shared across all of them.
+    When several battles land between two polls only the net change is known, so the split is
+    approximate.
     """
+    if defenses_gain:
+        return _even_split(max(delta, 0), len(battles)) if battles else []
     att = [i for i, b in enumerate(battles) if b.attack]
     dfn = [i for i, b in enumerate(battles) if not b.attack]
     out = [0] * len(battles)
@@ -198,7 +202,9 @@ def legend_trophies(b: Battle) -> int | None:
     return value if b.attack else -value
 
 
-def battle_trophies(battles: Sequence[Battle], fresh_keys: set[str], delta: int) -> list[int]:
+def battle_trophies(
+    battles: Sequence[Battle], fresh_keys: set[str], delta: int, *, defenses_gain: bool = False
+) -> list[int]:
     """Trophies for each battle (oldest first).
 
     Legend I battles use the stars/destruction rule. For the rest, the observed trophy change
@@ -214,8 +220,9 @@ def battle_trophies(battles: Sequence[Battle], fresh_keys: set[str], delta: int)
         explained = sum(
             k for b, k in zip(battles, known, strict=True) if k is not None and b.key in fresh_keys
         )
-        for i, v in zip(
-            open_idx, assign_trophies([battles[i] for i in open_idx], delta - explained), strict=True
-        ):
+        split = assign_trophies(
+            [battles[i] for i in open_idx], delta - explained, defenses_gain=defenses_gain
+        )
+        for i, v in zip(open_idx, split, strict=True):
             out[i] = v
     return out

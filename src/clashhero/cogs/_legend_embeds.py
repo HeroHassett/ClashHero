@@ -38,6 +38,8 @@ def hit_line(h: Hit) -> str:
     """One battle: trophies, then stars, destruction and opponent when read from the battle log
     (`` `+40` ★★★ 100% · vs Name TH17``); inferred battles show only the trophies."""
     base = f"`{signed(h.trophies):>4}`"
+    if h.autofill:
+        return f"{base} auto-filled by the game (defense not received)"
     if not h.detailed:
         return base
     word = "vs" if h.kind == "attack" else "by"
@@ -48,7 +50,7 @@ def hit_line(h: Hit) -> str:
 def hit_chunks(hits: Sequence[Hit], limit: int = 1024) -> list[str]:
     """Field values listing ``hits``: one line per battle when any has battle-log details,
     otherwise the compact trophy list."""
-    if not has_details(hits):
+    if not has_details(hits) and not any(h.autofill for h in hits):
         return [_hits([h.trophies for h in hits])]
     return [c.rstrip() for c in chunk_lines([hit_line(h) for h in hits], limit)]
 

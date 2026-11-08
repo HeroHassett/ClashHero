@@ -10,7 +10,7 @@ import math
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from clashhero.utils.ranked import is_tracked_ranked, league_name
+from clashhero.utils.ranked import is_legend_one, is_tracked_ranked, league_name
 
 try:  # unit categories from coc.py's static game data
     from coc import PETS_ORDER, SIEGE_MACHINE_ORDER, SUPER_TROOP_ORDER
@@ -258,7 +258,9 @@ def infer_battles(old: PlayerSnap, new: PlayerSnap) -> list[InferredBattle]:
     att = max(0, new.attack_wins - old.attack_wins)
     dfn = max(0, new.defense_wins - old.defense_wins)
     if delta > 0:
-        return _split("attack", delta, max(att, 1))
+        return _split("attack", delta, max(att, 1))  # below Legend I this may be a defense: unknowable
+    if delta < 0 and not is_legend_one(new.league):
+        return []  # outside Legend I trophies only drop at resets, never in battle
     if delta < 0:
         return _split("defense", delta, max(1, math.ceil(-delta / MAX_TROPHIES_PER_BATTLE)))
     if att:  # trophies unchanged but an attack registered (e.g. 0-trophy hit)

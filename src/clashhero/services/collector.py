@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
@@ -47,8 +47,15 @@ from clashhero.services.snapshots import (
     has_activity,
     infer_battles,
 )
-from clashhero.utils.ranked import is_tracked_ranked
-from clashhero.utils.seasons import clan_games, cwl_season_id, game_season, legend_day_id
+from clashhero.utils.ranked import daily_attack_cap, defenses_gain, is_legend_one, is_tracked_ranked
+from clashhero.utils.seasons import (
+    clan_games,
+    cwl_season_id,
+    game_season,
+    legend_day_bounds,
+    legend_day_id,
+    ranked_week,
+)
 
 if TYPE_CHECKING:
     from clashhero.bot import ClashHeroBot
@@ -70,6 +77,28 @@ def _ts(t: Any) -> datetime | None:
     return raw if raw.tzinfo else raw.replace(tzinfo=UTC)
 
 
+@dataclass(frozen=True)
+class Crossing:
+    """Which resets happened between a player's previous poll and this one."""
+
+    day: bool = False  # a legend-day reset (05:00 UTC)
+    week: bool = False  # a weekly tournament reset (Monday 05:00 UTC; also every season end)
+    prev_day: str | None = None  # the legend day that just ended (only for a single-day step)
+
+
+NO_CROSSING = Crossing()
+
+
+def crossing_between(prev: datetime | None, now: datetime) -> Crossing:
+    if prev is None:
+        return NO_CROSSING
+    prev_day, day = legend_day_id(prev), legend_day_id(now)
+    if prev_day == day:
+        return NO_CROSSING
+    adjacent = legend_day_id(now - timedelta(days=1)) == prev_day
+    return Crossing(True, ranked_week(prev).id != ranked_week(now).id, prev_day if adjacent else None)
+
+
 def _sides(war: Any, clan_tag: str) -> tuple[Any, Any]:
     """(our side, their side); coc.py may orient a war from either clan."""
     if getattr(war.clan, "tag", None) == clan_tag:
@@ -88,6 +117,7 @@ class Collector:
         self._cwl_lineups: dict[str, set[str]] = {}
         self._battle_cursors: dict[str, Cursor] = {}
         self._battlelog_fetched: dict[str, datetime] = {}
+        self._player_seen: dict[str, datetime] = {}  # when each player's snapshot was taken
         self._player_sources: dict[str, PlayerSource] = {}
         self.in_maintenance = False
         self.maintenance_since: datetime | None = None
@@ -119,6 +149,8 @@ class Collector:
             self._clans[key[5:]] = ClanSnap.from_json(data)
         for key, data in (await self.db.load_snapshots("player:")).items():
             self._players[key[7:]] = PlayerSnap.from_json(data)
+        for key, seen in (await self.db.load_snapshot_times("player:")).items():
+            self._player_seen[key[7:]] = datetime.fromisoformat(seen)
         for key, data in (await self.db.load_snapshots("battles:")).items():
             self._battle_cursors[key[8:]] = Cursor.from_json(data)
         log.info(
@@ -368,16 +400,20 @@ class Collector:
                 self._battle_cursors[tag] = cursor
                 note_unknown_types(fresh)
                 logged = ([b for b in battles if b.ranked], {b.key for b in fresh})
+        crossing = crossing_between(self._player_seen.get(tag), now) if old is not None else NO_CROSSING
         async with self.db.batch():
             await self._store_player(new, now)
             if logged is not None:
-                await self._sync_battles(old, new, *logged, now)
+                await self._sync_battles(old, new, *logged, now, crossing)
             if old is not None:
-                await self._apply_player_diff(old, new, now, battle_log_read=logged is not None)
+                await self._apply_player_diff(
+                    old, new, now, battle_log_read=logged is not None, crossing=crossing
+                )
             else:
                 await self._ensure_name(new, now)
             await self._update_legend_day(new, now)
             self._players[tag] = new
+            self._player_seen[tag] = now
             await self.db.save_snapshot(f"player:{tag}", new.to_json(), _iso(now))
             if tag in self._battle_cursors:
                 await self.db.save_snapshot(f"battles:{tag}", self._battle_cursors[tag].to_json(), _iso(now))
@@ -448,7 +484,13 @@ class Collector:
         )
 
     async def _apply_player_diff(
-        self, old: PlayerSnap, new: PlayerSnap, now: datetime, *, battle_log_read: bool = False
+        self,
+        old: PlayerSnap,
+        new: PlayerSnap,
+        now: datetime,
+        *,
+        battle_log_read: bool = False,
+        crossing: Crossing = NO_CROSSING,
     ) -> None:
         clan = new.clan_tag
         if old.clan_tag != new.clan_tag:
@@ -467,6 +509,11 @@ class Collector:
             self.dispatch(ev.TownHallUpgraded(clan, new.tag, new.name, old.town_hall, new.town_hall))
         if old.league != new.league:
             self.dispatch(ev.LeagueChanged(clan, new.tag, new.name, old.league, new.league, new.trophies))
+            if is_legend_one(new.league) and not is_legend_one(old.league):
+                await self.db.execute(
+                    "INSERT OR IGNORE INTO legend_promotions (player_tag, legend_day) VALUES (?, ?)",
+                    (new.tag, legend_day_id(now)),
+                )
         if old.war_opted_in is not None and old.war_opted_in != new.war_opted_in:
             self.dispatch(ev.WarPreferenceChanged(clan, new.tag, new.name, bool(new.war_opted_in)))
 
@@ -501,7 +548,9 @@ class Collector:
         if has_activity(old, new):
             await self._record_activity(new.tag, clan, now)
 
-        if not battle_log_read:  # battle log unavailable this poll: infer from the trophy change
+        if not battle_log_read and not crossing.day:
+            # Battle log unavailable this poll: infer from the trophy change. Changes across a
+            # reset are autofill or reset adjustments, not battles, so they're skipped here.
             await self._record_inferred(old, new, now)
 
     async def _record_inferred(self, old: PlayerSnap, new: PlayerSnap, now: datetime) -> None:
@@ -527,20 +576,20 @@ class Collector:
         ranked_log: list[Battle],
         fresh_keys: set[str],
         now: datetime,
+        crossing: Crossing = NO_CROSSING,
     ) -> None:
         """Make legend_events match the player's battle log for the current season.
 
-        Records every ranked battle in the log that isn't stored yet: on first sight this
-        backfills the last ~2 days, and it also fills gaps after downtime. Alerts are dispatched
-        only for battles that are new since the previous read. Trophies come from the Legend I
-        rule, or from the observed trophy change for other tiers; a change seen before its
-        battle appears is carried until it does.
+        Records every ranked battle in the log that isn't stored yet (backfilling the last ~2 days
+        on first sight and filling gaps after downtime). Alerts go out only for battles new since
+        the previous read. Trophies come from the Legend I rule, or from the observed trophy
+        change for other tiers. Trophy changes no battle explains are, depending on timing:
+        carried until their battle shows up; the game's autofilled defenses (at a daily reset);
+        or a reset adjustment such as the weekly floor or season reset to 5000 (ignored).
         """
         cursor = self._battle_cursors[new.tag]
         season_start = game_season(now).start
         ranked = sorted((b for b in ranked_log if b.occurred_at >= season_start), key=lambda b: b.timestamp)
-        delta = new.trophies - old.trophies if old is not None else 0
-        plausible = old is not None and old.league == new.league and abs(delta) <= MAX_PLAUSIBLE_DELTA
         existing: dict[str, int] = {}
         if ranked:
             rows = await self.db.fetchall(
@@ -555,30 +604,37 @@ class Collector:
                 for r in rows
             }
         missing = [b for b in ranked if b.key not in existing]
-        fresh_missing = [b for b in missing if b.key in fresh_keys]
 
-        if not fresh_missing:
-            # Trophies may have moved before the battle shows up in the log: carry the change.
-            if plausible and delta:
-                cursor.pending_delta += delta
-                cursor.pending_since = cursor.pending_since or _iso(now)
-                if abs(cursor.pending_delta) > MAX_PLAUSIBLE_DELTA:
-                    cursor.pending_delta, cursor.pending_since = 0, None
-            if cursor.pending_delta and cursor.pending_since and old is not None:
-                if now - datetime.fromisoformat(cursor.pending_since) >= PENDING_TIMEOUT:
-                    # No matching battle ever appeared (e.g. a battle type this version doesn't
-                    # know yet): record the change the old, inferred way.
-                    pending = cursor.pending_delta
-                    cursor.pending_delta, cursor.pending_since = 0, None
-                    await self._record_inferred(replace(new, trophies=new.trophies - pending), new, now)
+        delta = new.trophies - old.trophies if old is not None else 0
+        plausible = old is not None and old.league == new.league and abs(delta) <= MAX_PLAUSIBLE_DELTA
+        if crossing.week:  # weekly floor / season reset: the raw change isn't battles
+            cursor.pending_delta, cursor.pending_since = 0, None
             total = 0
         else:
             total = cursor.pending_delta + (delta if plausible else 0)
+        values = battle_trophies(missing, fresh_keys, total, defenses_gain=defenses_gain(new.league))
+        explained = sum(v for b, v in zip(missing, values, strict=True) if b.key in fresh_keys)
+        residual = total - explained
+
+        if crossing.day and old is not None:
+            await self._record_autofill(old, crossing, residual)
+            cursor.pending_delta, cursor.pending_since = 0, None
+        elif residual and not crossing.week:
+            # Trophies moved but the battle isn't in the log yet: carry the change.
+            cursor.pending_delta = residual
+            cursor.pending_since = cursor.pending_since or _iso(now)
+            if abs(residual) > MAX_PLAUSIBLE_DELTA:
+                cursor.pending_delta, cursor.pending_since = 0, None
+            elif old is not None and now - datetime.fromisoformat(cursor.pending_since) >= PENDING_TIMEOUT:
+                # No matching battle ever appeared (e.g. a battle type this version doesn't know
+                # yet): record the change the old, inferred way.
+                cursor.pending_delta, cursor.pending_since = 0, None
+                await self._record_inferred(replace(new, trophies=new.trophies - residual), new, now)
+        else:
             cursor.pending_delta, cursor.pending_since = 0, None
         if not missing:
             return
 
-        values = battle_trophies(missing, fresh_keys, total)
         trophies = {**existing, **{b.key: v for b, v in zip(missing, values, strict=True)}}
         after: dict[str, int] = {}
         running = new.trophies
@@ -588,7 +644,8 @@ class Collector:
 
         # Trophy-change guesses covering the same window are superseded by the real battles.
         await self.db.execute(
-            "DELETE FROM legend_events WHERE player_tag = ? AND battle_time IS NULL AND occurred_at >= ?",
+            "DELETE FROM legend_events WHERE player_tag = ? AND battle_time IS NULL "
+            "AND (battle_type IS NULL OR battle_type != 'autofill') AND occurred_at >= ?",
             (new.tag, _iso(missing[0].occurred_at - timedelta(minutes=15))),
         )
         for b, t in zip(missing, values, strict=True):
@@ -640,6 +697,77 @@ class Collector:
                 )
         for day in sorted({legend_day_id(b.occurred_at) for b in missing}):
             await self._rebuild_legend_day(new.tag, day)
+
+    async def _record_autofill(self, old: PlayerSnap, crossing: Crossing, residual: int) -> None:
+        """Record the defenses the game auto-filled for the legend day that just ended.
+
+        Legend I: missing = daily cap (8, or 7 on a promotion day) minus real defenses; each is
+        worth the season's average defense loss. On a normal day the unexplained trophy drop is the
+        exact total; at a weekly/season reset that change is mixed with the reset itself, so the
+        expected amount is used instead. Below Legend I defenses gain trophies and there's no daily
+        cap, so an unexplained gain at a (non-weekly) daily reset is recorded as autofill.
+        """
+        day = crossing.prev_day
+        if day is None or not is_tracked_ranked(old.league):
+            return
+        tag = old.tag
+        rows = await self.db.fetchall(
+            "SELECT kind, battle_type FROM legend_events WHERE player_tag = ? AND legend_day = ?", (tag, day)
+        )
+        if any(r["battle_type"] == "autofill" for r in rows):
+            return
+        real_defenses = sum(1 for r in rows if r["kind"] == "defense")
+        day_start, day_end = legend_day_bounds(datetime.fromisoformat(f"{day}T12:00:00+00:00"))
+        if is_legend_one(old.league):
+            first_day = await self.db.fetchval(
+                "SELECT 1 FROM legend_promotions WHERE player_tag = ? AND legend_day = ?", (tag, day)
+            )
+            count = (daily_attack_cap(old.league, first_day=bool(first_day)) or 0) - real_defenses
+            if count <= 0:
+                return
+            if crossing.week:
+                if not rows:  # no battles that day: shielded or not tracked; nothing to estimate
+                    return
+                avg = await self.db.fetchval(
+                    "SELECT AVG(trophies) FROM legend_events WHERE player_tag = ? AND kind = 'defense' "
+                    "AND season_id = ? AND (battle_type IS NULL OR battle_type != 'autofill')",
+                    (tag, game_season(day_start).id),
+                )
+                if avg is None:
+                    return
+                total = round(avg * count)
+            else:
+                if residual >= 0:  # no unexplained loss: shielded day, or nothing was filled
+                    return
+                total = residual
+        else:
+            if crossing.week or residual <= 0:
+                return
+            avg = await self.db.fetchval(
+                "SELECT AVG(trophies) FROM legend_events WHERE player_tag = ? AND kind = 'defense' "
+                "AND occurred_at >= ? AND trophies > 0",
+                (tag, _iso(ranked_week(day_start).start)),
+            )
+            count = max(1, round(residual / avg)) if avg else 1
+            total = residual
+        base, rem = divmod(abs(total), count)
+        sign = 1 if total >= 0 else -1
+        end_row = await self.db.fetchone(
+            "SELECT trophies_after FROM legend_events WHERE player_tag = ? AND legend_day = ? "
+            "ORDER BY occurred_at DESC, id DESC LIMIT 1",
+            (tag, day),
+        )
+        running = end_row["trophies_after"] if end_row else old.trophies
+        at = day_end - timedelta(seconds=1)
+        for i in range(count):
+            value = sign * (base + (1 if i < rem else 0))
+            running += value
+            await self.db.execute(
+                "INSERT INTO legend_events (player_tag, legend_day, season_id, kind, trophies, "
+                "trophies_after, occurred_at, battle_type) VALUES (?, ?, ?, 'defense', ?, ?, ?, 'autofill')",
+                (tag, day, game_season(day_start).id, value, running, _iso(at)),
+            )
+        await self._rebuild_legend_day(tag, day)
 
     async def _rebuild_legend_day(self, player_tag: str, day: str) -> None:
         """Start/end trophies for a legend day from its recorded battles."""
