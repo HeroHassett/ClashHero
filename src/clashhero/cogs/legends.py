@@ -107,8 +107,8 @@ async def _day_card(bot, tag: str, day: str, guild_id: int | None) -> discord.Em
     )
 
 
-def army_battles(hits: Sequence[repo.Hit]) -> list[cards.ArmyBattle]:
-    """Battles for the armies card, with each army code decoded."""
+def army_battles(hits: Sequence[repo.Hit], *, armies: bool = True) -> list[cards.ArmyBattle]:
+    """Battles for the image cards, with each army code decoded when ``armies``."""
     return [
         cards.ArmyBattle(
             trophies=h.trophies,
@@ -117,11 +117,48 @@ def army_battles(hits: Sequence[repo.Hit]) -> list[cards.ArmyBattle]:
             occurred_at=h.occurred_at,
             stars=h.stars,
             destruction=h.destruction,
-            army=parse_army(h.army_share_code) if h.army_share_code else None,
+            army=parse_army(h.army_share_code) if armies and h.army_share_code else None,
             autofill=h.autofill,
         )
         for h in hits
     ]
+
+
+async def _day_reply(
+    bot, tag: str, day: str, guild_id: int | None
+) -> tuple[discord.Embed, discord.File | None]:
+    """The /legends day reply: a compact embed with the battle-log image, or the full text embed
+    (as before the image) when the image can't be drawn."""
+    stats = await repo.day_stats(bot.db, tag, day)
+    row = await repo.legend_day_row(bot.db, tag, day)
+    player = await bot.db.get_player_row(tag)
+    name = player["name"] if player else tag
+    start = row["start_trophies"] if row else None
+    end = row["end_trophies"] if row else None
+    color = await guild_color(bot, guild_id)
+    today = day == legend_day_id(_now())
+    trophies = end if end is not None else start
+    if today and player is not None and player["trophies"] is not None:
+        trophies = player["trophies"]
+    try:
+        png = await asyncio.to_thread(
+            cards.render_legend_day,
+            player_name=name,
+            day=day,
+            today=today,
+            trophies=trophies,
+            cap=stats.cap,
+            attacks=army_battles(stats.hits("attack"), armies=False),
+            defenses=army_battles(stats.hits("defense"), armies=False),
+            trophy_icon=await unit_icons.fetch_trophy_icon(),
+        )
+    except Exception:
+        log.exception("Couldn't draw the legend day card for %s on %s", tag, day)
+        text = E.day_embed(name=name, tag=tag, day=day, stats=stats, start=start, end=end, color=color)
+        return text, None
+    embed = E.day_card_embed(name=name, tag=tag, day=day, stats=stats, start=start, end=end, color=color)
+    embed.set_image(url="attachment://legend-day.png")
+    return embed, discord.File(io.BytesIO(png), filename="legend-day.png")
 
 
 async def _armies_card(
@@ -345,6 +382,9 @@ class OwnerView(discord.ui.View):
 
 
 class AltSelectView(OwnerView):
+    """Switch a reply between the user's linked accounts. ``render(tag)`` gives (embed, image
+    file or None); the message is edited with the new image, or none."""
+
     def __init__(self, owner_id: int, accounts: list[tuple[str, str]], render) -> None:
         super().__init__(owner_id)
         self.render = render
@@ -357,8 +397,8 @@ class AltSelectView(OwnerView):
         self.add_item(select)
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
-        embed = await self.render(self.select.values[0])
-        await interaction.response.edit_message(embed=embed, view=self)
+        embed, file = await self.render(self.select.values[0])
+        await interaction.response.edit_message(embed=embed, attachments=[file] if file else [], view=self)
 
 
 class Pager(OwnerView):
@@ -683,8 +723,8 @@ class Legends(BaseCog):
         day = legend_day_id(_now() - timedelta(days=day_offset))
         gid = interaction.guild_id
 
-        async def render(t: str) -> discord.Embed:
-            return await _day_card(self.bot, t, day, gid)
+        async def render(t: str) -> tuple[discord.Embed, discord.File | None]:
+            return await _day_reply(self.bot, t, day, gid)
 
         view = None
         if not player:
@@ -693,7 +733,14 @@ class Legends(BaseCog):
                 view = AltSelectView(
                     interaction.user.id, [(r["player_tag"], r["name"] or "?") for r in links], render
                 )
-        await interaction.response.send_message(embed=await render(tag), view=view or discord.utils.MISSING)
+        await interaction.response.defer()
+        embed, file = await render(tag)
+        reply: dict[str, Any] = {"embed": embed}
+        if file is not None:
+            reply["file"] = file
+        if view is not None:
+            reply["view"] = view
+        await interaction.followup.send(**reply)
 
     @legends.command(
         name="armies", description="The armies a player faced on defense (or used to attack) on a legend day"

@@ -206,6 +206,33 @@ def day_embed(
     return e
 
 
+def day_card_embed(
+    *,
+    name: str,
+    tag: str,
+    day: str,
+    stats: DayStats,
+    start: int | None,
+    end: int | None,
+    color: discord.Color | None = None,
+) -> discord.Embed:
+    """The compact /legends day embed that goes with the battle-log image: one summary line
+    (trophies, net, attacks and defenses); the battles themselves are on the image."""
+    e = discord.Embed(title=f"{name} · Legend day {day}", url=player_link(tag), color=color)
+    parts = []
+    if start is not None:
+        parts.append(f"**{start}** → **{end if end is not None else start}**")
+    parts += [
+        f"Net **{signed(stats.net)}**",
+        f"⚔️ {count(stats.attacks, stats.cap)} ({signed(stats.offense)})",
+        f"🛡️ {count(stats.defenses, stats.cap)} ({signed(stats.defense)})",
+    ]
+    e.description = SEP.join(parts)
+    hits = _day_hits(stats)
+    e.set_footer(text=f"{tag} · {source_note(hits)}" if hits else tag)
+    return e
+
+
 def armies_embed(
     *,
     name: str,

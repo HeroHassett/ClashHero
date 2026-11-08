@@ -33,6 +33,7 @@ from urllib.parse import urlparse
 from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
 
 from clashhero.services.army import Army, HeroLoadout, Unit
+from clashhero.services.icons import font_dir
 
 log = logging.getLogger(__name__)
 
@@ -217,9 +218,25 @@ def fit_runs(text: str, fonts: Sequence[ImageFont.FreeTypeFont], max_width: floa
     return [ellipsis]
 
 
-def _draw_runs(draw: ImageDraw.ImageDraw, x: float, baseline: float, runs: Sequence[Run], fill) -> None:
+def _draw_runs(
+    draw: ImageDraw.ImageDraw,
+    x: float,
+    baseline: float,
+    runs: Sequence[Run],
+    fill,
+    stroke_width: int = 0,
+    stroke_fill=None,
+) -> None:
     for s, font in runs:
-        draw.text((x, baseline), s, font=font, fill=fill, anchor="ls")
+        draw.text(
+            (x, baseline),
+            s,
+            font=font,
+            fill=fill,
+            anchor="ls",
+            stroke_width=stroke_width,
+            stroke_fill=stroke_fill,
+        )
         x += font.getlength(s)
 
 
@@ -576,7 +593,7 @@ def _row(canvas: Image.Image, draw: ImageDraw.ImageDraw, top: int, row: CardRow,
 
 @dataclass(frozen=True)
 class ArmyBattle:
-    """One battle on the armies card.
+    """One battle on the legend cards (armies and day).
 
     ``army``: the army used (the attacker's on a defense, the player's own on an attack), None
     when no army code was recorded. ``stars`` and ``destruction`` are None for battles inferred
@@ -1208,6 +1225,450 @@ def _count_badge(draw: ImageDraw.ImageDraw, right: int, bottom: int, n: int) -> 
         (x0, y0, x1, y1), radius=h / 2, fill=(10, 10, 13, 232), outline=(255, 255, 255, 34), width=_px(1)
     )
     draw.text(((x0 + x1) / 2, _baseline(font, (y0 + y1) / 2)), text, font=font, fill=CREAM, anchor="ms")
+
+
+# ------------------------------------------------------------------ legend day card (the game's battle log)
+
+# The game's Legend League "Battle Log" window, on ClashHero's dark backdrop. Text is drawn in the
+# game's font (from game-assets/fonts, see services.icons.font_dir) with a dark outline and a drop
+# shadow; without the font it falls back to Inter with the same outline.
+
+GAME_FONT = "Clash_Bold.otf"
+MAX_HIT = 40
+MAX_DAY_ROWS = 30
+
+INK: RGB = (30, 22, 18)  # outline and shadow of game text, window outlines
+WHITE: RGB = (255, 255, 255)
+PALE_YELLOW: RGB = (247, 242, 180)
+FRAME_TOP: RGB = (106, 87, 74)
+FRAME_BOTTOM: RGB = (72, 58, 49)
+CREAM_TOP: RGB = (245, 238, 226)
+CREAM_BOTTOM: RGB = (236, 228, 215)
+TAB_TOP: RGB = (186, 175, 160)
+TAB_BOTTOM: RGB = (151, 138, 123)
+BAR_TOP: RGB = (231, 222, 210)
+BAR_BOTTOM: RGB = (212, 201, 188)
+BAR_LEDGE: RGB = (170, 157, 143)
+BAND_TOP: RGB = (86, 20, 37)
+BAND_BOTTOM: RGB = (126, 34, 42)
+BAND_EDGE: RGB = (48, 10, 18)
+SUB_PANEL = (58, 10, 18, 150)
+
+# Slot fills: (top, bottom, top shade, edge).
+SLOT_STYLES: dict[str, tuple[RGB, RGB, RGB, RGB]] = {
+    "grey": ((214, 203, 193), (222, 211, 202), (186, 174, 162), (176, 163, 150)),
+    "gold": ((247, 222, 140), (234, 196, 98), (214, 172, 74), (196, 154, 66)),
+    "red": ((236, 182, 170), (225, 156, 143), (204, 134, 121), (196, 124, 112)),
+    "empty": ((222, 213, 203), (230, 222, 213), (200, 190, 179), (198, 187, 175)),
+}
+# The battle log's stars: silver-white when earned, dark grey when not (as in the game).
+STAR_EARNED = ((253, 254, 255), (190, 205, 219))
+STAR_GREY = ((128, 121, 114), (90, 84, 78))
+
+DAY_TABS = ("Battle Log", "Armies", "Season")
+DAY_MARGIN = 22  # backdrop around the window
+FRAME_PAD = 12  # brown frame around the cream body
+TAB_TOP_Y = DAY_MARGIN + 12
+BODY_TOP_Y = TAB_TOP_Y + 50
+BODY_PAD = 18  # cream body edge to its contents
+BAR_H = 52
+BAND_H = 114
+SLOT_H = 40
+SLOT_GAP = 7
+COL_GAP = 14
+BAR_Y = BODY_TOP_Y + 16
+BAND_Y = BAR_Y + BAR_H + 14
+SLOTS_Y = BAND_Y + BAND_H + 10
+BODY_L = DAY_MARGIN + FRAME_PAD
+BODY_R = WIDTH - DAY_MARGIN - FRAME_PAD
+INNER_L = BODY_L + BODY_PAD
+INNER_R = BODY_R - BODY_PAD
+COL_W = (INNER_R - INNER_L - COL_GAP) / 2
+
+
+def legend_day_rows(attacks: int, defenses: int, cap: int | None) -> int:
+    """Slots per column: the daily cap (8, or 7 on a first Legend I day), else the battle count;
+    never fewer than the battles played or 1, never more than MAX_DAY_ROWS."""
+    return max(1, min(MAX_DAY_ROWS, max(cap or 0, attacks, defenses)))
+
+
+def legend_day_height(rows: int) -> int:
+    body_bottom = SLOTS_Y + rows * SLOT_H + (rows - 1) * SLOT_GAP + BODY_PAD - 2
+    return body_bottom + FRAME_PAD + DAY_MARGIN
+
+
+def slot_style(battle: ArmyBattle, kind: str) -> str:
+    """gold for a 3-star attack, red for a defense that lost 40 (a 3-star), grey otherwise.
+    Battles without star data go by trophies; auto-filled defenses are always grey."""
+    if battle.autofill:
+        return "grey"
+    if kind == "attack":
+        triple = battle.stars == 3 if battle.stars is not None else battle.trophies >= MAX_HIT
+        return "gold" if triple else "grey"
+    tripled = battle.stars == 3 if battle.stars is not None else battle.trophies <= -MAX_HIT
+    return "red" if battle.trophies < 0 and tripled else "grey"
+
+
+@lru_cache(maxsize=32)
+def _clash_font(path: str, size: int) -> ImageFont.FreeTypeFont | None:
+    try:
+        return ImageFont.truetype(path, _px(size), layout_engine=ImageFont.Layout.BASIC)
+    except OSError:
+        log.warning("Couldn't load the game font %s; using Inter", path, exc_info=True)
+        return None
+
+
+def _game_fonts(size: int) -> tuple[ImageFont.FreeTypeFont, ...]:
+    """The game's font when it's installed, then Inter and the CJK fallbacks."""
+    path = font_dir() / GAME_FONT
+    clash = _clash_font(str(path), size) if path.is_file() else None
+    return (*((clash,) if clash else ()), _inter(size, 800), *_fallback_fonts(size))
+
+
+def _stroke(size: int) -> int:
+    return max(2, round(_px(size) * 0.1))
+
+
+def _game_text(
+    draw: ImageDraw.ImageDraw,
+    x: float,
+    cy: float,
+    text: str | Sequence[Run],
+    size: int,
+    fill: RGB = WHITE,
+    anchor: str = "l",
+) -> float:
+    """Text in the game's style at drawing scale: ``fill`` with a dark outline and a drop shadow,
+    vertically centred on ``cy``; ``anchor`` l, m or r for ``x``. Returns the width."""
+    runs = _runs(text, _game_fonts(size)) if isinstance(text, str) else list(text)
+    if not runs:
+        return 0
+    width = _runs_width(runs)
+    x -= width if anchor == "r" else width / 2 if anchor == "m" else 0
+    base = _baseline(_game_fonts(size)[0], cy)
+    stroke = _stroke(size)
+    _draw_runs(draw, x, base + max(2, round(_px(size) * 0.08)), runs, INK, stroke, INK)
+    _draw_runs(draw, x, base, runs, fill, stroke, INK)
+    return width
+
+
+def _fit_game(text: str, size: int, min_size: int, max_w: float) -> tuple[list[Run], int]:
+    """Runs for ``text`` shrunk from ``size`` down to ``min_size`` to fit ``max_w`` (drawing
+    scale), then cut with an ellipsis."""
+    for s in range(size, min_size - 1, -1):
+        runs = _runs(text, _game_fonts(s))
+        if _runs_width(runs) + 2 * _stroke(s) <= max_w:
+            return runs, s
+    return fit_runs(text, _game_fonts(min_size), max_w - 2 * _stroke(min_size)), min_size
+
+
+class _TrophyIcon:
+    """The trophy icon at the sizes a render needs, or a drawn cup when there's no image."""
+
+    def __init__(self, data: bytes | None) -> None:
+        self.data = data
+        self._sizes: dict[int, Image.Image | None] = {}
+
+    def draw(self, canvas: Image.Image, draw: ImageDraw.ImageDraw, cx: float, cy: float, size: int) -> None:
+        """Centred on (cx, cy), ``size`` px tall at 1x."""
+        px = _px(size)
+        if px not in self._sizes:
+            self._sizes[px] = _contained_image(self.data, px)
+        icon = self._sizes[px]
+        if icon is None:
+            _trophy(draw, cx, cy + px * 0.04, px * 1.02, INK)
+            _trophy(draw, cx, cy, px * 0.86, GOLD_LIGHT)
+            return
+        canvas.paste(icon, (round(cx - icon.width / 2), round(cy - icon.height / 2)), icon)
+
+
+def _star_points(cx: float, cy: float, r: float, inner: float = 0.5) -> list[tuple[float, float]]:
+    points = []
+    for i in range(10):
+        angle = -math.pi / 2 + i * math.pi / 5
+        rr = r if i % 2 == 0 else r * inner
+        points.append((cx + rr * math.cos(angle), cy + rr * math.sin(angle)))
+    return points
+
+
+def _game_star(canvas: Image.Image, draw: ImageDraw.ImageDraw, cx: float, cy: float, r: float, earned: bool):
+    """A chunky in-game star with a dark outline: silver when earned, grey when not (drawing scale)."""
+    size = math.ceil(2 * r) + 4
+    x0, y0 = round(cx - size / 2), round(cy - size / 2)
+    mask = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(mask).polygon(_star_points(cx - x0, cy - y0, r), fill=255)
+    top, bottom = STAR_EARNED if earned else STAR_GREY
+    canvas.paste(_gradient((size, size), ((0.2, top), (0.85, bottom)), vertical=True), (x0, y0), mask)
+    points = _star_points(cx, cy, r)
+    draw.line([*points, points[0], points[1]], fill=INK, width=max(2, round(r * 0.2)), joint="curve")
+
+
+@lru_cache(maxsize=8)
+def _slot_image(w: int, h: int, style: str) -> Image.Image:
+    """A sunken row slot: a darker band along the top edge, a soft gradient and a thin edge."""
+    top, bottom, shade, edge = SLOT_STYLES[style]
+    radius = _px(10)
+    im = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    im.paste((*shade, 255), (0, 0, w, h), _rounded_mask(w, h, radius))
+    t = _px(3)
+    fill = _gradient((w, h - t), ((0.0, top), (1.0, bottom)), vertical=True)
+    im.paste(fill, (0, t), _rounded_mask(w, h - t, radius))
+    ImageDraw.Draw(im).rounded_rectangle(
+        (0, 0, w - 1, h - 1), radius=radius, outline=(*edge, 255), width=_px(1)
+    )
+    return im
+
+
+def render_legend_day(
+    *,
+    player_name: str,
+    day: str | date,
+    today: bool,
+    trophies: int | None,
+    cap: int | None,
+    attacks: Sequence[ArmyBattle],
+    defenses: Sequence[ArmyBattle],
+    trophy_icon: bytes | None = None,
+    rank: int | None = None,
+) -> bytes:
+    """PNG of a legend day in the style of the game's Legend League battle log.
+
+    ``trophies``: end-of-day trophies (current trophies for today); ``cap``: the daily
+    attack/defense cap (None for tiers without one); ``attacks``/``defenses``: chronological;
+    ``trophy_icon``: image bytes for the trophy (a cup is drawn without it); ``rank``: a global
+    rank to show next to the trophies, when known."""
+    with _RENDER_LOCK:
+        image = _render_day(
+            player_name, day, today, trophies, cap, list(attacks), list(defenses), trophy_icon, rank
+        )
+    buf = io.BytesIO()
+    image.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _render_day(
+    player_name: str,
+    day: str | date,
+    today: bool,
+    trophies: int | None,
+    cap: int | None,
+    attacks: list[ArmyBattle],
+    defenses: list[ArmyBattle],
+    trophy_icon: bytes | None,
+    rank: int | None,
+) -> Image.Image:
+    rows = legend_day_rows(len(attacks), len(defenses), cap)
+    height = legend_day_height(rows)
+    canvas = Image.new("RGB", (_px(WIDTH), _px(height)), BG)
+    draw = ImageDraw.Draw(canvas, "RGBA")
+    _backdrop(canvas)
+    trophy = _TrophyIcon(trophy_icon)
+
+    body_bottom = height - DAY_MARGIN - FRAME_PAD
+    _day_frame(canvas, draw, height, body_bottom)
+
+    try:
+        d = day if isinstance(day, date) else date.fromisoformat(day)
+        day_short = f"{d:%b %d}"
+    except ValueError:
+        day_short = str(day)
+    _day_player_bar(canvas, draw, trophy, player_name, trophies, rank, day_short)
+
+    offense = sum(b.trophies for b in attacks)
+    defense = sum(b.trophies for b in defenses)
+    title = "Current League Day" if today else f"League Day · {day_short}"
+    _day_band(canvas, draw, trophy, title, offense, defense)
+
+    for col, (kind, battles) in enumerate((("attack", attacks), ("defense", defenses))):
+        x0 = INNER_L + col * (COL_W + COL_GAP)
+        shown = battles[-rows:]
+        for i in range(rows):
+            top = SLOTS_Y + i * (SLOT_H + SLOT_GAP)
+            battle = shown[i] if i < len(shown) else None
+            _day_slot(canvas, draw, trophy, x0, top, kind, battle)
+    return canvas.resize((WIDTH, height), Image.Resampling.LANCZOS)
+
+
+def _day_frame(canvas: Image.Image, draw: ImageDraw.ImageDraw, height: int, body_bottom: int) -> None:
+    """The window: a brown frame with the tab strip, and the cream body with the active tab."""
+    fx0, fy0, fx1, fy1 = DAY_MARGIN, DAY_MARGIN, WIDTH - DAY_MARGIN, height - DAY_MARGIN
+    w, h = _px(fx1 - fx0), _px(fy1 - fy0)
+    _panel(
+        canvas,
+        (_px(fx0), _px(fy0), _px(fx1), _px(fy1)),
+        _px(22),
+        _gradient((w, h), ((0.0, FRAME_TOP), (0.25, FRAME_BOTTOM), (1.0, FRAME_BOTTOM)), vertical=True),
+        INK,
+        _px(2),
+    )
+    tab_w, tab_gap = 214, 8
+    tabs = [(BODY_L + 12 + i * (tab_w + tab_gap), label) for i, label in enumerate(DAY_TABS)]
+    radius = _px(12)
+    for i, (tx, label) in enumerate(tabs):
+        if i == 0:
+            continue
+        box = (_px(tx), _px(TAB_TOP_Y + 4), _px(tx + tab_w), _px(BODY_TOP_Y + 6))
+        draw.rounded_rectangle(box, radius=radius, fill=INK, corners=(True, True, False, False))
+        inner = (box[0] + _px(2), box[1] + _px(2), box[2] - _px(2), box[3])
+        mask = Image.new("L", (inner[2] - inner[0], inner[3] - inner[1]), 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            (0, 0, mask.width - 1, mask.height - 1),
+            radius=radius - _px(2),
+            fill=255,
+            corners=(True, True, False, False),
+        )
+        canvas.paste(
+            _gradient(mask.size, ((0.0, TAB_TOP), (1.0, TAB_BOTTOM)), vertical=True), inner[:2], mask
+        )
+        _game_text(
+            draw, _px(tx + tab_w / 2), _px((TAB_TOP_Y + 4 + BODY_TOP_Y) / 2 + 1), label, 21, anchor="m"
+        )
+
+    bw, bh = _px(BODY_R - BODY_L), _px(body_bottom - BODY_TOP_Y)
+    _panel(
+        canvas,
+        (_px(BODY_L), _px(BODY_TOP_Y), _px(BODY_R), _px(body_bottom)),
+        _px(16),
+        _gradient((bw, bh), ((0.0, CREAM_TOP), (1.0, CREAM_BOTTOM)), vertical=True),
+        INK,
+        _px(2),
+    )
+    # Soft bevel: a light line just inside the top edge, a darker one along the bottom.
+    draw.line(
+        (_px(BODY_L + 14), _px(BODY_TOP_Y + 3), _px(BODY_R - 14), _px(BODY_TOP_Y + 3)),
+        fill=(255, 255, 255, 150),
+        width=_px(2),
+    )
+    draw.line(
+        (_px(BODY_L + 14), _px(body_bottom - 4), _px(BODY_R - 14), _px(body_bottom - 4)),
+        fill=(150, 135, 118, 90),
+        width=_px(2),
+    )
+
+    tx, label = tabs[0]
+    box = (_px(tx), _px(TAB_TOP_Y), _px(tx + tab_w), _px(BODY_TOP_Y) + _px(2))
+    draw.rounded_rectangle(box, radius=radius, fill=INK, corners=(True, True, False, False))
+    draw.rounded_rectangle(
+        (box[0] + _px(2), box[1] + _px(2), box[2] - _px(2), box[3] + _px(2)),
+        radius=radius - _px(2),
+        fill=CREAM_TOP,
+        corners=(True, True, False, False),
+    )
+    draw.line(
+        (box[0] + _px(14), box[1] + _px(4), box[2] - _px(14), box[1] + _px(4)),
+        fill=(255, 255, 255, 150),
+        width=_px(2),
+    )
+    _game_text(draw, _px(tx + tab_w / 2), _px((TAB_TOP_Y + BODY_TOP_Y) / 2 + 2), label, 22, anchor="m")
+
+
+def _day_player_bar(
+    canvas, draw, trophy: _TrophyIcon, name: str, trophies: int | None, rank: int | None, day: str
+):
+    x0, x1, y0 = INNER_L, INNER_R, BAR_Y
+    box = (_px(x0), _px(y0), _px(x1), _px(y0 + BAR_H))
+    ledge = (box[0], box[1] + _px(3), box[2], box[3] + _px(3))
+    draw.rounded_rectangle(ledge, radius=_px(12), fill=BAR_LEDGE)
+    _panel(
+        canvas,
+        box,
+        _px(12),
+        _gradient((box[2] - box[0], box[3] - box[1]), ((0.0, BAR_TOP), (1.0, BAR_BOTTOM)), vertical=True),
+        BAR_LEDGE,
+        _px(1),
+    )
+    cy = _px(y0 + BAR_H / 2)
+    size = 26
+    right = _px(x1 - 14)
+    icon = 36
+    trophy.draw(canvas, draw, right - _px(icon / 2), cy, icon)
+    day_w = _game_text(draw, right - _px(icon + 6), cy, f"Day: {day}", size, anchor="r")
+
+    eod = f"EOD: {trophies:,}" if trophies is not None else "EOD: —"
+    if rank:
+        eod += f" (#{rank:,})"
+    mid = _px((x0 + x1) / 2 + 40)
+    eod_runs = _runs(eod, _game_fonts(size))
+    eod_w = _runs_width(eod_runs)
+    eod_x = min(mid - eod_w / 2, right - _px(icon + 6) - day_w - _px(24) - eod_w)
+    _game_text(draw, eod_x, cy, eod_runs, size)
+
+    name_room = eod_x - _px(24) - _px(x0 + 18)
+    runs, name_size = _fit_game(name, size, 18, name_room)
+    if not runs:
+        runs, name_size = _fit_game("?", size, size, name_room)
+    _game_text(draw, _px(x0 + 18), cy, runs, name_size)
+
+
+def _day_band(canvas, draw, trophy: _TrophyIcon, title: str, offense: int, defense: int) -> None:
+    x0, x1, y0 = INNER_L, INNER_R, BAND_Y
+    w, h = _px(x1 - x0), _px(BAND_H)
+    band = _gradient((w, h), ((0.0, BAND_TOP), (1.0, BAND_BOTTOM)), vertical=True).convert("RGBA")
+    lattice = ImageDraw.Draw(band, "RGBA")
+    step = _px(44)  # a faint diamond lattice, as on the game's banners
+    for k in range(-h // step - 1, w // step + 2):
+        lattice.line((k * step, 0, k * step + h, h), fill=(0, 0, 0, 10), width=_px(1.5))
+        lattice.line((k * step + h, 0, k * step, h), fill=(0, 0, 0, 10), width=_px(1.5))
+    _panel(
+        canvas, (_px(x0), _px(y0), _px(x1), _px(y0 + BAND_H)), _px(12), band.convert("RGB"), BAND_EDGE, _px(2)
+    )
+
+    cols = [(INNER_L, INNER_L + COL_W), (INNER_L + COL_W + COL_GAP, INNER_R)]
+    top_cy = _px(y0 + 33)
+    title_end = _px(x0 + 18) + _game_text(draw, _px(x0 + 18), top_cy, title, 23, PALE_YELLOW)
+    big = 36
+    net = f"{offense + defense:+d}"
+    net_w = _runs_width(_runs(net, _game_fonts(26)))
+    right = max(_px(cols[0][1] - 12), title_end + _px(24) + net_w + _px(big + 4))
+    trophy.draw(canvas, draw, right - _px(big / 2), top_cy, big)
+    _game_text(draw, right - _px(big + 4), top_cy, net, 26, anchor="r")
+
+    sub_y0, sub_y1 = y0 + 64, y0 + BAND_H - 10
+    for (cx0, cx1), label, value in zip(cols, ("Attacks", "Defenses"), (offense, defense), strict=True):
+        draw.rounded_rectangle(
+            (_px(cx0 + 6), _px(sub_y0), _px(cx1 - 6), _px(sub_y1)), radius=_px(10), fill=SUB_PANEL
+        )
+        cy = _px((sub_y0 + sub_y1) / 2)
+        _game_text(draw, _px(cx0 + 20), cy, label, 20)
+        small = 28
+        r = _px(cx1 - 18)
+        trophy.draw(canvas, draw, r - _px(small / 2), cy, small)
+        _game_text(draw, r - _px(small + 4), cy, f"{value:+d}", 24, anchor="r")
+
+
+def _day_slot(
+    canvas, draw, trophy: _TrophyIcon, x0: float, top: int, kind: str, battle: ArmyBattle | None
+) -> None:
+    x1 = x0 + COL_W
+    style = "empty" if battle is None else slot_style(battle, kind)
+    slot = _slot_image(_px(x1) - _px(x0), _px(SLOT_H), style)
+    canvas.paste(slot, (_px(x0), _px(top)), slot)
+    if battle is None:
+        return
+    cy = _px(top + SLOT_H / 2 + 1)
+    icon = 30
+    icon_cx = x1 - 12 - icon / 2
+    trophy.draw(canvas, draw, _px(icon_cx), cy, icon)
+    trophies_right = x1 - 12 - icon - 4
+    _game_text(draw, _px(trophies_right), cy, f"{battle.trophies:+d}", 22, anchor="r")
+
+    name_left = x0 + 16
+    if battle.autofill or not battle.detailed:
+        label = "Auto-filled" if battle.autofill else "Attack" if kind == "attack" else "Defense"
+        _game_text(draw, _px(name_left), cy, label, 20)
+        return
+    star_r, star_step = 13.5, 29
+    last_star = trophies_right - 52 - star_r
+    for i in range(3):
+        sx = last_star - (2 - i) * star_step
+        _game_star(canvas, draw, _px(sx), cy, _px(star_r), i < (battle.stars or 0))
+    pct_right = last_star - 2 * star_step - star_r - 10
+    pct_w = _game_text(draw, _px(pct_right), cy, f"{battle.destruction or 0}%", 21, anchor="r")
+    room = _px(pct_right) - max(pct_w, _px(58)) - _px(12) - _px(name_left)
+    runs, size = _fit_game(battle.opponent or "?", 20, 14, room)
+    if not runs:
+        runs, size = _fit_game("?", 20, 20, room)
+    _game_text(draw, _px(name_left), cy, runs, size)
 
 
 # ------------------------------------------------------------------ badge downloads

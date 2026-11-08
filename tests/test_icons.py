@@ -188,3 +188,29 @@ async def test_fetch_icons_uses_the_shared_cache(icon_dir, monkeypatch):
     monkeypatch.setattr(icons, "icon_cache", icons.IconCache(session_factory=FakeSession()))
     assert await icons.fetch_icons(["Healer", "Healer"]) == {"Healer": b"healer png"}
     assert "Healer" in icons.icon_cache._cache
+
+
+async def test_trophy_icon_by_emoji_key(icon_dir, monkeypatch):
+    monkeypatch.setattr(icons, "icon_cache", icons.IconCache(session_factory=FakeSession()))
+    assert await icons.fetch_trophy_icon() is None
+    (icon_dir / "res_trophy.png").write_bytes(b"trophy png")
+    assert await icons.fetch_trophy_icon() == b"trophy png"
+
+
+async def test_trophy_icon_from_the_app_emoji(icon_dir, monkeypatch):
+    saved = dict(EMOJIS._by_name)
+    try:
+        EMOJIS.load([E("res_trophy", 444)])
+        session = FakeSession({CDN.format(444): FakeResponse(body=b"emoji trophy")})
+        monkeypatch.setattr(icons, "icon_cache", icons.IconCache(session_factory=session))
+        assert await icons.fetch_trophy_icon() == b"emoji trophy"
+    finally:
+        EMOJIS._by_name = saved
+
+
+def test_font_dir_from_the_environment(monkeypatch, tmp_path):
+    monkeypatch.delenv(icons.FONT_DIR_ENV, raising=False)
+    assert icons.font_dir() == icons.DEFAULT_FONT_DIR
+    assert icons.DEFAULT_FONT_DIR.parts[-2:] == ("game-assets", "fonts")
+    monkeypatch.setenv(icons.FONT_DIR_ENV, str(tmp_path))
+    assert icons.font_dir() == tmp_path

@@ -10,9 +10,11 @@ ENV PATH="/app/.venv/bin:$PATH" \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never
 
-# Noto CJK so image cards can draw Chinese/Japanese/Korean player and clan names.
+# Fonts so image cards can draw player and clan names in any script: Noto CJK for Chinese,
+# Japanese and Korean, DejaVu for Arabic, Cyrillic, Greek and symbols. FriBiDi turns on Pillow's
+# text shaping, so Arabic names come out joined and right-to-left.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends fonts-noto-cjk \
+    && apt-get install -y --no-install-recommends fonts-noto-cjk fonts-dejavu-core libfribidi0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

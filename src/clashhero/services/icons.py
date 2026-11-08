@@ -1,4 +1,4 @@
-"""Unit icons (troops, spells, heroes, pets, equipment) for image cards.
+"""Game icons (troops, spells, heroes, pets, equipment, the trophy) and fonts for image cards.
 
 ``fetch_icons(names)`` maps in-game names to PNG bytes, looking in order at:
 
@@ -6,9 +6,13 @@
    (git-ignored, filled from Supercell's Fan Kit), with files named ``unit_key(name) + ".png"``;
 2. ClashHero's own Discord application emoji of that name, downloaded from Discord's CDN.
 
-Names found in neither are left out and the card draws a placeholder tile. Downloads only go to
-Discord's CDN over https, give up after a few seconds and are capped in size. Icons found are kept
-in a small in-memory LRU cache; failures aren't, so the next card tries again.
+Names found in neither are left out and the card draws a placeholder. A name already in emoji-key
+form (``res_trophy``) maps to itself, so ``fetch_trophy_icon`` uses the same lookup. Downloads only
+go to Discord's CDN over https, give up after a few seconds and are capped in size. Icons found are
+kept in a small in-memory LRU cache; failures aren't, so the next card tries again.
+
+``font_dir()`` is where the game's font files are (``$CLASHHERO_FONT_DIR``, else
+``game-assets/fonts`` in the project); cards fall back to the bundled fonts without them.
 """
 
 from __future__ import annotations
@@ -27,8 +31,11 @@ from clashhero.services.emojis import EMOJIS, unit_key
 log = logging.getLogger(__name__)
 
 ICON_DIR_ENV = "CLASHHERO_ICON_DIR"
+FONT_DIR_ENV = "CLASHHERO_FONT_DIR"
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_ICON_DIR = PROJECT_ROOT / "game-assets" / "icons"
+DEFAULT_FONT_DIR = PROJECT_ROOT / "game-assets" / "fonts"
+TROPHY_ICON = "res_trophy"
 
 EMOJI_URL = "https://cdn.discordapp.com/emojis/{id}.png?size=128"
 ICON_HOSTS = frozenset({"cdn.discordapp.com"})
@@ -37,9 +44,17 @@ TIMEOUT = 4.0
 MAX_CONCURRENT = 16
 
 
+def _env_dir(env: str, default: Path) -> Path:
+    raw = os.getenv(env, "").strip()
+    return Path(raw).expanduser() if raw else default
+
+
 def icon_dir() -> Path:
-    raw = os.getenv(ICON_DIR_ENV, "").strip()
-    return Path(raw).expanduser() if raw else DEFAULT_ICON_DIR
+    return _env_dir(ICON_DIR_ENV, DEFAULT_ICON_DIR)
+
+
+def font_dir() -> Path:
+    return _env_dir(FONT_DIR_ENV, DEFAULT_FONT_DIR)
 
 
 def allowed(url: str) -> bool:
@@ -170,3 +185,8 @@ icon_cache = IconCache()
 async def fetch_icons(names: Iterable[str | None]) -> dict[str, bytes]:
     """In-game name -> PNG bytes for every name an icon was found for (see the module docs)."""
     return await icon_cache.fetch(names)
+
+
+async def fetch_trophy_icon() -> bytes | None:
+    """The trophy icon (``res_trophy``), or None when there's neither a file nor an emoji."""
+    return (await icon_cache.fetch([TROPHY_ICON])).get(TROPHY_ICON)
