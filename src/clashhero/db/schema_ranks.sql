@@ -18,3 +18,16 @@ CREATE TABLE IF NOT EXISTS legend_day_ranks (
     trophies   INTEGER NOT NULL,
     PRIMARY KEY (player_tag, legend_day)
 );
+
+-- Country leaderboards: each country's top 200 (players who set that country in-game). A player
+-- is in at most one country's ranking; replaced country by country on each fetch.
+CREATE TABLE IF NOT EXISTS player_country_ranks (
+    player_tag   TEXT    PRIMARY KEY,
+    location_id  INTEGER NOT NULL,
+    country_code TEXT    NOT NULL,
+    country_name TEXT    NOT NULL,
+    rank         INTEGER NOT NULL,
+    trophies     INTEGER NOT NULL,
+    fetched_at   TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_country_ranks_location ON player_country_ranks (location_id);

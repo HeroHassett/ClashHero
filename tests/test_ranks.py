@@ -38,3 +38,42 @@ async def test_collector_polls_the_global_ranking(setup):  # noqa: F811
     coc.http.items = items(("#A", 3))
     await col._poll_ranks()
     assert await ranks.current_rank(bot.db, "#A") == 3
+
+
+US = {"id": 32000249, "name": "United States", "countryCode": "US"}
+
+
+async def test_country_rankings(db):
+    await ranks.store_country_rankings(db, US, items(("#A", 57), ("#B", 3)), NOW)
+    assert await ranks.country_rank(db, "#A", NOW) == ranks.CountryRank(57, "US", "United States")
+    # Next fetch: #B dropped out, #A moved up; another country doesn't touch the US rows.
+    await ranks.store_country_rankings(db, US, items(("#A", 50)), NOW + timedelta(hours=3))
+    await ranks.store_country_rankings(
+        db, {"id": 1, "name": "Japan", "countryCode": "JP"}, items(("#C", 1)), NOW
+    )
+    assert (await ranks.country_rank(db, "#A")).rank == 50
+    assert await ranks.country_rank(db, "#B") is None
+    assert (await ranks.country_rank(db, "#C")).country_code == "JP"
+    assert await ranks.country_rank(db, "#A", NOW + timedelta(hours=12)) is None  # stale
+    assert (
+        await ranks.store_country_rankings(db, {"id": 2, "name": "X"}, items(("#D", 1)), NOW) == 0
+    )  # no code
+
+
+async def test_collector_polls_country_rankings(setup):  # noqa: F811
+    bot, coc, col = setup
+
+    class Http(FakeHttp):
+        async def request(self, route):
+            if "/locations?" in route.url:
+                return {
+                    "items": [
+                        {**US, "isCountry": True},
+                        {"id": 32000000, "name": "Europe", "isCountry": False},  # a region: skipped
+                    ]
+                }
+            return {"items": items(("#A", 7))}
+
+    coc.http = Http()
+    await col._poll_country_ranks()
+    assert (await ranks.country_rank(bot.db, "#A")).rank == 7

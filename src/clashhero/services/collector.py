@@ -64,6 +64,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 RANK_POLL_SECONDS = 30 * 60  # global top-200 ranking (current and end-of-day ranks)
+COUNTRY_RANK_POLL_SECONDS = 3 * 60 * 60  # every country's top 200 (flags and local ranks)
 
 PlayerSource = Callable[[], Awaitable[Iterable[str]]]
 
@@ -132,7 +133,15 @@ class Collector:
         self.war_loop = tasks.loop(seconds=cfg.war_poll_seconds)(self._poll_wars)
         self.raid_loop = tasks.loop(seconds=cfg.raid_poll_seconds)(self._poll_raids)
         self.rank_loop = tasks.loop(seconds=RANK_POLL_SECONDS)(self._poll_ranks)
-        self._loops = (self.clan_loop, self.player_loop, self.war_loop, self.raid_loop, self.rank_loop)
+        self.country_rank_loop = tasks.loop(seconds=COUNTRY_RANK_POLL_SECONDS)(self._poll_country_ranks)
+        self._loops = (
+            self.clan_loop,
+            self.player_loop,
+            self.war_loop,
+            self.raid_loop,
+            self.rank_loop,
+            self.country_rank_loop,
+        )
         for loop in self._loops:
             loop.error(self._make_error_handler(loop))
 
@@ -984,10 +993,10 @@ class Collector:
             )
         return group
 
-    # ------------------------------------------------------------------ capital raids
+    # ------------------------------------------------------------------ rankings
 
     async def _poll_ranks(self) -> None:
-        """Global top 200 (the only ranks the API publishes): current rank, and each legend day's
+        """Global top 200 (the API publishes no deeper ranks): current rank, and each legend day's
         end-of-day rank (the last fetch before the 05:00 UTC reset)."""
         now = datetime.now(UTC)
         route = coc.http.Route("GET", self.coc.http.base_url, "/locations/global/rankings/players?limit=200")
@@ -995,6 +1004,30 @@ class Collector:
         if data and data.get("items"):
             await ranks.store_rankings(self.db, data["items"], legend_day_id(now), now)
             self._cycle_done("ranks", now)
+
+    async def _poll_country_ranks(self) -> None:
+        """Every country's top 200 (players who set that country in-game): their flag and local
+        rank. About 255 small requests, run every few hours through the usual concurrency limit."""
+        now = datetime.now(UTC)
+        base = self.coc.http.base_url
+        data = await self._guarded(
+            self.coc.http.request(coc.http.Route("GET", base, "/locations?limit=1000"))
+        )
+        countries = [loc for loc in (data or {}).get("items") or [] if loc.get("isCountry")]
+
+        async def one(loc: dict) -> None:
+            path = f"/locations/{loc['id']}/rankings/players?limit=200"
+            board = await self._guarded(self.coc.http.request(coc.http.Route("GET", base, path)))
+            if board and board.get("items"):
+                await ranks.store_country_rankings(self.db, loc, board["items"], now)
+
+        await asyncio.gather(
+            *(self._isolated(one(c), "country ranking", str(c.get("id"))) for c in countries)
+        )
+        if countries:
+            self._cycle_done("country_ranks", now)
+
+    # ------------------------------------------------------------------ capital raids
 
     async def _poll_raids(self) -> None:
         tags = await self.db.all_clan_tags()

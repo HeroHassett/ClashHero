@@ -1597,6 +1597,37 @@ def _window(canvas: Image.Image, draw: ImageDraw.ImageDraw, height: int) -> None
     _close_button(canvas, draw)
 
 
+FLAG_CENTER = ((GW_EDGE + GW_TAB_X0) / 2, (GW_TAB_Y0 + GW_BODY_Y) / 2)  # left of the first tab
+FLAG_MAX = (36, 24)  # as large as the game draws it
+
+
+def _flag_image(data: bytes) -> Image.Image | None:
+    """The flag fitted inside FLAG_MAX (drawing scale, aspect kept), or None if unreadable."""
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            if im.width * im.height > 1024 * 1024:
+                return None
+            return ImageOps.contain(
+                im.convert("RGBA"), (_px(FLAG_MAX[0]), _px(FLAG_MAX[1])), Image.Resampling.LANCZOS
+            )
+    except Exception:  # any undecodable image just means no flag
+        return None
+
+
+def _draw_flag(canvas: Image.Image, draw: ImageDraw.ImageDraw, data: bytes) -> None:
+    """The player's country flag in the frame left of the "Leaderboard" tab, as the game shows
+    it, with a soft shadow and a thin dark outline so light flags don't vanish."""
+    im = _flag_image(data)
+    if im is None:
+        return
+    cx, cy = (_px(v) for v in FLAG_CENTER)
+    x0, y0 = round(cx - im.width / 2), round(cy - im.height / 2)
+    x1, y1 = x0 + im.width, y0 + im.height
+    draw.rectangle((x0 + _px(1), y0 + _px(1.5), x1 + _px(1), y1 + _px(1.5)), fill=(0, 0, 0, 80))
+    canvas.paste(im, (x0, y0), im)
+    draw.rectangle((x0 - _px(1), y0 - _px(1), x1, y1), outline=GW_OUTLINE, width=_px(1))
+
+
 def _close_button(canvas: Image.Image, draw: ImageDraw.ImageDraw) -> None:
     """The red square close button with a white X."""
     x0, y0, x1, y1 = (_px(v) for v in GW_CLOSE_BOX)
@@ -1728,6 +1759,7 @@ def render_legend_day(
     rank: int | None = None,
     eod: int | None = None,
     eod_rank: int | None = None,
+    flag: bytes | None = None,
 ) -> bytes:
     """PNG of a legend day as the game's Legend League battle log (list view).
 
@@ -1736,11 +1768,11 @@ def render_legend_day(
     day; ``eod_rank``: the global rank at that end of day; ``rank``: the player's global rank now
     (each shown only when known); ``cap``: the daily attack/defense cap (None for tiers without
     one); ``attacks``/``defenses``: chronological; ``trophy_icon``: image bytes for the trophy (a
-    cup is drawn without it)."""
+    cup is drawn without it); ``flag``: the player's country flag (image bytes), top left."""
     with _RENDER_LOCK:
         battles = list(attacks), list(defenses)
         image = _render_day(
-            player_name, day, today, trophies, cap, *battles, trophy_icon, rank, eod, eod_rank
+            player_name, day, today, trophies, cap, *battles, trophy_icon, rank, eod, eod_rank, flag
         )
     buf = io.BytesIO()
     image.save(buf, "PNG")
@@ -1759,6 +1791,7 @@ def _render_day(
     rank: int | None,
     eod: int | None = None,
     eod_rank: int | None = None,
+    flag: bytes | None = None,
 ) -> Image.Image:
     rows = legend_day_rows(len(attacks), len(defenses), cap)
     height = legend_day_height(rows)
@@ -1766,6 +1799,8 @@ def _render_day(
     draw = ImageDraw.Draw(canvas, "RGBA")
     trophy = _TrophyIcon(trophy_icon)
     _window(canvas, draw, height)
+    if flag:
+        _draw_flag(canvas, draw, flag)
     try:
         d = day if isinstance(day, date) else date.fromisoformat(day)
         day_short = f"{d:%b %d}"
@@ -1908,14 +1943,17 @@ def render_ranked_week(
     defenses: Sequence[ArmyBattle],
     trophy_icon: bytes | None = None,
     rank: int | None = None,
+    flag: bytes | None = None,
 ) -> bytes:
     """PNG of a weekly ranked tournament as the game's battle log grid view.
 
     ``trophies``: the player's tournament trophies (the "Total"); ``cap``: the weekly attack cap
     (None when unknown); ``attacks``/``defenses``: the week's battles, chronological;
-    ``trophy_icon``: image bytes for the trophy; ``rank``: when known."""
+    ``trophy_icon``: image bytes for the trophy; ``rank``: when known; ``flag``: the player's
+    country flag (image bytes), top left."""
     with _RENDER_LOCK:
-        image = _render_week(player_name, trophies, cap, list(attacks), list(defenses), trophy_icon, rank)
+        battles = list(attacks), list(defenses)
+        image = _render_week(player_name, trophies, cap, *battles, trophy_icon, rank, flag)
     buf = io.BytesIO()
     image.save(buf, "PNG")
     return buf.getvalue()
@@ -1929,6 +1967,7 @@ def _render_week(
     defenses: list[ArmyBattle],
     trophy_icon: bytes | None,
     rank: int | None,
+    flag: bytes | None = None,
 ) -> Image.Image:
     rows = ranked_week_rows(len(attacks), len(defenses), cap)
     height = ranked_week_height(rows)
@@ -1936,6 +1975,8 @@ def _render_week(
     draw = ImageDraw.Draw(canvas, "RGBA")
     trophy = _TrophyIcon(trophy_icon)
     _window(canvas, draw, height)
+    if flag:
+        _draw_flag(canvas, draw, flag)
     offense, defense = sum(b.trophies for b in attacks), sum(b.trophies for b in defenses)
     _week_band(canvas, draw, trophy, player_name, rank, trophies, offense, defense)
     slots = rows * GRID_PER_SIDE

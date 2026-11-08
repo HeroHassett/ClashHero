@@ -339,3 +339,18 @@ def test_profile_uses_game_symbols_once_uploaded(monkeypatch):
     assert by_name["<:res_capital_gold:1> Capital gold"] == "<:res_capital_gold:1> `12` contributed"
     assert by_name["<:ui_clan_games:1> Events"] == "<:ui_clan_games:1> `9` Clan Games points"
     assert by_name["<:res_trophy:1> Trophies"].startswith("<:res_trophy:1> `5,000` best `6,203`")
+
+
+def test_profile_shows_country_rank():
+    from clashhero.repos.ranks import CountryRank
+
+    p = NS(
+        name="Alex", tag="#2PP", town_hall=18, town_hall_weapon=None, exp_level=300, trophies=5100,
+        best_trophies=6203, war_stars=40, war_opted_in=True, clan=None, role=None,
+        attack_wins=0, defense_wins=0, clan_capital_contributions=0, _raw_data={},
+    )  # fmt: skip
+    _, fields = profile_parts(p, country=CountryRank(57, "US", "United States"))
+    trophies = next(v for n, v, _ in fields if n.endswith("Trophies"))
+    assert trophies.endswith("\n🇺🇸 United States")
+    _, fields = profile_parts(p)
+    assert "🇺🇸" not in next(v for n, v, _ in fields if n.endswith("Trophies"))

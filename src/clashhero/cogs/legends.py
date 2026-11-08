@@ -30,7 +30,7 @@ from clashhero.cogs.army import army_embed_fields
 from clashhero.events import LegendBattle
 from clashhero.repos import legends as repo
 from clashhero.repos import ranks
-from clashhero.services import cards
+from clashhero.services import cards, country_flags
 from clashhero.services import icons as unit_icons
 from clashhero.services.army import parse_army
 from clashhero.services.battlelog import army_link, estimate_legend_result
@@ -250,6 +250,17 @@ def _week_trophies(week: Window, days: Sequence[repo.WeekDay], player) -> int | 
     return sum(d.stats.offense + d.stats.defense for d in days)
 
 
+async def _country_flag(bot, tag: str) -> bytes | None:
+    """The flag of the player's country (when they're in its top 200, the only way the API tells
+    us their country), or None. Never raises: the image is drawn without it."""
+    try:
+        country = await ranks.country_rank(bot.db, tag, now=_now())
+        return await country_flags.fetch_flag(country.country_code) if country else None
+    except Exception:
+        log.debug("Couldn't get the country flag of %s", tag, exc_info=True)
+        return None
+
+
 async def _week_image(
     tag: str,
     name: str,
@@ -257,6 +268,7 @@ async def _week_image(
     days: Sequence[repo.WeekDay],
     trophies: int | None,
     rank: int | None = None,
+    flag: bytes | None = None,
 ) -> discord.File | None:
     """The weekly-tournament grid (the game's battle log for tiers below Legend I), or None
     (logged) if it can't be drawn."""
@@ -270,6 +282,7 @@ async def _week_image(
             defenses=army_battles([h for d in days for h in d.stats.hits("defense")], armies=False),
             trophy_icon=await unit_icons.fetch_trophy_icon(),
             rank=rank,
+            flag=flag,
         )
     except Exception:
         log.exception("Couldn't draw the ranked week card for %s", tag)
@@ -292,11 +305,12 @@ async def _day_reply(
     league = await repo.player_league(bot.db, tag)
     now = _now()
     rank = await ranks.current_rank(bot.db, tag, now=now)
+    flag = await _country_flag(bot, tag)
     file = None
     if league and not is_legend_one(league):
         week = ranked_week(datetime.fromisoformat(f"{day}T12:00:00+00:00"))
         days = await repo.week_days(bot.db, tag, week.start)
-        file = await _week_image(tag, name, league, days, _week_trophies(week, days, player), rank)
+        file = await _week_image(tag, name, league, days, _week_trophies(week, days, player), rank, flag)
     else:
         today = day == legend_day_id(now)
         trophies = end if end is not None else start
@@ -325,6 +339,7 @@ async def _day_reply(
                 rank=rank,
                 eod=eod,
                 eod_rank=eod_rank,
+                flag=flag,
             )
             file = discord.File(io.BytesIO(png), filename="legend-day.png")
         except Exception:
@@ -1169,7 +1184,9 @@ class Legends(BaseCog):
         file = None
         if not is_legend_one(league):  # Legend I is shown day by day (/legends day), as in the game
             rank = await ranks.current_rank(self.db, tag, now=_now())
-            file = await _week_image(tag, name, league, days, _week_trophies(week, days, row), rank)
+            flag = await _country_flag(self.bot, tag)
+            trophies = _week_trophies(week, days, row)
+            file = await _week_image(tag, name, league, days, trophies, rank, flag)
         if file is None:
             await interaction.followup.send(embed=embed)
             return

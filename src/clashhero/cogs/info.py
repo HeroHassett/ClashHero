@@ -28,7 +28,7 @@ from clashhero.cogs._info_embeds import (
     upgrades_blocks,
 )
 from clashhero.constants import CLAN_TYPE_LABELS, WAR_FREQUENCY_LABELS
-from clashhero.repos import stats
+from clashhero.repos import ranks, stats
 from clashhero.services.emojis import EMOJIS
 from clashhero.utils.fmt import clan_link, make_embed, player_link, role_name, table, ts
 from clashhero.utils.ranked import league_icon, league_name
@@ -390,6 +390,7 @@ async def render_player_page(
             if totals and totals["donations"] is not None
             else None,
             names=names,
+            country=await ranks.country_rank(client.db, p.tag, now=datetime.now(UTC)),
         )
         for name, value, inline in fields[:25]:
             embed.add_field(name=name, value=value or "—", inline=inline)

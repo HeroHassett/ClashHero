@@ -27,6 +27,7 @@ from coc import (
 from discord.utils import escape_markdown
 
 from clashhero.services.army import housing_space, parse_army
+from clashhero.services.country_flags import flag_emoji
 from clashhero.services.emojis import EMOJIS
 from clashhero.services.snapshots import home_units
 from clashhero.utils.fmt import clan_link, pad, role_name, ts
@@ -673,11 +674,13 @@ def profile_parts(
     last_seen: str | datetime | None = None,
     season: tuple[int, int] | None = None,
     names: Sequence[str] = (),
+    country: Any = None,
 ) -> tuple[str, list[tuple[str, str, bool]]]:
     """(description, [(field name, value, inline)]) for /player info.
 
     ``p`` is a coc.py Player; the rest comes from the database (linked Discord user, last seen,
-    season donations given/received, earlier names)."""
+    season donations given/received, earlier names, ``country``: a ``repos.ranks.CountryRank``
+    when the player is in their country's top 200)."""
     weapon = getattr(p, "town_hall_weapon", None)
     th = [
         header(f"Town Hall {p.town_hall}", EMOJIS.town_hall(p.town_hall) or "🏠"),
@@ -698,7 +701,8 @@ def profile_parts(
         (
             f"{trophy or ICONS['trophy']} Trophies",
             with_icon(trophy, f"{chip(f'{p.trophies:,}')} best {chip(f'{p.best_trophies:,}')}")
-            + f"\n{EMOJIS.league(league)} {league}".rstrip(),
+            + f"\n{EMOJIS.league(league)} {league}".rstrip()
+            + (f"\n{flag_emoji(country.country_code)} {country.country_name}" if country else ""),
             True,
         )
     )
