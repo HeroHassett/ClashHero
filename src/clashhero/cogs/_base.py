@@ -13,6 +13,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from clashhero.utils.resolve import parse_tag
+from clashhero.utils.style import fail_embed
 
 if TYPE_CHECKING:
     from clashhero.bot import ClashHeroBot
@@ -67,12 +68,14 @@ def error_message(error: BaseException) -> str | None:
 async def send_error(interaction: discord.Interaction, error: BaseException) -> None:
     msg = error_message(error)
     if msg is None:
-        log.error("Unhandled error in %s", interaction.command, exc_info=error)
-        msg = "Something went wrong running that command."
+        name = getattr(interaction.command, "qualified_name", "?")
+        log.error("Unhandled error in /%s", name, exc_info=error)
+        msg = "Something went wrong running that command. It's been logged; try again in a moment."
+    embed = fail_embed(msg)
     try:
         if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
         else:
-            await interaction.response.send_message(msg, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
     except discord.HTTPException:
         pass
