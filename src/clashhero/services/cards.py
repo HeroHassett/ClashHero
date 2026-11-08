@@ -1821,6 +1821,9 @@ def _render_day(
     return canvas.resize((WIDTH, height), Image.Resampling.LANCZOS)
 
 
+BAR_NUMBER = 18  # trophy numbers in the player bar (labels are 19)
+
+
 def _day_player_bar(
     canvas,
     draw,
@@ -1841,14 +1844,14 @@ def _day_player_bar(
     icon_cx = 838.5
     trophy.draw(canvas, draw, _px(icon_cx), cy, 35)
     label, value = right
-    value_w = _game_text(draw, _px(icon_cx - 22), cy, value, 14, PALE_YELLOW, anchor="r")
+    value_w = _game_text(draw, _px(icon_cx - 22), cy, value, BAR_NUMBER, PALE_YELLOW, anchor="r")
     label_right = _px(icon_cx - 22) - value_w - _px(8)
     limit = label_right - _game_text(draw, label_right, cy, label, 19, anchor="r")
 
     if eod is not None:
-        parts = [("EOD:", 19, WHITE, 0), (str(eod), 14, PALE_YELLOW, _px(8))]
+        parts = [("EOD:", 19, WHITE, 0), (str(eod), BAR_NUMBER, PALE_YELLOW, _px(8))]
         if eod_rank:
-            parts.append((f"(#{eod_rank})", 14, WHITE, _px(6)))
+            parts.append((f"(#{eod_rank})", BAR_NUMBER - 1, WHITE, _px(6)))
         widths = [_runs_width(_runs(t, _game_fonts(sz))) + gap for t, sz, _, gap in parts]
         group = sum(widths)
         x = min(_px(480) - group / 2, limit - _px(24) - group)
