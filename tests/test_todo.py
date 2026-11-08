@@ -100,13 +100,13 @@ async def test_account_todos(db):
     # Bob: war done; Legend II counts the week (28 of 30), raid 2 of 5
     assert summary(accts["#B"]) == [("ranked", "Legend II", 28, 30), ("raid", "Main", 2, 5)]
     assert accts["#B"].items[0].ends_at == datetime(2026, 11, 9, 5, tzinfo=UTC)
-    # Dan: CWL attack left, uncapped ranked count, tracked clan mid-raid and not raided yet
+    # Dan: CWL attack left, Electro counts the week (4 of 18), tracked clan mid-raid and not raided yet
     assert summary(accts["#D"]) == [
         ("cwl", "Feeder", 0, 1),
-        ("ranked", "Electro League 32", 4, None),
+        ("ranked", "Electro League 32", 4, 18),
         ("raid", "Feeder", 0, 5),
     ]
-    assert not accts["#D"].items[1].pending and not accts["#D"].all_done
+    assert accts["#D"].items[1].pending and not accts["#D"].all_done
     # Eve: only a stale war; unknown tag: nothing
     assert accts["#E"].items == [] and accts["#E"].all_done
     assert (accts["#Z"].name, accts["#Z"].all_done) == ("#Z", True)
@@ -130,7 +130,7 @@ def test_ranked_item():
     item = T.ranked_item("Legend III", 5, 20, NOW)
     assert (item.left, item.period, item.ends_at) == (4, "this week", datetime(2026, 11, 9, 5, tzinfo=UTC))
     item = T.ranked_item("Electro League 32", 4, 10, NOW)
-    assert (item.total, item.done, item.pending) == (None, 4, False)
+    assert (item.total, item.done, item.period) == (18, 10, "this week")  # weekly cap for tier 32
     assert T.ranked_item("Wizard League 10", 1, 1, NOW) is None
     assert T.ranked_item(None, 0, 0, NOW) is None
 

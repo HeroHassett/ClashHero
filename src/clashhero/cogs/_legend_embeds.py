@@ -9,7 +9,8 @@ from typing import Any
 import discord
 
 from clashhero.repos.legends import BoardEntry, DayStats, Hit, SeasonSummary, WeekDay, has_details
-from clashhero.utils.fmt import chunk_lines, player_link, signed, stars, table, ts
+from clashhero.services.emojis import EMOJIS
+from clashhero.utils.fmt import chunk_lines, display_width, pad, player_link, signed, stars, table, ts
 from clashhero.utils.seasons import season_by_id, season_label
 from clashhero.utils.style import SEP
 
@@ -17,6 +18,11 @@ ATTACK_COLOR = discord.Color.green()
 DEFENSE_COLOR = discord.Color.red()
 KIND_EMOJI = {"attack": "⚔️", "defense": "🛡️"}
 LATEST_BATTLES = 8
+
+
+def sym(name: str, fallback: str) -> str:
+    """A game-symbol emoji (``ui_sword``, ``ui_shield``), or ``fallback`` until it's uploaded."""
+    return EMOJIS.get(name) or fallback
 
 
 def _hits(values: Sequence[int]) -> str:
@@ -203,33 +209,6 @@ def day_embed(
     if has_details(stats.hits("attack")):
         e.add_field(name="3★", value=f"{stats.triples}/{len(stats.attacks)}")
     e.set_footer(text=f"{tag} · {source_note(_day_hits(stats))}")
-    return e
-
-
-def day_card_embed(
-    *,
-    name: str,
-    tag: str,
-    day: str,
-    stats: DayStats,
-    start: int | None,
-    end: int | None,
-    color: discord.Color | None = None,
-) -> discord.Embed:
-    """The compact /legends day embed that goes with the battle-log image: one summary line
-    (trophies, net, attacks and defenses); the battles themselves are on the image."""
-    e = discord.Embed(title=f"{name} · Legend day {day}", url=player_link(tag), color=color)
-    parts = []
-    if start is not None:
-        parts.append(f"**{start}** → **{end if end is not None else start}**")
-    parts += [
-        f"Net **{signed(stats.net)}**",
-        f"⚔️ {count(stats.attacks, stats.cap)} ({signed(stats.offense)})",
-        f"🛡️ {count(stats.defenses, stats.cap)} ({signed(stats.defense)})",
-    ]
-    e.description = SEP.join(parts)
-    hits = _day_hits(stats)
-    e.set_footer(text=f"{tag} · {source_note(hits)}" if hits else tag)
     return e
 
 
@@ -478,4 +457,131 @@ def top_clans_embed(
     ]
     e = discord.Embed(title=title, color=color, description=table(rows, ["#", "Clan", "Points", "Mem"]))
     e.set_footer(text=f"Page {page + 1}/{max(pages, 1)} · ★ = linked to this server")
+    return e
+
+
+# ------------------------------------------------------------------ /legends logs: the day at a glance
+
+LOGS_DESC_LIMIT = 3800  # keep the description well under Discord's 4,096
+NAME_COLUMNS = 20  # display columns for an opponent's name in a battle line
+
+
+def _clip(text: str, columns: int) -> str:
+    """``text`` cut to ``columns`` display columns (wide characters count 2), with an ellipsis."""
+    if display_width(text) <= columns:
+        return text
+    out = ""
+    for ch in text:
+        if display_width(out + ch) > columns - 1:
+            break
+        out += ch
+    return out + "…"
+
+
+def battle_lines(hits: Sequence[Hit]) -> list[str]:
+    """One monospace line per battle: ``+28  ★★☆   86%  name``, columns aligned; battles
+    inferred from trophy changes and auto-filled defenses say so instead of stars and %."""
+    width = max([3, *(len(signed(h.trophies)) for h in hits)])
+    lines = []
+    for h in hits:
+        t = signed(h.trophies).rjust(width)
+        if h.autofill:
+            lines.append(f"{t}  ···  {'—'.center(4)}  auto-filled (no defense received)")
+        elif not h.detailed:
+            lines.append(f"{t}  ···  {'—'.center(4)}  inferred from trophies")
+        else:
+            name = _clip(h.opponent_name or h.opponent_tag or "?", NAME_COLUMNS)
+            lines.append(f"{t}  {_stars(h.stars or 0)}  {f'{h.destruction or 0}%':>4}  {name}")
+    return lines
+
+
+def summary_block(
+    attacks: Sequence[Hit], defenses: Sequence[Hit], cap: int | None, start: int | None, end: int | None
+) -> str:
+    """The ATTACK / DEFENSE / NET / TROPHIES block, in aligned columns."""
+    a = [h.trophies for h in attacks]
+    d = [h.trophies for h in defenses]
+    rows = [
+        ("ATTACK", signed(sum(a)), count(a, cap)),
+        ("DEFENSE", signed(sum(d)), count(d, cap)),
+        ("NET", signed(sum(a) + sum(d)), ""),
+    ]
+    if start is not None:
+        rows.append(("TROPHIES", str(start), f"→ {end if end is not None else start}"))
+    width = max(5, *(display_width(v) + 1 for _, v, _ in rows))
+    out = []
+    for label, value, extra in rows:
+        line = pad(label, 10) + pad(value, width, right=True)
+        if extra:
+            line += (" " if label == "TROPHIES" else "   ") + extra
+        out.append(line)
+    return "\n".join(out)
+
+
+def _block(lines: Sequence[str], dropped: int, empty: str) -> str:
+    body = list(lines) or [empty]
+    if dropped:
+        body.insert(0, f"… {dropped} earlier")
+    return "```\n" + "\n".join(body) + "\n```"
+
+
+def legends_today_embed(
+    *,
+    author: str,
+    name: str,
+    tag: str,
+    town_hall: int | None,
+    trophies: int | None,
+    attacks: Sequence[Hit],
+    defenses: Sequence[Hit],
+    cap: int | None,
+    start: int | None,
+    end: int | None,
+    footer: str,
+    now: datetime | None = None,
+    color: discord.Color | None = None,
+    limit: int = LOGS_DESC_LIMIT,
+) -> discord.Embed:
+    """The /legends logs "today" view: the player's line, a summary block, then each attack and
+    defense as a line (the newest kept when it's too long, with "… N earlier")."""
+    e = discord.Embed(title=f"{name} {tag}", url=player_link(tag), color=color)
+    e.set_author(name=author.upper())
+    first = []
+    if town_hall:
+        th = EMOJIS.town_hall(town_hall)
+        first.append(f"{th} Town Hall {town_hall}" if th else f"Town Hall {town_hall}")
+    if trophies is not None:
+        trophy = sym("res_trophy", "")
+        first.append(f"{trophy} **{trophies:,}** trophies".strip())
+    a_values = [h.trophies for h in attacks]
+    d_values = [h.trophies for h in defenses]
+    a_head = f"{sym('ui_sword', '⚔️')} **Attacks {count(a_values, cap)} ({signed(sum(a_values))})**"
+    d_head = f"{sym('ui_shield', '🛡️')} **Defenses {count(d_values, cap)} ({signed(sum(d_values))})**"
+    summary = "```\n" + summary_block(attacks, defenses, cap, start, end) + "\n```"
+    a_lines, d_lines = battle_lines(attacks), battle_lines(defenses)
+    dropped = [0, 0]
+
+    def build() -> str:
+        parts = [SEP.join(first)] if first else []
+        parts += [
+            summary,
+            a_head,
+            _block(a_lines[dropped[0] :], dropped[0], "No attacks yet"),
+            d_head,
+            _block(d_lines[dropped[1] :], dropped[1], "No defenses yet"),
+        ]
+        return "\n".join(parts)
+
+    text = build()
+    while len(text) > limit:
+        side = 0 if len(a_lines) - dropped[0] >= len(d_lines) - dropped[1] else 1
+        if len((a_lines, d_lines)[side]) - dropped[side] <= 1:
+            break
+        dropped[side] += 1
+        text = build()
+    e.description = text
+    hits = [*attacks, *defenses]
+    note = f" · {source_note(hits)}" if hits and not all(h.detailed or h.autofill for h in hits) else ""
+    e.set_footer(text=f"{footer} · Net {signed(sum(a_values) + sum(d_values))}{note}")
+    e.timestamp = now or datetime.now().astimezone()
     return e

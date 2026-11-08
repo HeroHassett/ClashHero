@@ -41,7 +41,12 @@ def test_caps():
     assert daily_attack_cap("Legend I") == 8
     assert daily_attack_cap("Legend II") is None
     assert weekly_attack_cap("Legend II") == 30 and weekly_attack_cap("Legend III") == 24
-    assert weekly_attack_cap("Electro League 32") is None
+    expected = {1: 6, 6: 6, 7: 8, 12: 8, 13: 10, 18: 10, 19: 12, 27: 12, 28: 14, 30: 14, 31: 18, 33: 18}
+    for n, cap in expected.items():
+        name = next(t for t in LEAGUE_TIERS if t.endswith(f" {n}"))
+        assert weekly_attack_cap(name) == cap, name
+    assert weekly_attack_cap("Legend I") is None  # daily cap instead
+    assert weekly_attack_cap("Unranked") is None and weekly_attack_cap(None) is None
 
 
 def test_league_name_prefers_league_tier():

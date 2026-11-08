@@ -68,8 +68,8 @@ class AccountTodo:
 def ranked_item(
     league: str | None, today_attacks: int, week_attacks: int, now: datetime, first_day: bool = False
 ) -> TodoItem | None:
-    """Legend I: today vs the daily cap. Legend II/III: this week vs the weekly cap. Other tracked
-    tiers: today's count with no cap. None when untracked or nothing is left."""
+    """Legend I: today vs the daily cap. Other tracked tiers: this week vs their weekly cap
+    (today's count with no cap if a tier's cap is unknown). None when untracked or nothing is left."""
     if not is_tracked_ranked(league):
         return None
     if (cap := daily_attack_cap(league, first_day=first_day)) is not None:

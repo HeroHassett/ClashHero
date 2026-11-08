@@ -32,10 +32,11 @@ from clashhero.services import cards
 from clashhero.services import icons as unit_icons
 from clashhero.services.army import parse_army
 from clashhero.services.battlelog import army_link
+from clashhero.services.emojis import EMOJIS
 from clashhero.services.outbox import send_clan_log, send_to_channel, update_live_message
 from clashhero.utils.checks import has_permission, manager
 from clashhero.utils.fmt import guild_color, signed, table
-from clashhero.utils.ranked import is_tracked_ranked, league_name, weekly_attack_cap
+from clashhero.utils.ranked import is_legend_one, is_tracked_ranked, league_name, weekly_attack_cap
 from clashhero.utils.resolve import (
     ResolveError,
     clan_autocomplete,
@@ -204,41 +205,78 @@ async def _season_image(
     return discord.File(io.BytesIO(png), filename="legend-season.png")
 
 
+def _week_trophies(week: Window, days: Sequence[repo.WeekDay], player) -> int | None:
+    """The tournament trophies: current while the week runs, else the week's last known."""
+    if week.contains(_now()) and player is not None and player["trophies"] is not None:
+        return player["trophies"]
+    known = [d.end if d.end is not None else d.start for d in days]
+    known = [t for t in known if t is not None]
+    return known[-1] if known else None
+
+
+async def _week_image(
+    tag: str, name: str, league: str | None, days: Sequence[repo.WeekDay], trophies: int | None
+) -> discord.File | None:
+    """The weekly-tournament grid (the game's battle log for tiers below Legend I), or None
+    (logged) if it can't be drawn."""
+    try:
+        png = await asyncio.to_thread(
+            cards.render_ranked_week,
+            player_name=name,
+            trophies=trophies,
+            cap=weekly_attack_cap(league),
+            attacks=army_battles([h for d in days for h in d.stats.hits("attack")], armies=False),
+            defenses=army_battles([h for d in days for h in d.stats.hits("defense")], armies=False),
+            trophy_icon=await unit_icons.fetch_trophy_icon(),
+        )
+    except Exception:
+        log.exception("Couldn't draw the ranked week card for %s", tag)
+        return None
+    return discord.File(io.BytesIO(png), filename="ranked-week.png")
+
+
 async def _day_reply(
     bot, tag: str, day: str, guild_id: int | None
-) -> tuple[discord.Embed, discord.File | None]:
-    """The /legends day reply: a compact embed with the battle-log image, or the full text embed
-    (as before the image) when the image can't be drawn."""
+) -> tuple[discord.Embed | None, discord.File | None]:
+    """The /legends day reply: just the image, as (None, file): the battle-log list for Legend I
+    (and unknown tiers), the weekly-tournament grid containing that day for tiers below it, as
+    the game shows them. When the image can't be drawn, (the text embed, None)."""
     stats = await repo.day_stats(bot.db, tag, day)
     row = await repo.legend_day_row(bot.db, tag, day)
     player = await bot.db.get_player_row(tag)
     name = player["name"] if player else tag
     start = row["start_trophies"] if row else None
     end = row["end_trophies"] if row else None
+    league = await repo.player_league(bot.db, tag)
+    file = None
+    if league and not is_legend_one(league):
+        week = ranked_week(datetime.fromisoformat(f"{day}T12:00:00+00:00"))
+        days = await repo.week_days(bot.db, tag, week.start)
+        file = await _week_image(tag, name, league, days, _week_trophies(week, days, player))
+    else:
+        today = day == legend_day_id(_now())
+        trophies = end if end is not None else start
+        if today and player is not None and player["trophies"] is not None:
+            trophies = player["trophies"]
+        try:
+            png = await asyncio.to_thread(
+                cards.render_legend_day,
+                player_name=name,
+                day=day,
+                today=today,
+                trophies=trophies,
+                cap=stats.cap,
+                attacks=army_battles(stats.hits("attack"), armies=False),
+                defenses=army_battles(stats.hits("defense"), armies=False),
+                trophy_icon=await unit_icons.fetch_trophy_icon(),
+            )
+            file = discord.File(io.BytesIO(png), filename="legend-day.png")
+        except Exception:
+            log.exception("Couldn't draw the legend day card for %s on %s", tag, day)
+    if file is not None:
+        return None, file
     color = await guild_color(bot, guild_id)
-    today = day == legend_day_id(_now())
-    trophies = end if end is not None else start
-    if today and player is not None and player["trophies"] is not None:
-        trophies = player["trophies"]
-    try:
-        png = await asyncio.to_thread(
-            cards.render_legend_day,
-            player_name=name,
-            day=day,
-            today=today,
-            trophies=trophies,
-            cap=stats.cap,
-            attacks=army_battles(stats.hits("attack"), armies=False),
-            defenses=army_battles(stats.hits("defense"), armies=False),
-            trophy_icon=await unit_icons.fetch_trophy_icon(),
-        )
-    except Exception:
-        log.exception("Couldn't draw the legend day card for %s on %s", tag, day)
-        text = E.day_embed(name=name, tag=tag, day=day, stats=stats, start=start, end=end, color=color)
-        return text, None
-    embed = E.day_card_embed(name=name, tag=tag, day=day, stats=stats, start=start, end=end, color=color)
-    embed.set_image(url="attachment://legend-day.png")
-    return embed, discord.File(io.BytesIO(png), filename="legend-day.png")
+    return E.day_embed(name=name, tag=tag, day=day, stats=stats, start=start, end=end, color=color), None
 
 
 async def _armies_card(
@@ -285,6 +323,183 @@ async def _armies_card(
         battles=card is None,
     )
     return embed, card
+
+
+# ------------------------------------------------------------------ /legends logs views and buttons
+
+# One row under /legends logs and /legends armies switches the message between four views of a
+# player's day: "day" (the day at a glance; the button refreshes it), "season" (the season's day
+# by day history), "def" and "att" (the armies card for that day). custom_id:
+# lg:v:<view>:<tag without #>:<YYYY-MM-DD>.
+LEGEND_VIEWS = ("day", "season", "def", "att")
+VIEW_LABELS = {
+    "day": "Refresh",
+    "season": "View Historical Data",
+    "def": "Defense Armies",
+    "att": "Attack Armies",
+}
+VIEW_EMOJIS = {
+    "day": (("ui_war_star", "res_trophy"), "🔄"),
+    "season": (("ui_clan_games",), "📈"),
+    "def": (("ui_shield",), "🛡️"),
+    "att": (("ui_sword",), "⚔️"),
+}
+LEGEND_VIEW_TEMPLATE = (
+    r"lg:v:(?P<view>day|season|def|att):(?P<tag>[0289PYLQGRJCUV]{3,15}):(?P<day>\d{4}-\d{2}-\d{2})"
+)
+_LEGEND_VIEW_RE = re.compile(LEGEND_VIEW_TEMPLATE)
+
+
+def legend_view_id(view: str, tag: str, day: str) -> str:
+    """custom_id of a view button: ``lg:v:season:2PQ8VLYC0:2026-11-07``."""
+    if view not in LEGEND_VIEWS:
+        raise ValueError(f"unknown legend view {view!r}")
+    return f"lg:v:{view}:{tag.lstrip('#').upper()}:{day}"
+
+
+def parse_legend_view_id(custom_id: str) -> tuple[str, str, str] | None:
+    """(view, "#TAG", "YYYY-MM-DD") from a view button's custom_id, or None."""
+    m = _LEGEND_VIEW_RE.fullmatch(custom_id)
+    return (m["view"], f"#{m['tag']}", m["day"]) if m else None
+
+
+def _view_emoji(view: str) -> discord.PartialEmoji | str:
+    names, fallback = VIEW_EMOJIS[view]
+    for name in names:
+        emoji = discord.PartialEmoji.from_str(EMOJIS.get(name)) if EMOJIS.get(name) else None
+        if emoji is not None and emoji.id:  # only a well-formed custom emoji
+            return emoji
+    return fallback
+
+
+class LegendViewButton(discord.ui.DynamicItem[discord.ui.Button], template=LEGEND_VIEW_TEMPLATE):
+    """Switches a /legends logs or /legends armies message to another view of the player's day,
+    editing it in place. Persistent: works on old messages after a restart. Anyone may click."""
+
+    def __init__(self, view: str, tag: str, day: str, *, current: bool = False) -> None:
+        super().__init__(
+            discord.ui.Button(
+                label=VIEW_LABELS[view],
+                style=discord.ButtonStyle.primary if current else discord.ButtonStyle.secondary,
+                disabled=current and view != "day",  # Refresh always works
+                emoji=_view_emoji(view),
+                custom_id=legend_view_id(view, tag, day),
+            )
+        )
+        self.target, self.tag, self.day = view, f"#{tag.lstrip('#')}", day
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match):
+        return cls(match["view"], match["tag"], match["day"])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await interaction.response.defer()
+            embed, file = await render_legend_view(
+                interaction.client, interaction.guild_id, self.target, self.tag, self.day
+            )
+            await interaction.edit_original_response(
+                embed=embed,
+                attachments=[file] if file else [],
+                view=legend_view_row(self.target, self.tag, self.day),
+            )
+        except Exception as e:  # buttons have no command error handler
+            await send_error(interaction, e)
+
+
+def legend_view_row(current: str, tag: str, day: str) -> discord.ui.View:
+    """Refresh · View Historical Data · Defense Armies · Attack Armies; ``current`` highlighted."""
+    view = discord.ui.View(timeout=None)
+    for name in LEGEND_VIEWS:
+        view.add_item(LegendViewButton(name, tag, day, current=name == current))
+    return view
+
+
+def _day_label(day: str) -> str:
+    d = date.fromisoformat(day)
+    return f"{d:%b %d}"
+
+
+async def _logs_day_view(bot, tag: str, day: str, guild_id: int | None) -> discord.Embed:
+    """The day at a glance: summary and every battle of that legend day (for tiers below
+    Legend I, of the weekly tournament containing it)."""
+    player = await bot.db.get_player_row(tag)
+    name = player["name"] if player else tag
+    league = await repo.player_league(bot.db, tag)
+    color = await guild_color(bot, guild_id)
+    common = dict(
+        name=name, tag=tag, town_hall=player["town_hall"] if player else None, now=_now(), color=color
+    )
+    if league and not is_legend_one(league):
+        week = ranked_week(datetime.fromisoformat(f"{day}T12:00:00+00:00"))
+        days = await repo.week_days(bot.db, tag, week.start)
+        starts = [d.start for d in days if d.start is not None]
+        ends = [d.end for d in days if d.end is not None]
+        s, e = week.start, week.end
+        span = f"{s:%b} {s.day} – {e:%b} {e.day}"
+        return E.legends_today_embed(
+            author=f"{league} · Week {span}",
+            trophies=_week_trophies(week, days, player),
+            attacks=[h for d in days for h in d.stats.hits("attack")],
+            defenses=[h for d in days for h in d.stats.hits("defense")],
+            cap=weekly_attack_cap(league),
+            start=starts[0] if starts else None,
+            end=ends[-1] if ends else None,
+            footer=span,
+            **common,
+        )
+    stats = await repo.day_stats(bot.db, tag, day)
+    row = await repo.legend_day_row(bot.db, tag, day)
+    start = row["start_trophies"] if row else None
+    end = row["end_trophies"] if row else None
+    today = day == legend_day_id(_now())
+    trophies = end if end is not None else start
+    if today and player is not None and player["trophies"] is not None:
+        trophies = player["trophies"]
+    return E.legends_today_embed(
+        author=f"{league or 'Legend League'} · {'Today' if today else _day_label(day)}",
+        trophies=trophies,
+        attacks=stats.hits("attack"),
+        defenses=stats.hits("defense"),
+        cap=stats.cap,
+        start=start,
+        end=end,
+        footer=_day_label(day),
+        **common,
+    )
+
+
+async def render_legend_view(
+    bot, guild_id: int | None, view: str, tag: str, day: str
+) -> tuple[discord.Embed, discord.File | None]:
+    """(embed, image file or None) for one of the four views of a player's day."""
+    if view in ("def", "att"):
+        embed, card = await _armies_card(bot, tag, day, "defense" if view == "def" else "attack", guild_id)
+        if card is None:
+            return embed, None
+        embed.set_image(url="attachment://armies.png")
+        return embed, discord.File(io.BytesIO(card), filename="armies.png")
+    season_id = game_season(datetime.fromisoformat(f"{day}T12:00:00+00:00")).id
+    summary = await repo.season_summary(bot.db, tag, season_id)
+    name = await _player_name(bot, tag)
+    if view == "day":
+        embed = await _logs_day_view(bot, tag, day, guild_id)
+    else:
+        color = await guild_color(bot, guild_id)
+        embed = E.season_embed(name=name, tag=tag, season_id=season_id, summary=summary, color=color)
+    file = await _season_image(bot, tag, name, season_id, summary)
+    if file is not None:
+        embed.set_image(url="attachment://legend-season.png")
+    return embed, file
+
+
+async def _send_view(interaction: discord.Interaction, view: str, tag: str, day: str) -> None:
+    """Send a view (after the command deferred) with the row of view buttons under it."""
+    embed, file = await render_legend_view(interaction.client, interaction.guild_id, view, tag, day)
+    reply: dict[str, Any] = {"embed": embed, "view": legend_view_row(view, tag, day)}
+    if file is not None:
+        reply["file"] = file
+    await interaction.followup.send(**reply)
 
 
 # ------------------------------------------------------------------ persistent components
@@ -462,8 +677,8 @@ class OwnerView(discord.ui.View):
 
 
 class AltSelectView(OwnerView):
-    """Switch a reply between the user's linked accounts. ``render(tag)`` gives (embed, image
-    file or None); the message is edited with the new image, or none."""
+    """Switch a reply between the user's linked accounts. ``render(tag)`` gives (embed or None,
+    image file or None); the message is edited to show exactly that."""
 
     def __init__(self, owner_id: int, accounts: list[tuple[str, str]], render) -> None:
         super().__init__(owner_id)
@@ -531,7 +746,7 @@ class Legends(BaseCog):
 
     async def cog_load(self) -> None:
         self.collector.register_player_source(self._tracked_tags)
-        self.bot.add_dynamic_items(MuteAttacksButton, ViewArmyButton, BoardSelect)
+        self.bot.add_dynamic_items(MuteAttacksButton, ViewArmyButton, BoardSelect, LegendViewButton)
         self.board_loop.start()
         self.daily_loop.start()
 
@@ -803,7 +1018,7 @@ class Legends(BaseCog):
         day = legend_day_id(_now() - timedelta(days=day_offset))
         gid = interaction.guild_id
 
-        async def render(t: str) -> tuple[discord.Embed, discord.File | None]:
+        async def render(t: str) -> tuple[discord.Embed | None, discord.File | None]:
             return await _day_reply(self.bot, t, day, gid)
 
         view = None
@@ -815,9 +1030,7 @@ class Legends(BaseCog):
                 )
         await interaction.response.defer()
         embed, file = await render(tag)
-        reply: dict[str, Any] = {"embed": embed}
-        if file is not None:
-            reply["file"] = file
+        reply: dict[str, Any] = {"file": file} if file is not None else {"embed": embed}
         if view is not None:
             reply["view"] = view
         await interaction.followup.send(**reply)
@@ -840,17 +1053,10 @@ class Legends(BaseCog):
         side: app_commands.Choice[str] | None = None,
     ) -> None:
         tag = await self._resolve_player(interaction, player, user)
-        kind = side.value if side else "defense"
+        target = "att" if side and side.value == "attack" else "def"
         day = legend_day_id(_now() - timedelta(days=day_offset))
         await interaction.response.defer()
-        embed, card = await _armies_card(self.bot, tag, day, kind, interaction.guild_id)
-        if card is None:
-            await interaction.followup.send(embed=embed)
-            return
-        embed.set_image(url="attachment://armies.png")
-        await interaction.followup.send(
-            embed=embed, file=discord.File(io.BytesIO(card), filename="armies.png")
-        )
+        await _send_view(interaction, target, tag, day)
 
     @legends.command(name="week", description="A player's ranked week (weekly tournaments)")
     @app_commands.autocomplete(player=player_autocomplete)
@@ -864,17 +1070,28 @@ class Legends(BaseCog):
     ) -> None:
         tag = await self._resolve_player(interaction, player, user)
         week = ranked_week(_now() - timedelta(weeks=weeks_ago))
+        await interaction.response.defer()
         league = await repo.player_league(self.db, tag)
+        days = await repo.week_days(self.db, tag, week.start)
+        row = await self.db.get_player_row(tag)
+        name = row["name"] if row else tag
         embed = E.week_embed(
-            name=await _player_name(self.bot, tag),
+            name=name,
             tag=tag,
             league=league,
             week_id=week.id,
-            days=await repo.week_days(self.db, tag, week.start),
+            days=days,
             weekly_cap=weekly_attack_cap(league),
             color=await guild_color(self.bot, interaction.guild_id),
         )
-        await interaction.response.send_message(embed=embed)
+        file = None
+        if not is_legend_one(league):  # Legend I is shown day by day (/legends day), as in the game
+            file = await _week_image(tag, name, league, days, _week_trophies(week, days, row))
+        if file is None:
+            await interaction.followup.send(embed=embed)
+            return
+        embed.set_image(url="attachment://ranked-week.png")
+        await interaction.followup.send(embed=embed, file=file)
 
     async def _season_autocomplete(self, interaction: discord.Interaction, current: str):
         raw = getattr(interaction.namespace, "player", None)
@@ -904,29 +1121,15 @@ class Legends(BaseCog):
         season: str | None = None,
     ) -> None:
         tag = await self._resolve_player(interaction, player, user)
+        target, day = "day", legend_day_id(_now())
         if season:
             window = season_for_date(season)
             if window is None:
                 raise ResolveError("Pick a season from the list, or type a date like 2026-11-02.")
-            season_id = window.id
-        else:
-            season_id = game_season(_now()).id
+            if not window.contains(_now()):  # another season: open on its day-by-day history
+                target, day = "season", legend_day_id(min(window.end, _now()) - timedelta(seconds=1))
         await interaction.response.defer()
-        summary = await repo.season_summary(self.db, tag, season_id)
-        name = await _player_name(self.bot, tag)
-        embed = E.season_embed(
-            name=name,
-            tag=tag,
-            season_id=season_id,
-            summary=summary,
-            color=await guild_color(self.bot, interaction.guild_id),
-        )
-        file = await _season_image(self.bot, tag, name, season_id, summary)
-        if file is None:
-            await interaction.followup.send(embed=embed)
-            return
-        embed.set_image(url="attachment://legend-season.png")
-        await interaction.followup.send(embed=embed, file=file)
+        await _send_view(interaction, target, tag, day)
 
     @legends.command(name="history", description="A player's legend results across seasons")
     @app_commands.autocomplete(player=player_autocomplete)

@@ -77,12 +77,14 @@ def test_slot_styles():
     assert cards.slot_style(hit(40, stars=3), "attack") == "gold"
     assert cards.slot_style(hit(32, stars=3), "attack") == "gold"  # a triple in a lower tier
     assert cards.slot_style(hit(30, stars=2), "attack") == "grey"
+    assert cards.slot_style(hit(2, stars=0), "attack") == "red"  # a 0-star attack, as in the game
     assert cards.slot_style(B(trophies=40), "attack") == "gold"  # inferred: max trophies
     assert cards.slot_style(B(trophies=24), "attack") == "grey"
     assert cards.slot_style(hit(-40, stars=3), "defense") == "red"
     assert cards.slot_style(B(trophies=-40), "defense") == "red"
     assert cards.slot_style(hit(-25, stars=2), "defense") == "grey"
-    assert cards.slot_style(hit(12, stars=3), "defense") == "grey"  # below Legend I: a gain
+    assert cards.slot_style(hit(0, stars=3), "defense") == "red"  # below Legend I a 3-star defense earns 0
+    assert cards.slot_style(hit(12, stars=2), "defense") == "grey"  # below Legend I: a gain
     assert cards.slot_style(B(trophies=-40, autofill=True), "defense") == "grey"
 
 
@@ -288,8 +290,8 @@ def spy(monkeypatch):
 
 async def test_day_card_is_attached(day, spy):
     msg = await run_day(day)
-    embed, file = msg["embed"], msg["file"]
-    assert embed.image.url == "attachment://legend-day.png"
+    assert "embed" not in msg  # just the image, as a plain attachment
+    file = msg["file"]
     assert file.filename == "legend-day.png"
     assert open_png(file.fp.read()).size == (1000, cards.legend_day_height(8))
     assert "view" not in msg  # a tag was given: no account switcher
@@ -300,10 +302,6 @@ async def test_day_card_is_attached(day, spy):
     assert [(b.trophies, b.stars) for b in kw["attacks"]] == [(40, 3), (40, None)]
     assert [(b.opponent, b.trophies) for b in kw["defenses"]] == [("Raider", -20)]
     assert kw["trophy_icon"] == png()
-
-    assert embed.title == f"Amy · Legend day {DAY}"
-    assert embed.description == "**5000** → **5060** · Net **+60** · ⚔️ 2/8 (+80) · 🛡️ 1/8 (-20)"
-    assert not embed.fields
 
 
 async def test_switching_accounts_edits_in_the_new_image(day, spy):
@@ -319,7 +317,7 @@ async def test_switching_accounts_edits_in_the_new_image(day, spy):
     [edit] = switch.response.edits
     [file] = edit["attachments"]
     assert isinstance(file, discord.File) and file.filename == "legend-day.png"
-    assert edit["embed"].title == f"Bob · Legend day {DAY}" and edit["view"] is view
+    assert edit["embed"] is None and edit["view"] is view  # image only, no embed
     assert spy["render"]["player_name"] == "Bob" and spy["render"]["trophies"] == 4900
 
 

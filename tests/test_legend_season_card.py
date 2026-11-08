@@ -275,7 +275,9 @@ async def test_logs_attach_the_season_card(season_db, monkeypatch):
     embed, file = msg["embed"], msg["file"]
     assert embed.image.url == "attachment://legend-season.png" and file.filename == "legend-season.png"
     assert open_png(file.fp.read()).size == (1000, cards.SEASON_H)
-    assert "11-02" in embed.description and embed.fields  # the text embed and its day table stay
+    assert embed.author.name == "LEGEND I · TODAY"  # the day at a glance, with the season card
+    assert "ATTACK" in embed.description and "Attacks 2/8 (+72)" in embed.description
+    assert [b.item.label for b in msg["view"].children][0] == "Refresh"
 
     card = seen["card"]
     assert (card.player_name, card.today, card.trophies, card.start) == ("Amy", 1, 5104, 5000)
@@ -291,11 +293,19 @@ async def test_logs_fall_back_to_the_text_embed(season_db, monkeypatch, caplog):
     with caplog.at_level(logging.ERROR):
         msg = await run_logs(season_db)
     assert "file" not in msg
-    assert msg["embed"].image.url is None and "11-02" in msg["embed"].description
+    assert msg["embed"].image.url is None and "ATTACK" in msg["embed"].description  # text alone
     assert any("legend season card" in r.getMessage() for r in caplog.records)
 
 
 async def test_logs_for_a_past_season_by_date(season_db):
     msg = await run_logs(season_db, season="2026-10-20")
-    assert msg["embed"].description == "No legend data recorded for this season."
+    assert msg["embed"].description == "No legend data recorded for this season."  # the history view
     assert msg["file"].filename == "legend-season.png"  # an empty season still gets its card
+    current = [b.item for b in msg["view"].children if b.item.style.name == "primary"]
+    assert [b.label for b in current] == ["View Historical Data"]
+    assert current[0].custom_id == f"lg:v:season:{TAG[1:]}:2026-11-01"  # the season's last day
+
+
+async def test_logs_for_the_current_season_open_on_today(season_db):
+    msg = await run_logs(season_db, season="2026-11-05")
+    assert msg["embed"].author.name == "LEGEND I · TODAY"

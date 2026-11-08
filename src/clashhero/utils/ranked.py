@@ -13,12 +13,14 @@ Tournament rules (adjust here if Supercell changes them):
 - Defenses a player didn't receive by the daily reset are auto-filled by the game with their
   average defense (season average in Legend I, tournament average elsewhere).
 - Every other tier runs weekly tournaments (Monday 05:00 UTC to Monday 05:00 UTC).
-- Legend II allows 30 attacks per week and Legend III 24 ("battles" in Supercell's wording).
+- Battles per weekly tournament: tiers 1-6: 6, 7-12: 8, 13-18: 10, 19-27: 12, Dragon 28-30: 14,
+  Electro 31-33: 18, Legend III: 24, Legend II: 30 (Legend I: 8 per day instead).
 - Per-battle tracking covers Dragon League 28 and up.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -46,6 +48,8 @@ LEGEND_ONE = "Legend I"
 MIN_TRACKED_TIER = _TIER_INDEX["dragon league 28"]
 DAILY_ATTACK_CAP = {"legend i": 8}
 WEEKLY_ATTACK_CAP = {"legend ii": 30, "legend iii": 24}
+# Battles per weekly tournament for the numbered tiers: (last tier number of the band, cap).
+WEEKLY_CAP_BANDS = ((6, 6), (12, 8), (18, 10), (27, 12), (30, 14), (33, 18))
 
 
 def tier_number(name: str | None) -> int | None:
@@ -98,7 +102,18 @@ def defenses_gain(name: str | None) -> bool:
 
 
 def weekly_attack_cap(name: str | None) -> int | None:
-    return WEEKLY_ATTACK_CAP.get(name.lower()) if name else None
+    """Battles (attacks, and likewise defenses) per weekly tournament, or None for Legend I (which
+    has a daily cap) and unknown tiers. Numbered tiers read their number from the name
+    ("Electro League 32"), so a reordered tier list doesn't shift them."""
+    if not name:
+        return None
+    if (cap := WEEKLY_ATTACK_CAP.get(name.lower())) is not None:
+        return cap
+    m = re.search(r"(\d+)\s*$", name)
+    number = int(m.group(1)) if m else None
+    if number is None or number < 1:
+        return None
+    return next((cap for last, cap in WEEKLY_CAP_BANDS if number <= last), None)
 
 
 def league_icon(obj: Any) -> str | None:
