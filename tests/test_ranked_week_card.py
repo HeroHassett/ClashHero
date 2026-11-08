@@ -73,7 +73,11 @@ def test_tiles_fill_left_to_right_then_down_with_the_halves_apart():
     assert a6[0] == a0[0] and a6[1] > a0[1]  # next row
     gap = cards.grid_tile_box(0, 1)[0] - a0[2]
     assert d0[0] - a5[2] > gap  # a wider gap between attacks and defenses
-    assert cards.INNER_L < a0[0] and d0[0] > cards.WIDTH / 2 and cards.grid_tile_box(1, 5)[2] < cards.INNER_R
+    assert (
+        cards.GW_EDGE < a0[0]
+        and d0[0] > cards.WIDTH / 2
+        and cards.grid_tile_box(1, 5)[2] < cards.WIDTH - cards.GW_EDGE
+    )
 
 
 def _tile_pixel(im: Image.Image, side: int, index: int) -> tuple[int, int, int]:

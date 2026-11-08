@@ -89,10 +89,9 @@ def test_slot_styles():
 
 
 def _slot_pixel(im: Image.Image, col: int, row: int) -> tuple[int, int, int]:
-    """A pixel inside a slot, left of its text."""
-    x = cards.INNER_L + col * (cards.COL_W + cards.COL_GAP) + 8
-    y = cards.SLOTS_Y + row * (cards.SLOT_H + cards.SLOT_GAP) + cards.SLOT_H * 0.65
-    return im.convert("RGB").getpixel((round(x), round(y)))
+    """A pixel inside a row, left of its text."""
+    x0, y0, x1, y1 = cards.day_slot_box(col, row)
+    return im.convert("RGB").getpixel((round(x0 + 4), round(y0 + (y1 - y0) * 0.65)))
 
 
 def test_row_colours():
@@ -103,9 +102,9 @@ def test_row_colours():
     assert r > 210 and g > 170 and b < 140
     r, g, b = _slot_pixel(im, 1, 0)  # -40 defense: pinkish red
     assert r > 200 and r - g > 45 and r - b > 50
-    for col, row in ((0, 1), (1, 1), (0, 5)):  # others grey; unplayed slots pale
+    for col, row in ((0, 1), (1, 1), (0, 5)):  # others grey (the game's #cfbeb6); unplayed slots pale
         r, g, b = _slot_pixel(im, col, row)
-        assert 190 < r < 240 and abs(r - g) < 16 and abs(r - b) < 26
+        assert 190 < r < 240 and abs(r - g) < 20 and abs(r - b) < 28
 
 
 def test_autofill_and_inferred_rows():
@@ -365,3 +364,56 @@ async def test_icon_failures_fall_back_too(day, monkeypatch):
     monkeypatch.setattr(unit_icons, "fetch_trophy_icon", offline)
     msg = await run_day(day)
     assert "file" not in msg and msg["embed"].fields
+
+
+# ------------------------------------------------------------------ the game's window
+
+
+def _near(c, target, tolerance=14):
+    return all(abs(a - b) <= tolerance for a, b in zip(c, target, strict=True))
+
+
+def test_the_image_is_the_game_window_only():
+    im = open_png(render([hit(40, stars=3)], [hit(-40, stars=3)])).convert("RGB")
+    assert _near(im.getpixel((40, 4)), cards.GW_FRAME)  # the window's frame, no backdrop or band
+    assert _near(im.getpixel((500, 2)), cards.GW_FRAME)
+    tab = cards.GW_TAB_X0 + cards.GW_TAB_W / 2
+    step = cards.GW_TAB_W + cards.GW_TAB_GAP
+    assert _near(im.getpixel((round(tab + step), 14)), cards.GW_TAB_ACTIVE)  # Battle Log: 2nd tab
+    for i in (0, 2, 3):
+        assert _near(im.getpixel((round(tab + i * step) - 80, 14)), cards.GW_TAB)
+    x0, y0, x1, y1 = cards.GW_CLOSE_BOX
+    r, g, b = im.getpixel((round(x0 + 5), round((y0 + y1) / 2)))
+    assert r > 170 and g < 90 and b < 90  # the red close button
+
+
+def test_the_toggle_shows_the_current_view():
+    day = open_png(render([hit(40, stars=3)])).convert("RGB")
+    x0, y0, x1, y1 = cards.DAY_TOGGLE
+    list_button = day.getpixel((round(x0 + (x1 - x0) / 4 - 14), round((y0 + y1) / 2 - 13)))
+    assert _near(list_button, cards.GW_TOGGLE_ON_LIGHT, 30)  # the list view is highlighted
+    assert _near(day.getpixel((round(x1 - 4), round((y0 + y1) / 2))), cards.GW_TOGGLE, 18)
+    week = open_png(
+        cards.render_ranked_week(player_name="Amy", trophies=975, cap=30, attacks=[hit(40, 3)], defenses=[])
+    ).convert("RGB")
+    gx = round(881 + 94 * 3 / 4 - 14)
+    gy = round(cards.WEEK_BAND_Y + 32 - 13)
+    assert _near(week.getpixel((gx, gy)), cards.GW_TOGGLE_ON_BAND_LIGHT, 30)  # the grid view is
+
+
+def test_the_band_texture_stays_faint():
+    """The banner's diamond lattice must blend into the maroon, never show as light lines."""
+    im = open_png(render([hit(40, stars=3)], [hit(-40, stars=3)])).convert("RGB")
+    x0, y0 = 560, cards.DAY_BAND[1] + 4
+    area = im.crop((x0, round(y0), 960, round(y0 + 56)))
+    colours = [c for _, c in area.getcolors(maxcolors=100_000)]
+    assert max(max(c) for c in colours) < 150  # no light streaks on the dark maroon
+
+
+def test_undrawable_symbols_keep_the_word_break():
+    fonts = cards._game_fonts(14)
+    if any(cards._has_glyph(f, "🔥") for f in fonts):
+        pytest.skip("this host has a font that draws the emoji")
+    assert cards._spaced("KT🔥ISHRAK🔥(L)", 14) == "KT ISHRAK (L)"
+    assert cards._spaced("🔥🔥", 14) == ""
+    assert cards._spaced("戦Eren  Yeager", 14) == "戦Eren Yeager"
