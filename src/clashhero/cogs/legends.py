@@ -290,6 +290,16 @@ async def _week_image(
     return discord.File(io.BytesIO(png), filename="ranked-week.png")
 
 
+async def _day_start(db, tag: str, day: str, start: int | None) -> int | None:
+    """Trophies at the beginning of a legend day (BOD): the day's recorded start, else the end of
+    the day before (an untracked start). Resets (season, weekly floor) and promotions to Legend I
+    are already applied to the recorded start by the collector."""
+    if start is not None:
+        return start
+    prev = await repo.legend_day_row(db, tag, (date.fromisoformat(day) - timedelta(days=1)).isoformat())
+    return prev["end_trophies"] if prev is not None and prev["end_trophies"] is not None else None
+
+
 async def _day_reply(
     bot, tag: str, day: str, guild_id: int | None
 ) -> tuple[discord.Embed | None, discord.File | None]:
@@ -314,6 +324,7 @@ async def _day_reply(
     else:
         today = day == legend_day_id(now)
         trophies = end if end is not None else start
+        bod = None
         if today:  # EOD: the end of the previous day (today's start), with its rank
             eod = start
             eod_rank = await ranks.eod_rank(
@@ -324,6 +335,7 @@ async def _day_reply(
         else:
             eod = trophies
             eod_rank = await ranks.eod_rank(bot.db, tag, day)
+            bod = await _day_start(bot.db, tag, day, start)
         estimate = is_legend_one(league)
         try:
             png = await asyncio.to_thread(
@@ -340,6 +352,7 @@ async def _day_reply(
                 eod=eod,
                 eod_rank=eod_rank,
                 flag=flag,
+                bod=bod,
             )
             file = discord.File(io.BytesIO(png), filename="legend-day.png")
         except Exception:

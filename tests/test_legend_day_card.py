@@ -418,3 +418,37 @@ def test_undrawable_symbols_keep_the_word_break():
     assert cards._spaced("KT🔥ISHRAK🔥(L)", 14) == "KT ISHRAK (L)"
     assert cards._spaced("🔥🔥", 14) == ""
     assert cards._spaced("戦Eren  Yeager", 14) == "戦Eren Yeager"
+
+
+async def test_past_day_shows_bod(db, monkeypatch):
+    """A past day's card shows BOD (the day's start) on the right instead of the date again; an
+    untracked start falls back to the previous day's end."""
+    from types import SimpleNamespace
+
+    from clashhero.cogs import legends as cog
+
+    calls = []
+
+    def fake_render(**kw):
+        calls.append(kw)
+        return b"\x89PNG fake"
+
+    monkeypatch.setattr(cog.cards, "render_legend_day", fake_render)
+    monkeypatch.setattr(cog, "_now", lambda: datetime(2026, 11, 8, 12, tzinfo=UTC))
+
+    async def no_icon():
+        return None
+
+    monkeypatch.setattr(cog.unit_icons, "fetch_trophy_icon", no_icon)
+    for day, start, end in (("2026-11-06", 4900, 4945), ("2026-11-07", 4945, 4961)):
+        await db.execute(
+            "INSERT INTO legend_days (player_tag, legend_day, season_id, start_trophies, end_trophies) "
+            "VALUES ('#A', ?, 's', ?, ?)",
+            (day, start, end),
+        )
+    bot = SimpleNamespace(db=db, coc=None)
+    await cog._day_reply(bot, "#A", "2026-11-07", None)
+    assert (calls[-1]["today"], calls[-1]["bod"], calls[-1]["eod"]) == (False, 4945, 4961)
+    assert await cog._day_start(db, "#A", "2026-11-07", None) == 4945  # no start: the day before's end
+    await cog._day_reply(bot, "#A", "2026-11-08", None)
+    assert (calls[-1]["today"], calls[-1]["bod"]) == (True, None)  # today: "Total" on the right

@@ -212,3 +212,51 @@ async def test_late_drop_on_a_full_day_is_inferred(setup):  # noqa: F811
     await col._poll_player("#A", at(8, 5, 46))
     assert await bot.db.fetchval("SELECT COUNT(*) FROM legend_events WHERE battle_type = 'autofill'") == 0
     assert (await day_stats(bot.db, "#A", "2026-11-08")).defenses == [-29]
+
+
+async def _start(bot, day):
+    row = await bot.db.fetchone("SELECT start_trophies FROM legend_days WHERE legend_day = ?", (day,))
+    return row["start_trophies"] if row else None
+
+
+async def test_late_auto_defense_also_fixes_todays_start(setup):  # noqa: F811
+    bot, coc, col = setup
+    coc.http = FakeHttp()
+    log = [
+        battle(f"20261107T{6 + i:02d}0000.000Z", attack=False, opp=f"#D{i}", stars=2, pct=81)
+        for i in range(7)
+    ]
+    coc.http.items = list(reversed(log))
+    coc.player = ranked_player(4990)
+    await col._poll_player("#A", at(7, 23, 30))
+    await col._poll_player("#A", at(8, 5, 1))  # today's row starts at 4990: the fill isn't visible yet
+    coc.player = ranked_player(4961)
+    await col._poll_player("#A", at(8, 5, 15))
+    await col._poll_player("#A", at(8, 5, 46))
+    assert await _start(bot, "2026-11-08") == 4961  # BOD: after yesterday's auto defense
+
+
+async def test_late_weekly_floor_is_not_a_battle(setup):  # noqa: F811
+    """Monday's reset lifts players under 5000 to 5000; if the API shows it late, today began at
+    5000 and nothing is recorded as a battle."""
+    bot, coc, col = setup
+    coc.http = FakeHttp()
+    coc.http.items = [battle("20261108T120000.000Z")]
+    coc.player = ranked_player(4980)
+    await col._poll_player("#A", at(8, 23, 30))
+    await col._poll_player("#A", at(9, 5, 1))  # Monday reset: still 4980 in the API
+    coc.player = ranked_player(5000)
+    await col._poll_player("#A", at(9, 5, 15))
+    await col._poll_player("#A", at(9, 5, 46))
+    assert await bot.db.fetchval("SELECT COUNT(*) FROM legend_events WHERE battle_time IS NULL") == 0
+    assert await _start(bot, "2026-11-09") == 5000
+
+
+async def test_promotion_day_begins_in_legend_one(setup):  # noqa: F811
+    bot, coc, col = setup
+    coc.player = ranked_player(1003, "Legend II")  # lower tiers report a tournament count
+    await col._poll_player("#A", at(8, 23))
+    await col._poll_player("#A", at(9, 5, 1))  # Monday: still Legend II in the API
+    coc.player = ranked_player(5000, "Legend I")  # promoted
+    await col._poll_player("#A", at(9, 5, 20))
+    assert await _start(bot, "2026-11-09") == 5000

@@ -68,6 +68,7 @@ RANK_POLL_SECONDS = 30 * 60  # global top-200 ranking (current and end-of-day ra
 COUNTRY_RANK_POLL_SECONDS = 3 * 60 * 60  # every country's top 200 (flags and local ranks)
 # Auto defenses can reach the API's trophy count a while after the 05:00 UTC reset.
 LATE_AUTOFILL_WINDOW = timedelta(hours=2)
+RESET_TROPHIES = 5000  # Legend I's season reset and weekly floor
 
 PlayerSource = Callable[[], Awaitable[Iterable[str]]]
 
@@ -530,6 +531,8 @@ class Collector:
                     "INSERT OR IGNORE INTO legend_promotions (player_tag, legend_day) VALUES (?, ?)",
                     (new.tag, legend_day_id(now)),
                 )
+                # The day may have started from a stale lower-tier count: begin it in Legend I.
+                await self._restart_day(new.tag, legend_day_id(now), new.trophies)
         if old.war_opted_in is not None and old.war_opted_in != new.war_opted_in:
             self.dispatch(ev.WarPreferenceChanged(clan, new.tag, new.name, bool(new.war_opted_in)))
 
@@ -667,7 +670,9 @@ class Collector:
                 # No matching battle ever appeared (e.g. a battle type this version doesn't know
                 # yet): record the change the old, inferred way.
                 cursor.pending_delta, cursor.pending_since = 0, None
-                if not await self._record_late_autofill(new, residual, now):
+                if await self._late_reset(new, now):
+                    pass  # the weekly floor / season reset reached the API late: not a battle
+                elif not await self._record_late_autofill(new, residual, now):
                     await self._record_inferred(replace(new, trophies=new.trophies - residual), new, now)
         else:
             cursor.pending_delta, cursor.pending_since = 0, None
@@ -749,7 +754,41 @@ class Collector:
         if now - reset > LATE_AUTOFILL_WINDOW:
             return False
         prev_day = legend_day_id(reset - timedelta(seconds=1))
-        return await self._record_autofill(p, Crossing(day=True, week=False, prev_day=prev_day), residual)
+        if not await self._record_autofill(p, Crossing(day=True, week=False, prev_day=prev_day), residual):
+            return False
+        await self._restart_day(p.tag, legend_day_id(now), p.trophies)  # today began after the fill
+        return True
+
+    async def _late_reset(self, p: PlayerSnap, now: datetime) -> bool:
+        """Legend I's weekly floor and season reset set trophies to 5000 at Monday's 05:00 UTC reset.
+        When the API shows that change late, it isn't a battle: today simply began at 5000."""
+        if not is_legend_one(p.league):
+            return False
+        reset = legend_day_bounds(now)[0]
+        if now - reset > LATE_AUTOFILL_WINDOW or ranked_week(now).start != reset:
+            return False
+        day = legend_day_id(now)
+        net = await self.db.fetchval(
+            "SELECT COALESCE(SUM(trophies), 0) FROM legend_events WHERE player_tag = ? AND legend_day = ?",
+            (p.tag, day),
+            0,
+        )
+        if p.trophies - net != RESET_TROPHIES:
+            return False
+        await self._restart_day(p.tag, day, p.trophies)
+        return True
+
+    async def _restart_day(self, tag: str, day: str, trophies: int) -> None:
+        """Set a legend day's start (BOD) from the current trophies and the day's recorded battles."""
+        net = await self.db.fetchval(
+            "SELECT COALESCE(SUM(trophies), 0) FROM legend_events WHERE player_tag = ? AND legend_day = ?",
+            (tag, day),
+            0,
+        )
+        await self.db.execute(
+            "UPDATE legend_days SET start_trophies = ? WHERE player_tag = ? AND legend_day = ?",
+            (trophies - net, tag, day),
+        )
 
     async def _record_autofill(self, old: PlayerSnap, crossing: Crossing, residual: int) -> bool:
         """Record the defenses the game auto-filled for the legend day that just ended.
