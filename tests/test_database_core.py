@@ -45,3 +45,25 @@ async def test_live_messages(db):
     await db.set_live_message_id(1, "war_embed", "#C", 777)
     rows = await db.live_messages("war_embed")
     assert rows[0]["message_id"] == 777
+
+
+async def test_columns_added_to_existing_database(tmp_path):
+    import aiosqlite
+
+    from clashhero.db import Database
+
+    path = tmp_path / "old.db"
+    async with aiosqlite.connect(path) as conn:  # a database from before the columns existed
+        await conn.execute(
+            "CREATE TABLE legend_events (id INTEGER PRIMARY KEY, player_tag TEXT, legend_day TEXT, "
+            "season_id TEXT, kind TEXT, trophies INTEGER, trophies_after INTEGER, occurred_at TEXT)"
+        )
+        await conn.commit()
+    db = Database(path)
+    await db.connect()
+    cols = {r[1] for r in await db.fetchall("PRAGMA table_info(legend_events)")}
+    assert {"opponent_tag", "army_share_code", "stars"} <= cols
+    await db.close()
+    db = Database(path)  # second start is a no-op
+    await db.connect()
+    await db.close()

@@ -29,6 +29,10 @@ CLAN_LOG_TYPES: dict[str, str] = {
     "capital_summary": "Weekly raid summary",
     # clan games
     "clan_games": "Clan Games progress",
+    # progression and clan settings
+    "upgrades": "Troop, spell, hero, pet and equipment upgrades",
+    "super_troops": "Super troop boosts",
+    "clan_settings": "Clan settings changes (description, requirements, labels, ...)",
 }
 
 # Server-wide logs. Configured with /setup server-logs.

@@ -18,18 +18,23 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Iterable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 import coc
 from discord.ext import tasks
 
 from clashhero import events as ev
+from clashhero.services.battlelog import Battle, Cursor, assign_trophies, parse_battles, take_new
 from clashhero.services.snapshots import (
+    MAX_PLAUSIBLE_DELTA,
     ClanSnap,
     PlayerSnap,
     counter_delta,
     diff_clan,
+    diff_settings,
+    diff_units,
     has_activity,
     infer_battles,
 )
@@ -72,6 +77,8 @@ class Collector:
         self._clans: dict[str, ClanSnap] = {}
         self._players: dict[str, PlayerSnap] = {}
         self._cwl_lineups: dict[str, set[str]] = {}
+        self._battle_cursors: dict[str, Cursor] = {}
+        self._battlelog_fetched: dict[str, datetime] = {}
         self._player_sources: list[PlayerSource] = []
         self.in_maintenance = False
         self._sem = asyncio.Semaphore(10)
@@ -95,6 +102,8 @@ class Collector:
             self._clans[key[5:]] = ClanSnap.from_json(data)
         for key, data in (await self.db.load_snapshots("player:")).items():
             self._players[key[7:]] = PlayerSnap.from_json(data)
+        for key, data in (await self.db.load_snapshots("battles:")).items():
+            self._battle_cursors[key[8:]] = Cursor.from_json(data)
         log.info(
             "Collector restored %d clan and %d player snapshots",
             len(self._clans),
@@ -272,6 +281,9 @@ class Collector:
             self.dispatch(ev.DonationsChanged(new.tag, new.name, m.tag, m.name, donated, received))
         for attr, a, b in d.clan_changes:
             self.dispatch(ev.ClanAttributeChanged(new.tag, new.name, attr, a, b))
+        settings = diff_settings(old.settings, new.settings)
+        if settings:
+            self.dispatch(ev.ClanSettingsChanged(new.tag, new.name, tuple(settings)))
 
     # ------------------------------------------------------------------ players
 
@@ -301,15 +313,47 @@ class Collector:
             return
         new = PlayerSnap.from_coc(player)
         old = self._players.get(tag)
+        ranked_new: list[Battle] | None = None
+        if self._wants_battlelog(tag, old, new, now):
+            battles = await self._fetch_battlelog(tag)
+            if battles is not None:
+                self._battlelog_fetched[tag] = now
+                fresh, cursor = take_new(battles, self._battle_cursors.get(tag))
+                self._battle_cursors[tag] = cursor
+                ranked_new = [b for b in fresh if b.ranked]
         async with self.db.batch():
             await self._store_player(new, now)
             if old is not None:
-                await self._apply_player_diff(old, new, now)
+                await self._apply_player_diff(old, new, now, ranked_new)
             else:
                 await self._ensure_name(new, now)
             await self._update_legend_day(new, now)
             self._players[tag] = new
             await self.db.save_snapshot(f"player:{tag}", new.to_json(), _iso(now))
+            if tag in self._battle_cursors:
+                await self.db.save_snapshot(f"battles:{tag}", self._battle_cursors[tag].to_json(), _iso(now))
+
+    BATTLELOG_REFRESH = timedelta(minutes=10)
+
+    def _wants_battlelog(self, tag: str, old: PlayerSnap | None, new: PlayerSnap, now: datetime) -> bool:
+        """Read the battle log for ranked players when trophies moved, and periodically otherwise
+        (a 0-trophy defense doesn't move trophies)."""
+        if not (is_tracked_ranked(new.league) or (old is not None and is_tracked_ranked(old.league))):
+            return False
+        if tag not in self._battle_cursors or old is None or old.trophies != new.trophies:
+            return True
+        last = self._battlelog_fetched.get(tag)
+        return last is None or now - last >= self.BATTLELOG_REFRESH
+
+    async def _fetch_battlelog(self, tag: str) -> list[Battle] | None:
+        http = getattr(self.coc, "http", None)
+        if http is None:
+            return None
+        route = coc.http.Route("GET", http.base_url, f"/players/{quote(tag, safe='')}/battlelog")
+        data = await self._guarded(http.request(route))
+        if not isinstance(data, dict):
+            return None
+        return parse_battles(data.get("items") or [])
 
     async def _store_player(self, p: PlayerSnap, now: datetime) -> None:
         await self.db.execute(
@@ -354,8 +398,19 @@ class Collector:
             (p.tag, p.name, _iso(now)),
         )
 
-    async def _apply_player_diff(self, old: PlayerSnap, new: PlayerSnap, now: datetime) -> None:
+    async def _apply_player_diff(
+        self, old: PlayerSnap, new: PlayerSnap, now: datetime, ranked_new: list[Battle] | None = None
+    ) -> None:
         clan = new.clan_tag
+        if old.clan_tag != new.clan_tag:
+            self.dispatch(ev.PlayerClanChanged(new.tag, new.name, old.clan_tag, new.clan_tag, new.clan_name))
+        if old.units:  # need a baseline; snapshots from older versions have none
+            changes = diff_units(old.units, new.units)
+            if changes:
+                self.dispatch(ev.UnitsUpgraded(clan, new.tag, new.name, new.town_hall, tuple(changes)))
+            boosted = tuple(t for t in new.super_troops if t not in old.super_troops)
+            if boosted:
+                self.dispatch(ev.SuperTroopsBoosted(clan, new.tag, new.name, boosted))
         if old.name != new.name:
             await self._ensure_name(new, now)
             self.dispatch(ev.NameChanged(clan, new.tag, old.name, new.name))
@@ -397,6 +452,9 @@ class Collector:
         if has_activity(old, new):
             await self._record_activity(new.tag, clan, now)
 
+        if ranked_new is not None:
+            await self._record_logged_battles(old, new, ranked_new, now)
+            return
         battles = infer_battles(old, new)
         if battles:
             day = legend_day_id(now)
@@ -410,6 +468,72 @@ class Collector:
                     (new.tag, day, season, b.kind, b.trophies, running, _iso(now)),
                 )
                 self.dispatch(ev.LegendBattle(new.tag, new.name, clan, b.kind, b.trophies, running, now, day))
+
+    async def _record_logged_battles(
+        self, old: PlayerSnap, new: PlayerSnap, battles: list[Battle], now: datetime
+    ) -> None:
+        """Record ranked battles from the battle log, splitting the observed trophy change across
+        them. Trophy changes seen before their battles appear are carried until they do."""
+        cursor = self._battle_cursors[new.tag]
+        delta = new.trophies - old.trophies
+        plausible = old.league == new.league and abs(delta) <= MAX_PLAUSIBLE_DELTA
+        if not battles:
+            if plausible and delta:
+                cursor.pending_delta += delta
+                if abs(cursor.pending_delta) > MAX_PLAUSIBLE_DELTA:
+                    cursor.pending_delta = 0
+            return
+        total = cursor.pending_delta + (delta if plausible else 0)
+        cursor.pending_delta = 0
+        trophies = assign_trophies(battles, total)
+        running = new.trophies - sum(trophies)
+        for b, t in zip(battles, trophies, strict=True):
+            running += t
+            at = b.occurred_at
+            day = legend_day_id(at)
+            event_id = await self.db.execute(
+                "INSERT INTO legend_events (player_tag, legend_day, season_id, kind, trophies, "
+                "trophies_after, occurred_at, battle_type, opponent_tag, opponent_name, opponent_th, "
+                "stars, destruction, army_share_code, battle_time) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    new.tag,
+                    day,
+                    game_season(at).id,
+                    b.kind,
+                    t,
+                    running,
+                    _iso(at),
+                    b.battle_type,
+                    b.opponent_tag,
+                    b.opponent_name,
+                    b.opponent_th,
+                    b.stars,
+                    b.destruction,
+                    b.army_share_code,
+                    b.timestamp,
+                ),
+            )
+            self.dispatch(
+                ev.LegendBattle(
+                    new.tag,
+                    new.name,
+                    new.clan_tag,
+                    b.kind,
+                    t,
+                    running,
+                    at,
+                    day,
+                    event_id=event_id,
+                    battle_type=b.battle_type,
+                    opponent_tag=b.opponent_tag,
+                    opponent_name=b.opponent_name,
+                    opponent_th=b.opponent_th,
+                    stars=b.stars,
+                    destruction=b.destruction,
+                    army_share_code=b.army_share_code,
+                )
+            )
 
     async def _update_legend_day(self, p: PlayerSnap, now: datetime) -> None:
         if not is_tracked_ranked(p.league):

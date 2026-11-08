@@ -23,8 +23,8 @@ follow [Discord's Terms of Service](https://discord.com/terms) and
 ClashHero shows and organises Clash of Clans information from Supercell's official public API, and
 provides tools such as logs, reminders, rosters, statistics, alerts, autoroles and nicknames.
 
-- **Estimates.** Some information (such as activity, "last seen" and ranked attacks) is
-  estimated from changes in public data and may be inaccurate or incomplete.
+- **Estimates.** Some information (such as activity, "last seen" and the trophies won or lost in
+  each ranked battle) is estimated from changes in public data and may be inaccurate or incomplete.
 - **No game access.** ClashHero never signs in to, controls or automates any game account, and never
   asks for game account credentials. Never share your game login with anyone.
 - **Free to use.** ClashHero is currently free. Features may be added, changed or removed at any

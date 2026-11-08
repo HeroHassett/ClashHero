@@ -12,6 +12,11 @@ from typing import Any
 
 from clashhero.utils.ranked import is_tracked_ranked, league_name
 
+try:  # unit categories from coc.py's static game data
+    from coc import PETS_ORDER, SIEGE_MACHINE_ORDER, SUPER_TROOP_ORDER
+except ImportError:  # pragma: no cover
+    PETS_ORDER, SIEGE_MACHINE_ORDER, SUPER_TROOP_ORDER = [], [], []
+
 GAMES_CHAMPION = "Games Champion"
 MAX_TROPHIES_PER_BATTLE = 40
 # A single poll gap can't plausibly explain more than this; larger jumps are resets.
@@ -65,6 +70,7 @@ class ClanSnap:
     capital_league: str | None
     capital_hall: int | None
     members: dict[str, MemberSnap] = field(default_factory=dict)
+    settings: dict[str, Any] = field(default_factory=dict)  # see clan_settings()
 
     @classmethod
     def from_coc(cls, c: Any) -> ClanSnap:
@@ -80,6 +86,7 @@ class ClanSnap:
             capital_league=_name(getattr(c, "capital_league", None)),
             capital_hall=capital_hall,
             members={m.tag: MemberSnap.from_coc(m) for m in c.members},
+            settings=clan_settings(getattr(c, "_raw_data", None)),
         )
 
     def to_json(self) -> dict:
@@ -116,6 +123,9 @@ class PlayerSnap:
     builder_hall: int = 0
     builder_trophies: int = 0
     builder_league: str | None = None
+    clan_name: str | None = None
+    units: dict[str, int] = field(default_factory=dict)  # "Kind:Name" -> level, see unit_levels()
+    super_troops: tuple[str, ...] = ()  # currently boosted
 
     @classmethod
     def from_coc(cls, p: Any) -> PlayerSnap:
@@ -147,6 +157,9 @@ class PlayerSnap:
             builder_hall=getattr(p, "builder_hall", 0) or 0,
             builder_trophies=getattr(p, "builder_base_trophies", 0) or 0,
             builder_league=_name(getattr(p, "builder_base_league", None)),
+            clan_name=getattr(clan, "name", None),
+            units=unit_levels(getattr(p, "_raw_data", None)),
+            super_troops=active_super_troops(getattr(p, "_raw_data", None)),
         )
 
     def to_json(self) -> dict:
@@ -155,7 +168,10 @@ class PlayerSnap:
     @classmethod
     def from_json(cls, d: dict) -> PlayerSnap:
         known = set(cls.__dataclass_fields__)
-        return cls(**{k: v for k, v in d.items() if k in known})
+        d = {k: v for k, v in d.items() if k in known}
+        if "super_troops" in d:
+            d["super_troops"] = tuple(d["super_troops"])
+        return cls(**d)
 
 
 # ------------------------------------------------------------------ clan diff
@@ -268,3 +284,83 @@ def has_activity(old: PlayerSnap, new: PlayerSnap) -> bool:
         return True
     # Trophy gains need the player online; losses can be defenses while offline.
     return new.trophies > old.trophies
+
+
+# ------------------------------------------------------------------ units and clan settings
+
+
+def unit_levels(raw: dict | None) -> dict[str, int]:
+    """Home-village unit levels from a raw player payload: {"Kind:Name": level}.
+
+    Kinds: Troop, Siege, Pet, Spell, Hero, Equipment. Super troops are skipped (their level mirrors
+    the base troop); boosts are tracked separately by active_super_troops().
+    """
+    if not isinstance(raw, dict):
+        return {}
+    supers, pets, sieges = set(SUPER_TROOP_ORDER), set(PETS_ORDER), set(SIEGE_MACHINE_ORDER)
+    out: dict[str, int] = {}
+    for key, default_kind in (
+        ("troops", "Troop"),
+        ("spells", "Spell"),
+        ("heroes", "Hero"),
+        ("heroEquipment", "Equipment"),
+    ):
+        for u in raw.get(key) or []:
+            name = u.get("name")
+            if not name or u.get("village", "home") != "home" or name in supers:
+                continue
+            kind = "Pet" if name in pets else "Siege" if name in sieges else default_kind
+            out[f"{kind}:{name}"] = int(u.get("level") or 0)
+    return out
+
+
+def active_super_troops(raw: dict | None) -> tuple[str, ...]:
+    if not isinstance(raw, dict):
+        return ()
+    return tuple(sorted(u["name"] for u in raw.get("troops") or [] if u.get("superTroopIsActive")))
+
+
+def diff_units(old: dict[str, int], new: dict[str, int]) -> list[tuple[str, str, int | None, int]]:
+    """(kind, name, old level or None if newly unlocked, new level) for every level increase.
+
+    Returns nothing when ``old`` is empty (no baseline yet).
+    """
+    if not old:
+        return []
+    out = []
+    for key, level in sorted(new.items()):
+        before = old.get(key)
+        if before is None or level > before:
+            kind, _, name = key.partition(":")
+            out.append((kind, name, before, level))
+    return out
+
+
+_SETTING_KEYS = {
+    "description": "description",
+    "type": "type",
+    "requiredTownhallLevel": "required_town_hall",
+    "requiredTrophies": "required_trophies",
+    "requiredBuilderBaseTrophies": "required_builder_trophies",
+    "warFrequency": "war_frequency",
+    "isWarLogPublic": "public_war_log",
+    "isFamilyFriendly": "family_friendly",
+}
+
+
+def clan_settings(raw: dict | None) -> dict[str, Any]:
+    """Clan settings a leader can change, from a raw clan payload (JSON-friendly values)."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {name: raw.get(key) for key, name in _SETTING_KEYS.items() if key in raw}
+    out["location"] = (raw.get("location") or {}).get("name")
+    out["chat_language"] = (raw.get("chatLanguage") or {}).get("name")
+    out["labels"] = sorted(lbl.get("name", "") for lbl in raw.get("labels") or [])
+    return out
+
+
+def diff_settings(old: dict[str, Any], new: dict[str, Any]) -> list[tuple[str, Any, Any]]:
+    """(setting, old, new) for settings present in both snapshots whose value changed."""
+    if not old or not new:
+        return []
+    return [(k, old[k], new[k]) for k in sorted(new) if k in old and old[k] != new[k]]

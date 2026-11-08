@@ -42,6 +42,7 @@ class Database:
         await self._conn.execute("PRAGMA journal_mode = WAL")
         for script in self._schema_scripts():
             await self._conn.executescript(script)
+        await self._add_missing_columns()
         await self._conn.commit()
 
     @staticmethod
@@ -51,6 +52,30 @@ class Database:
             p.name for p in pkg.iterdir() if p.name.startswith("schema_") and p.name.endswith(".sql")
         )
         return [pkg.joinpath("schema.sql").read_text()] + [pkg.joinpath(n).read_text() for n in names]
+
+    @staticmethod
+    def _declared_columns() -> list[tuple[str, str, str]]:
+        """(table, column, declaration) from every ``db/columns_*.py`` module's ``COLUMNS``."""
+        import importlib
+        import pkgutil
+
+        import clashhero.db as pkg
+
+        out: list[tuple[str, str, str]] = []
+        for m in sorted(pkgutil.iter_modules(pkg.__path__), key=lambda m: m.name):
+            if m.name.startswith("columns_"):
+                out.extend(importlib.import_module(f"{pkg.__name__}.{m.name}").COLUMNS)
+        return out
+
+    async def _add_missing_columns(self) -> None:
+        """Columns added after a table first shipped. ``CREATE TABLE IF NOT EXISTS`` never alters an
+        existing table, so new columns are declared in ``db/columns_<feature>.py`` instead of being
+        edited into the CREATE statement, and added here if missing (fresh or existing databases)."""
+        for table, column, decl in self._declared_columns():
+            async with self.conn.execute(f"PRAGMA table_info({table})") as cur:
+                existing = {r[1] for r in await cur.fetchall()}
+            if existing and column not in existing:
+                await self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     async def close(self) -> None:
         if self._conn is not None:

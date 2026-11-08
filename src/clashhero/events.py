@@ -120,6 +120,17 @@ class ClanAttributeChanged(ClashEvent):
     new: object
 
 
+@dataclass(frozen=True)
+class ClanSettingsChanged(ClashEvent):
+    """Clan description, requirements, type, war frequency, location, labels, ... changed.
+    ``changes`` items are (setting, old, new)."""
+
+    event_name: ClassVar[str] = "clash_clan_settings"
+    clan_tag: str
+    clan_name: str
+    changes: tuple[tuple[str, object, object], ...]
+
+
 # ---------------------------------------------------------------- progression
 
 
@@ -144,7 +155,12 @@ class CapitalContribution(ClashEvent):
 
 @dataclass(frozen=True)
 class LegendBattle(ClashEvent):
-    """An inferred ranked attack or defense. ``trophies`` is signed."""
+    """A ranked attack or defense. ``trophies`` is signed.
+
+    When the battle came from the player's battle log, the opponent/stars/destruction/army fields
+    are set (``from_battle_log`` is True); otherwise it was inferred from a trophy change and those
+    fields are None. ``event_id`` is the legend_events row id.
+    """
 
     event_name: ClassVar[str] = "clash_legend_battle"
     player_tag: str
@@ -155,6 +171,52 @@ class LegendBattle(ClashEvent):
     trophies_after: int
     occurred_at: datetime
     legend_day: str
+    event_id: int | None = None
+    battle_type: str | None = None  # legend | ranked
+    opponent_tag: str | None = None
+    opponent_name: str | None = None
+    opponent_th: int | None = None
+    stars: int | None = None
+    destruction: int | None = None
+    army_share_code: str | None = None
+
+    @property
+    def from_battle_log(self) -> bool:
+        return self.opponent_tag is not None
+
+
+@dataclass(frozen=True)
+class UnitsUpgraded(ClashEvent):
+    """Home-village troop/spell/hero/pet/equipment levels that went up since the last poll.
+    ``changes`` items are (kind, unit name, old level or None if newly unlocked, new level)."""
+
+    event_name: ClassVar[str] = "clash_units_upgraded"
+    clan_tag: str | None
+    player_tag: str
+    name: str
+    town_hall: int
+    changes: tuple[tuple[str, str, int | None, int], ...]
+
+
+@dataclass(frozen=True)
+class SuperTroopsBoosted(ClashEvent):
+    event_name: ClassVar[str] = "clash_super_troops_boosted"
+    clan_tag: str | None
+    player_tag: str
+    name: str
+    troops: tuple[str, ...]  # newly active super troops
+
+
+@dataclass(frozen=True)
+class PlayerClanChanged(ClashEvent):
+    """A player's clan changed between polls (left, joined, or moved). Either tag may be None."""
+
+    event_name: ClassVar[str] = "clash_player_clan_changed"
+    player_tag: str
+    name: str
+    old_clan_tag: str | None
+    new_clan_tag: str | None
+    new_clan_name: str | None
 
 
 # ---------------------------------------------------------------- war / capital

@@ -233,3 +233,106 @@ async def test_cwl_round_from_league_group(setup):
     await col._poll_war("#C", NOW)
     row = await bot.db.fetchone("SELECT * FROM wars")
     assert (row["war_type"], row["cwl_round"], row["cwl_season"]) == ("cwl", 2, "2026-11")
+
+
+# ------------------------------------------------------------------ battle log, units, settings
+
+
+class FakeHttp:
+    base_url = "https://api.example"
+
+    def __init__(self):
+        self.items = []
+
+    async def request(self, route):
+        return {"items": list(self.items)}
+
+
+def legend_player(trophies, units=None, supers=(), clan="#C"):
+    raw = {
+        "leagueTier": {"name": "Legend I"},
+        "troops": [
+            {"name": n, "level": lvl, "village": "home"} for n, lvl in (units or {"Barbarian": 11}).items()
+        ]
+        + [{"name": s, "level": 11, "village": "home", "superTroopIsActive": True} for s in supers],
+    }
+    p = player_obj(trophies=trophies, clan=NS(tag=clan, name="Clan") if clan else None)
+    p._raw_data = raw
+    return p
+
+
+def battle(ts, attack=True, opp="#O"):
+    return {
+        "battleTimestamp": ts,
+        "battleType": "legend",
+        "attack": attack,
+        "opponentPlayerTag": opp,
+        "opponentName": "Opp",
+        "opponentTownHallLevel": 17,
+        "stars": 3,
+        "destructionPercentage": 100,
+        "armyShareCode": "u1x2",
+    }
+
+
+async def test_battle_log_records_exact_battles(setup):
+    bot, coc, col = setup
+    coc.http = FakeHttp()
+    coc.http.items = [battle("20261107T110000.000Z", opp="#OLD")]
+    coc.player = legend_player(5000)
+    await col._poll_player("#A", NOW)  # baseline: old battle not reported
+    coc.http.items = [battle("20261107T120030.000Z", opp="#NEW")] + coc.http.items
+    coc.player = legend_player(5038)
+    await col._poll_player("#A", NOW + timedelta(minutes=1))
+    (e,) = [e for n, e in bot.events if n == "clash_legend_battle"]
+    assert (e.kind, e.trophies, e.trophies_after, e.opponent_tag, e.stars) == ("attack", 38, 5038, "#NEW", 3)
+    assert e.from_battle_log and e.event_id
+    row = await bot.db.fetchone("SELECT * FROM legend_events")
+    assert (row["opponent_tag"], row["army_share_code"], row["legend_day"]) == ("#NEW", "u1x2", "2026-11-07")
+
+
+async def test_trophies_before_battle_appears_are_carried(setup):
+    bot, coc, col = setup
+    coc.http = FakeHttp()
+    coc.http.items = [battle("20261107T110000.000Z")]
+    coc.player = legend_player(5000)
+    await col._poll_player("#A", NOW)
+    coc.player = legend_player(4984)  # trophies dropped, battle log not updated yet
+    await col._poll_player("#A", NOW + timedelta(minutes=1))
+    assert not [e for n, e in bot.events if n == "clash_legend_battle"]
+    coc.http.items = [battle("20261107T120000.000Z", attack=False, opp="#D")] + coc.http.items
+    await col._poll_player("#A", NOW + timedelta(minutes=12))  # periodic re-check finds it
+    (e,) = [e for n, e in bot.events if n == "clash_legend_battle"]
+    assert (e.kind, e.trophies, e.opponent_tag) == ("defense", -16, "#D")
+
+
+async def test_units_boosts_and_clan_moves(setup):
+    bot, coc, col = setup
+    coc.player = legend_player(5000, units={"Barbarian": 11})
+    await col._poll_player("#A", NOW)
+    coc.player = legend_player(
+        5000, units={"Barbarian": 12, "Archer": 1}, supers=("Super Minion",), clan="#X"
+    )
+    await col._poll_player("#A", NOW + timedelta(minutes=1))
+    by = {n: e for n, e in bot.events}
+    assert set(by["clash_units_upgraded"].changes) == {
+        ("Troop", "Barbarian", 11, 12),
+        ("Troop", "Archer", None, 1),
+    }
+    assert by["clash_super_troops_boosted"].troops == ("Super Minion",)
+    moved = by["clash_player_clan_changed"]
+    assert (moved.old_clan_tag, moved.new_clan_tag) == ("#C", "#X")
+
+
+async def test_clan_settings_changes(setup):
+    bot, coc, col = setup
+    c = clan_obj([m("#A", "Alice")])
+    c._raw_data = {"description": "old", "requiredTownhallLevel": 14, "labels": []}
+    coc.clan = c
+    await col._poll_clan("#C", NOW)
+    c2 = clan_obj([m("#A", "Alice")])
+    c2._raw_data = {"description": "new", "requiredTownhallLevel": 14, "labels": []}
+    coc.clan = c2
+    await col._poll_clan("#C", NOW)
+    (e,) = [e for n, e in bot.events if n == "clash_clan_settings"]
+    assert e.changes == (("description", "old", "new"),)

@@ -39,12 +39,14 @@ Discord usernames or avatars.
 ClashHero reads **public** game data from Supercell's official Clash of Clans API for the clans that
 servers add and the players linked to or tracked by the bot. This includes player tags and names,
 Town Hall and hero levels, trophies and league, donations, war and Clan War League attacks, Clan
-Capital raids, Clan Games progress and clan membership.
+Capital raids, Clan Games progress, clan membership and clan settings, troop, spell, hero and
+equipment levels, and recent ranked battles from players' public battle logs (opponent name and
+tag, stars, destruction and the army used).
 
 From this public data the bot also **works out** some information, for example:
 
 - estimated "last seen" times and activity counts, based on changes between checks;
-- estimated ranked (legend league and other tier) attacks and defenses, based on trophy changes;
+- trophies won or lost per ranked battle, based on trophy changes between checks;
 - player name history and clan join/leave history;
 - war, raid and season statistics.
 

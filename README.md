@@ -51,10 +51,12 @@ Mutating commands require **Manage Server** or the relevant manager role from `/
 
 ### Limits of the official API
 
-- There is no battle log, so ranked attacks/defenses are **inferred** from trophy changes between
-  polls (every `PLAYER_POLL_SECONDS`). Opponents and armies of ranked battles are not available, and
-  several hits between two polls are split evenly. Ranked tiers come from the API's `leagueTier`
-  field (see `utils/ranked.py`); weekly tournament group standings aren't available.
+- Ranked battles (opponent, stars, destruction, army) come from each player's battle log
+  (`/players/{tag}/battlelog`, see `services/battlelog.py`). The log has no per-battle trophy change,
+  so the trophy change seen between polls is split across the new battles; when an attack and a
+  defense land between the same two polls, the split is approximate. If the battle log can't be
+  read, battles are inferred from trophy changes alone. Ranked tiers come from the API's
+  `leagueTier` field (see `utils/ranked.py`); weekly tournament group standings aren't available.
 - History (wars, donations, Clan Games, activity) only exists from when the bot started tracking.
 - Global rankings only cover the top 200 the API returns.
 

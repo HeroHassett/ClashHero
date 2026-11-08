@@ -1,5 +1,7 @@
 -- ClashHero core schema. Applied on every startup, so statements must be idempotent.
 -- Feature modules may add their own tables in db/schema_<feature>.sql (loaded after this).
+-- To add a column to a table that already shipped, declare it in db/columns_<feature>.py
+-- (COLUMNS = [(table, column, declaration)]) rather than editing its CREATE TABLE.
 -- Timestamps are ISO-8601 UTC strings.
 -- Privacy conventions (services/privacy.py relies on them): a column named guild_id scopes a row
 -- to a server; discord_user_id / user_id identify the Discord user the row is about;
