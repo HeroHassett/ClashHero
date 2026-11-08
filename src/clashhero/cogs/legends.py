@@ -15,7 +15,7 @@ import logging
 import re
 import sqlite3
 from collections.abc import Awaitable, Callable, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import discord
@@ -46,6 +46,7 @@ from clashhero.utils.resolve import (
     resolve_player,
 )
 from clashhero.utils.seasons import (
+    Window,
     game_season,
     legend_day_bounds,
     legend_day_id,
@@ -122,6 +123,80 @@ def army_battles(hits: Sequence[repo.Hit], *, armies: bool = True) -> list[cards
         )
         for h in hits
     ]
+
+
+def season_card(
+    *,
+    name: str,
+    tag: str,
+    window: Window,
+    summary: repo.SeasonSummary,
+    now: datetime,
+    trophies_now: int | None = None,
+) -> cards.SeasonCard:
+    """What the season card shows, from the season's recorded days. Every legend day of the
+    season window gets a point (untracked days have none); per-day averages are over the days
+    with battles of that kind; stars count only battles read from the battle log."""
+    first = window.start.date()
+    count = (window.end.date() - first).days
+    by_day = {d.day: d for d in summary.days}
+    points = []
+    for i in range(count):
+        day = first + timedelta(days=i)
+        sd = by_day.get(day.isoformat())
+        end = None if sd is None else sd.end if sd.end is not None else sd.start
+        played = sd is not None and bool(sd.stats.attacks or sd.stats.defenses)
+        points.append(cards.SeasonPoint(day, end, sd.stats.net if played else None))
+    today = None
+    if window.contains(now):
+        today = min(count - 1, max(0, (date.fromisoformat(legend_day_id(now)) - first).days))
+    ends = [p.end for p in points if p.end is not None]
+    trophies = ends[-1] if ends else None
+    if today is not None and trophies_now is not None:
+        trophies = trophies_now
+    start = next((d.start for d in summary.days if d.start is not None), None)
+
+    def avg(values: list[int]) -> float | None:
+        return sum(values) / len(values) if values else None
+
+    days = summary.days
+    return cards.SeasonCard(
+        player_name=name,
+        player_tag=tag,
+        season=season_label(window),
+        days=tuple(points),
+        today=today,
+        trophies=trophies,
+        start=start,
+        offense_per_day=avg([d.stats.offense for d in days if d.stats.attacks]),
+        defense_per_day=avg([d.stats.defense for d in days if d.stats.defenses]),
+        net_per_day=avg([d.stats.net for d in days if d.stats.attacks or d.stats.defenses]),
+        attacks=len(summary.all_attacks),
+        defenses=len(summary.all_defenses),
+        attack_stars=cards.star_counts(h.stars for h in summary.attack_hits),
+        defense_stars=cards.star_counts(h.stars for h in summary.defense_hits if not h.autofill),
+    )
+
+
+async def _season_image(
+    bot, tag: str, name: str, season_id: str, summary: repo.SeasonSummary
+) -> discord.File | None:
+    """The season card for /legends logs, or None (logged) if it can't be drawn."""
+    try:
+        player = await bot.db.get_player_row(tag)
+        card = season_card(
+            name=name,
+            tag=tag,
+            window=season_by_id(season_id),
+            summary=summary,
+            now=_now(),
+            trophies_now=player["trophies"] if player else None,
+        )
+        png = await asyncio.to_thread(cards.render_legend_season, card)
+    except Exception:
+        log.exception("Couldn't draw the legend season card for %s in %s", tag, season_id)
+        return None
+    return discord.File(io.BytesIO(png), filename="legend-season.png")
 
 
 async def _day_reply(
@@ -830,16 +905,23 @@ class Legends(BaseCog):
                 raise ResolveError("Pick a season from the list, or type a date like 2026-11-02.")
             season_id = window.id
         else:
-            season_id = game_season().id
+            season_id = game_season(_now()).id
+        await interaction.response.defer()
         summary = await repo.season_summary(self.db, tag, season_id)
+        name = await _player_name(self.bot, tag)
         embed = E.season_embed(
-            name=await _player_name(self.bot, tag),
+            name=name,
             tag=tag,
             season_id=season_id,
             summary=summary,
             color=await guild_color(self.bot, interaction.guild_id),
         )
-        await interaction.response.send_message(embed=embed)
+        file = await _season_image(self.bot, tag, name, season_id, summary)
+        if file is None:
+            await interaction.followup.send(embed=embed)
+            return
+        embed.set_image(url="attachment://legend-season.png")
+        await interaction.followup.send(embed=embed, file=file)
 
     @legends.command(name="history", description="A player's legend results across seasons")
     @app_commands.autocomplete(player=player_autocomplete)
