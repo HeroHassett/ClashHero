@@ -21,6 +21,14 @@ M = MemberSnap(
     donations=10,
     received=5,
 )
+STATS = E.JoinStats(
+    town_hall=18,
+    trophies=4938,
+    league="Legend I",
+    heroes=(("Barbarian King", 110), ("Archer Queen", 110)),
+    war_stars=3221,
+    rushed=0.79,
+)
 WAR = {
     "id": 1,
     "war_type": "random",
@@ -81,9 +89,9 @@ def test_embed_builders_smoke():
     builders = [
         E.clan_attribute_embed("Clan", "#C", "level", 10, 11),
         E.clan_attribute_embed("Clan", "#C", "war_league", "Gold I", "Crystal III"),
-        E.member_join_embed("Clan", M, 40, {"town_hall": 16, "heroes_total": 300, "war_stars": 900}),
+        E.member_join_embed("Clan", M, 40, STATS, badge_url="https://x/b.png"),
         E.member_join_embed("Clan", M, 40, None),
-        E.member_leave_embed("Clan", M, 39, 1200),
+        E.member_leave_embed("Clan", M, 39, 1200, 30),
         E.role_change_embed("Clan", "Alice", "#A", "member", "admin"),
         E.name_change_embed("#A", "Old", "New"),
         E.town_hall_embed("Alice", "#A", 15, 16),
@@ -238,6 +246,18 @@ class FakeBot:
         self.db = db
 
 
+class FakeMessage:
+    ids = iter(range(1000, 10**6))
+
+    def __init__(self, calls, channel_id, fail=False):
+        self.calls, self.channel_id, self.fail, self.id = calls, channel_id, fail, next(self.ids)
+
+    async def edit(self, *, embed):
+        if self.fail:
+            raise discord.NotFound(type("R", (), {"status": 404, "reason": "gone"})(), "gone")
+        self.calls.append(("edit", self.channel_id, None, embed, None))
+
+
 @pytest.fixture
 async def cog(db):
     return Logs(FakeBot(db))
@@ -249,6 +269,8 @@ def sent(monkeypatch):
 
     async def fake_send_clan_log(bot, clan_tag, log_type, embed, *, content=None, view=None):
         calls.append(("clan_log", clan_tag, log_type, embed, view))
+        targets = await bot.db.clan_log_targets(clan_tag, log_type)
+        return [(t, FakeMessage(calls, t["channel_id"]), embed.copy()) for t in targets]
 
     async def fake_send_to_channel(bot, channel_id, *, content=None, embed=None, view=None, **kw):
         calls.append(("channel", channel_id, content, embed, view))
@@ -302,7 +324,8 @@ async def test_clan_settings_log(cog, sent):
     assert "Anyone can join → **Closed**" in embed.description
 
 
-async def test_join_and_leave_have_profile_button(cog, sent):
+async def test_join_and_leave_have_profile_button(cog, sent, db):
+    await db.set_clan_log(1, "#C", "join_leave", 100)
     m = MemberSnap(
         tag="#A",
         name="Alice",
@@ -318,6 +341,64 @@ async def test_join_and_leave_have_profile_button(cog, sent):
     assert [c[2] for c in sent] == ["join_leave", "join_leave"]
     for call in sent:
         assert call[4].children[0].url == player_link("#A")
+    join, leave = sent[0][3], sent[1][3]
+    assert join.footer.text == "Joined Clan [40/50]" and join.timestamp is not None
+    assert leave.footer.text == "Left Clan [39/50]"
+    assert "?" not in join.description  # no API client: only what the member list has
+
+
+async def test_no_join_leave_log_means_no_player_fetch(cog, sent):
+    class Coc:
+        async def get_player(self, tag):
+            raise AssertionError("fetched without a log")
+
+    cog.bot.coc = Coc()
+    m = MemberSnap(tag="#A", name="A", role="member", town_hall=16, trophies=1, league=None,
+                   donations=0, received=0)  # fmt: skip
+    await cog.on_clash_member_join(ev.MemberJoined("#C", "Clan", m, 40))
+    assert sent == []
+
+
+async def test_join_uses_the_full_profile(cog, sent, db):
+    await db.set_clan_log(1, "#C", "join_leave", 100)
+
+    class Coc:
+        async def get_player(self, tag):
+            return type("P", (), {
+                "_raw_data": {
+                    "leagueTier": {"name": "Legend I"},
+                    "heroes": [
+                        {"name": "Barbarian King", "level": 110, "village": "home"},
+                        {"name": "Battle Machine", "level": 35, "village": "builderBase"},
+                    ],
+                },
+                "town_hall": 18, "trophies": 4938, "war_stars": 3221,
+            })()  # fmt: skip
+
+    cog.bot.coc = Coc()
+    m = MemberSnap(tag="#A", name="Al_ice", role="member", town_hall=18, trophies=4938, league="Legend I",
+                   donations=0, received=0)  # fmt: skip
+    await cog.on_clash_member_join(ev.MemberJoined("#C", "Clan", m, 30))
+    embed = sent[0][3]
+    assert embed.title == "Al\\_ice (#A)"
+    assert "**110**" in embed.description and "Battle Machine" not in embed.description
+    assert "**3,221**" in embed.description
+
+
+def test_join_and_leave_lines():
+    join = E.member_join_embed("Aurora", M, 30, STATS)
+    head, more = join.description.split("\n")
+    assert "TH **18**" in head and "**4,938**" in head
+    assert "Barbarian King **110**" in head  # no emoji uploaded in tests: the name instead
+    assert "**3,221**" in more and "**0.79%** rushed" in more
+    assert "rushed" not in E.member_join_embed("A", M, 30, E.JoinStats(18, 1, None, (), 0, None)).description
+    leave = E.member_leave_embed("Aurora", M, 29, 12, 3, badge_url="https://x/b.png")
+    assert leave.description.endswith("**12** ▲ **3** ▼")
+    assert leave.footer.icon_url == "https://x/b.png"
+    moved = E.with_new_clan(leave, "DifferentClass!", "#2JRYQCJRR")
+    assert moved.footer.text == "Left Aurora [29/50]\nJoined DifferentClass! (#2JRYQCJRR)"
+    assert moved.footer.icon_url == "https://x/b.png"
+    assert "this server" in E.with_new_clan(leave, None, "#N", own_clan=True).footer.text
 
 
 async def _setup_move_logs(db):
@@ -348,33 +429,63 @@ async def test_clan_move_skips_untracked_or_incomplete(cog, sent, db):
     assert sent == []
 
 
-async def test_leaver_is_polled_and_clanless_gap_still_reports_move(cog, sent, db):
+LEAVER = MemberSnap(
+    tag="#A",
+    name="Alice",
+    role="member",
+    town_hall=16,
+    trophies=5000,
+    league=None,
+    donations=0,
+    received=0,
+)
+
+
+async def test_leave_post_gets_the_new_clan(cog, sent, db):
     await _setup_move_logs(db)
-    m = MemberSnap(
-        tag="#A",
-        name="Alice",
-        role="member",
-        town_hall=16,
-        trophies=5000,
-        league=None,
-        donations=0,
-        received=0,
-    )
-    await cog.on_clash_member_leave(ev.MemberLeft("#OLD", "Old Clan", m, 39))
+    await cog.on_clash_member_leave(ev.MemberLeft("#OLD", "Old Clan", LEAVER, 39))
     assert await cog._recent_leavers() == {"#A"}
     sent.clear()
 
-    # Seen clanless first, then in a new clan.
+    # Seen clanless first, then in a new clan: both leave posts are edited, nothing new is sent.
     await cog.on_clash_player_clan_changed(ev.PlayerClanChanged("#A", "Alice", "#OLD", None, None))
-    await cog.on_clash_player_clan_changed(ev.PlayerClanChanged("#A", "Alice", None, "#ELSEWHERE", "Far"))
-    assert [c[1] for c in sent] == [100, 200]
-    assert "(left #OLD)" in sent[0][3].description
+    await cog.on_clash_player_clan_changed(ev.PlayerClanChanged("#A", "Alice", None, "#NEW", "New Clan"))
+    assert [(c[0], c[1]) for c in sent] == [("edit", 100), ("edit", 200)]
+    assert sent[0][3].footer.text.endswith("Joined New Clan (#NEW) · one of this server's clans")
+    assert sent[1][3].footer.text == "Left Old Clan [39/50]\nJoined New Clan (#NEW)"
+    assert await cog._recent_leavers() == set()
+
+
+async def test_failed_edit_posts_the_move_instead(cog, sent, db):
+    await _setup_move_logs(db)
+    await cog.on_clash_member_leave(ev.MemberLeft("#OLD", "Old Clan", LEAVER, 39))
+    cog._left["#A"].posts[0][1].fail = True
+    sent.clear()
+    await cog.on_clash_player_clan_changed(ev.PlayerClanChanged("#A", "Alice", "#OLD", "#X", "X"))
+    assert [(c[0], c[1]) for c in sent] == [("channel", 100), ("edit", 200)]
+    assert "is now in" in sent[0][3].description
+
+
+async def test_move_seen_before_the_leave_goes_into_the_leave_post(cog, sent, db):
+    await _setup_move_logs(db)
+
+    class Collector:
+        def clan_lists_member(self, clan_tag, player_tag):
+            return True  # the old clan's poll hasn't noticed the leave yet
+
+    cog.bot.collector = Collector()
+    await cog.on_clash_player_clan_changed(ev.PlayerClanChanged("#A", "Alice", "#OLD", "#X", "X"))
+    assert sent == []
+    await cog.on_clash_member_leave(ev.MemberLeft("#OLD", "Old Clan", LEAVER, 39))
+    assert [c[0] for c in sent] == ["clan_log", "edit", "edit"]
+    assert sent[1][3].footer.text.endswith("Joined X (#X)")
     assert await cog._recent_leavers() == set()
 
 
 async def test_recent_leavers_expire(cog, db):
-    cog._left["#A"] = ("#OLD", datetime.now(UTC) - logs_mod.MOVE_WINDOW - timedelta(seconds=1))
-    cog._left["#B"] = ("#OLD", datetime.now(UTC))
+    old = datetime.now(UTC) - logs_mod.MOVE_WINDOW - timedelta(seconds=1)
+    cog._left["#A"] = logs_mod.LeavePost("#OLD", old)
+    cog._left["#B"] = logs_mod.LeavePost("#OLD", datetime.now(UTC))
     assert await cog._recent_leavers() == {"#B"}
 
 

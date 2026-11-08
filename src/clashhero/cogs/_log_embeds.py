@@ -4,13 +4,19 @@ so they're easy to test. Colors may be overridden per subscription by outbox.sen
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 import discord
+from discord.utils import escape_markdown
 
+from clashhero.cogs._info_embeds import rush_report, unit_levels
 from clashhero.constants import CLAN_TYPE_LABELS, WAR_FREQUENCY_LABELS
+from clashhero.services.emojis import EMOJIS
 from clashhero.utils.fmt import chunk_lines, clan_link, duration, player_link, role_name, stars, table, ts
+from clashhero.utils.ranked import league_name
+from clashhero.utils.style import ICONS
 
 GREEN = discord.Color.green()
 RED = discord.Color.red()
@@ -83,41 +89,120 @@ def clan_attribute_embed(clan_name: str, clan_tag: str, attribute: str, old: Any
     return e
 
 
+@dataclass(frozen=True)
+class JoinStats:
+    """What a join post shows beyond the clan's member list (from a fresh /players fetch)."""
+
+    town_hall: int
+    trophies: int
+    league: str | None
+    heroes: tuple[tuple[str, int], ...]  # (name, level), home village, in game order
+    war_stars: int
+    rushed: float | None  # % of levels missing vs the previous Town Hall's max; None if unknown
+
+
+def join_stats(player: Any) -> JoinStats:
+    """JoinStats from a coc.py Player (its raw payload when there is one)."""
+    raw = getattr(player, "_raw_data", None)
+    if isinstance(raw, dict):
+        heroes = tuple(
+            (h["name"], int(h.get("level") or 0))
+            for h in raw.get("heroes") or []
+            if h.get("name") and h.get("village", "home") == "home"
+        )
+    else:
+        heroes = tuple((h.name, h.level) for h in getattr(player, "heroes", None) or [])
+    try:
+        overall = rush_report(unit_levels(player)).overall
+        rushed = overall.percent if overall.total else None
+    except Exception:  # unknown game data: leave it out rather than fail the post
+        rushed = None
+    return JoinStats(
+        town_hall=player.town_hall or 0,
+        trophies=player.trophies or 0,
+        league=league_name(player),
+        heroes=heroes,
+        war_stars=player.war_stars or 0,
+        rushed=rushed,
+    )
+
+
+def _icon_stat(icon: str, value: object, fallback: str) -> str:
+    """``{icon}**18**``, or ``TH **18**`` when the icon isn't uploaded."""
+    return f"{icon}**{value}**" if icon else f"{fallback} **{value}**"
+
+
+def _member_head(town_hall: int, league: str | None, trophies: int) -> list[str]:
+    trophy = EMOJIS.league(league) or EMOJIS.get("res_trophy", "🏆")
+    return [_icon_stat(EMOJIS.town_hall(town_hall), town_hall, "TH"), _icon_stat(trophy, f"{trophies:,}", "")]
+
+
+def _member_embed(member: Any, lines: Sequence[str], color: discord.Color) -> discord.Embed:
+    return discord.Embed(
+        title=f"{escape_markdown(member.name)} ({member.tag})",
+        url=player_link(member.tag),
+        description="\n".join(lines),
+        color=color,
+    )
+
+
+def _clan_footer(e: discord.Embed, text: str, badge_url: str | None, at: datetime | None) -> discord.Embed:
+    e.set_footer(text=text, icon_url=badge_url or None)
+    e.timestamp = at
+    return e
+
+
 def member_join_embed(
     clan_name: str,
     member: Any,
     member_count: int,
-    player_row: Mapping[str, Any] | None = None,
+    stats: JoinStats | None = None,
+    *,
+    badge_url: str | None = None,
+    at: datetime | None = None,
 ) -> discord.Embed:
-    th = _get(player_row, "town_hall", member.town_hall)
-    lines = [
-        f"TH{th} · {member.trophies} trophies",
-        f"Heroes: {_get(player_row, 'heroes_total', '?')} · War stars: {_get(player_row, 'war_stars', '?')}",
-        f"League: {member.league or 'Unranked'}",
-    ]
-    e = discord.Embed(
-        title=f"{member.name} joined {clan_name}",
-        url=player_link(member.tag),
-        description="\n".join(lines),
-        color=GREEN,
-    )
-    e.set_footer(text=f"{member.tag} · {member_count}/50 members")
-    return e
+    """Town Hall, trophies and hero levels; then war stars and rushed %. Without ``stats`` (the
+    player couldn't be fetched) only what the clan's member list has."""
+    if stats is None:
+        lines = [" ".join(_member_head(member.town_hall, member.league, member.trophies))]
+    else:
+        head = _member_head(stats.town_hall, stats.league or member.league, stats.trophies)
+        head += [_icon_stat(EMOJIS.unit(name), level, name) for name, level in stats.heroes]
+        more = [_icon_stat(EMOJIS.get("ui_war_star", "⭐"), f"{stats.war_stars:,}", "War stars")]
+        if stats.rushed is not None:
+            more.append(f"{ICONS['rushed']} **{stats.rushed:.2f}%** rushed")
+        lines = [" ".join(head), " ".join(more)]
+    e = _member_embed(member, lines, GREEN)
+    return _clan_footer(e, f"Joined {clan_name} [{member_count}/50]", badge_url, at)
 
 
 def member_leave_embed(
-    clan_name: str, member: Any, member_count: int, season_donations: int | None = None
+    clan_name: str,
+    member: Any,
+    member_count: int,
+    donated: int = 0,
+    received: int = 0,
+    *,
+    badge_url: str | None = None,
+    at: datetime | None = None,
 ) -> discord.Embed:
-    lines = [f"TH{member.town_hall} · {member.trophies} trophies · {role_name(member.role)}"]
-    if season_donations is not None:
-        lines.append(f"Donated this season: {season_donations}")
-    e = discord.Embed(
-        title=f"{member.name} left {clan_name}",
-        url=player_link(member.tag),
-        description="\n".join(lines),
-        color=RED,
-    )
-    e.set_footer(text=f"{member.tag} · {member_count}/50 members")
+    """Town Hall, trophies, and troops donated ▲ / received ▼ in this clan this season."""
+    castle = EMOJIS.get("ui_donate_troops", "🏰")
+    line = _member_head(member.town_hall, member.league, member.trophies)
+    line.append(f"{castle}**{donated:,}** ▲ **{received:,}** ▼")
+    e = _member_embed(member, [" ".join(line)], RED)
+    return _clan_footer(e, f"Left {clan_name} [{member_count}/50]", badge_url, at)
+
+
+def with_new_clan(
+    embed: discord.Embed, new_clan_name: str | None, new_clan_tag: str, own_clan: bool = False
+) -> discord.Embed:
+    """A posted leave, once we know where the player went: "Joined <clan>" under "Left <clan>"."""
+    e = embed.copy()
+    text = f"{e.footer.text or ''}\nJoined {new_clan_name or new_clan_tag} ({new_clan_tag})"
+    if own_clan:
+        text += " · one of this server's clans"
+    e.set_footer(text=text.strip(), icon_url=e.footer.icon_url)
     return e
 
 

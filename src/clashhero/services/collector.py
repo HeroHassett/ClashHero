@@ -209,6 +209,11 @@ class Collector:
     def dispatch(self, event: ev.ClashEvent) -> None:
         self.bot.dispatch(event.event_name, event)
 
+    def clan_lists_member(self, clan_tag: str, player_tag: str) -> bool:
+        """Whether the clan's last poll still had this player (their leave isn't processed yet)."""
+        snap = self._clans.get(clan_tag)
+        return snap is not None and player_tag in snap.members
+
     async def refresh_clan_now(self, clan_tag: str) -> None:
         """Poll one clan immediately (e.g. right after it's added)."""
         await self._poll_clan(clan_tag, datetime.now(UTC))

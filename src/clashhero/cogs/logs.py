@@ -7,10 +7,13 @@ flushed every minute. Legend feeds (legend_battles, legend_daily) are rendered b
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import defaultdict
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import discord
 from discord import app_commands
@@ -31,6 +34,19 @@ log = logging.getLogger(__name__)
 
 # How long after a leave we keep polling the player (through the collector) to see where they went.
 MOVE_WINDOW = timedelta(minutes=15)
+PLAYER_FETCH_TIMEOUT = 10  # seconds, for the full profile a join post shows
+
+
+@dataclass
+class LeavePost:
+    """A leave being posted (or posted): its messages get "Joined <clan>" once the move is seen."""
+
+    clan_tag: str
+    left_at: datetime
+    posts: list[tuple[Any, discord.Message, discord.Embed]] = field(default_factory=list)
+    sending: bool = True
+    moved: ev.PlayerClanChanged | None = None
+
 
 CLAN_LOG_CHOICES = [app_commands.Choice(name=label[:100], value=key) for key, label in CLAN_LOG_TYPES.items()]
 SERVER_LOG_CHOICES = [
@@ -118,8 +134,10 @@ class Logs(BaseCog):
         self._upgrades: dict[str, dict[str, list]] = defaultdict(dict)
         # clan_tag -> player_tag -> [name, [super troops]]
         self._boosts: dict[str, dict[str, list]] = defaultdict(dict)
-        # player_tag -> (clan_tag, left_at) for recent leavers of clans with a join/leave log
-        self._left: dict[str, tuple[str, datetime]] = {}
+        # player_tag -> their leave, for recent leavers of clans with a join/leave log
+        self._left: dict[str, LeavePost] = {}
+        # player_tag -> (move, seen_at): a move seen before the old clan's poll noticed the leave
+        self._early_moves: dict[str, tuple[ev.PlayerClanChanged, datetime]] = {}
         self._clan_names: dict[str, str] = {}
 
     async def cog_load(self) -> None:
@@ -317,73 +335,132 @@ class Logs(BaseCog):
 
     @commands.Cog.listener()
     async def on_clash_member_join(self, e: ev.MemberJoined) -> None:
-        row = await self.db.get_player_row(e.member.tag)
-        await send_clan_log(
-            self.bot,
-            e.clan_tag,
-            "join_leave",
-            E.member_join_embed(e.clan_name, e.member, e.member_count, row),
-            view=E.profile_view(e.member.tag),
+        if not await self.db.clan_log_targets(e.clan_tag, "join_leave"):
+            return
+        player = await self._fetch_player(e.member.tag)
+        embed = E.member_join_embed(
+            e.clan_name,
+            e.member,
+            e.member_count,
+            E.join_stats(player) if player is not None else None,
+            badge_url=await self._badge(e.clan_tag),
+            at=datetime.now(UTC),
         )
+        await send_clan_log(self.bot, e.clan_tag, "join_leave", embed, view=E.profile_view(e.member.tag))
+
+    async def _fetch_player(self, tag: str) -> Any:
+        """The player's full profile (the clan's member list has no heroes or war stars), or None."""
+        client = getattr(self.bot, "coc", None)
+        if client is None:
+            return None
+        try:
+            return await asyncio.wait_for(client.get_player(tag), PLAYER_FETCH_TIMEOUT)
+        except Exception as error:  # noqa: BLE001 - post what the member list has instead
+            log.info("Couldn't fetch %s for a join post: %s", tag, error)
+            return None
+
+    async def _badge(self, clan_tag: str) -> str | None:
+        row = await self.db.get_clan_row(clan_tag)
+        return row["badge_url"] if row else None
 
     @commands.Cog.listener()
     async def on_clash_member_leave(self, e: ev.MemberLeft) -> None:
-        donated = await self.db.fetchval(
-            "SELECT donations FROM season_stats WHERE season_id = ? AND player_tag = ? AND clan_tag = ?",
-            (game_season().id, e.member.tag, e.clan_tag),
-            0,
+        tag = e.member.tag
+        if not await self.db.clan_log_targets(e.clan_tag, "join_leave"):
+            return
+        row = await self.db.fetchone(
+            "SELECT donations, received FROM season_stats WHERE season_id = ? AND player_tag = ? "
+            "AND clan_tag = ?",
+            (game_season().id, tag, e.clan_tag),
         )
-        await send_clan_log(
-            self.bot,
-            e.clan_tag,
-            "join_leave",
-            E.member_leave_embed(e.clan_name, e.member, e.member_count, donated),
-            view=E.profile_view(e.member.tag),
+        embed = E.member_leave_embed(
+            e.clan_name,
+            e.member,
+            e.member_count,
+            row["donations"] if row else 0,
+            row["received"] if row else 0,
+            badge_url=await self._badge(e.clan_tag),
+            at=datetime.now(UTC),
         )
-        if await self.db.clan_log_targets(e.clan_tag, "join_leave"):
-            # If a player poll already stored their new clan, the move was reported already.
-            row = await self.db.get_player_row(e.member.tag)
-            if row is None or row["clan_tag"] in (None, e.clan_tag):
-                self._left[e.member.tag] = (e.clan_tag, datetime.now(UTC))
+        leave = LeavePost(e.clan_tag, datetime.now(UTC))
+        early = self._early_moves.pop(tag, None)
+        if early and early[1] >= datetime.now(UTC) - MOVE_WINDOW and early[0].old_clan_tag == e.clan_tag:
+            leave.moved = early[0]  # already know where they went
+        else:
+            # Watch where they go, unless a player poll already stored their new clan (then the
+            # move was reported on its own).
+            player = await self.db.get_player_row(tag)
+            if player is None or player["clan_tag"] in (None, e.clan_tag):
+                self._left[tag] = leave
+        leave.posts = await send_clan_log(self.bot, e.clan_tag, "join_leave", embed, view=E.profile_view(tag))
+        leave.sending = False
+        if leave.moved is not None:
+            await self._add_new_clan(leave, leave.moved)
 
     async def _recent_leavers(self) -> set[str]:
         """Player source for the collector: recent leavers of clans with a join/leave log."""
         cutoff = datetime.now(UTC) - MOVE_WINDOW
-        self._left = {tag: v for tag, v in self._left.items() if v[1] >= cutoff}
+        self._left = {tag: v for tag, v in self._left.items() if v.left_at >= cutoff}
+        self._early_moves = {tag: v for tag, v in self._early_moves.items() if v[1] >= cutoff}
         return set(self._left)
 
     @commands.Cog.listener()
     async def on_clash_player_clan_changed(self, e: ev.PlayerClanChanged) -> None:
-        """Follow up a leave with where the player went. Posts to the old clan's join/leave log;
-        if the player was clanless for a poll in between, the recorded leave is used instead."""
+        """Where a leaver went: added to the leave post ("Joined <clan>"). A move seen before the
+        leave is held for the leave post; one whose leave post isn't known (e.g. after a restart)
+        is posted on its own to the old clan's join/leave log."""
         if not e.new_clan_tag:
             return
-        recent = self._left.pop(e.player_tag, None)
-        from_clan = e.old_clan_tag
-        if from_clan is None and recent and recent[1] >= datetime.now(UTC) - MOVE_WINDOW:
-            from_clan = recent[0]
+        now = datetime.now(UTC)
+        leave = self._left.get(e.player_tag)
+        if leave is not None and leave.left_at < now - MOVE_WINDOW:
+            leave = None
+        from_clan = e.old_clan_tag or (leave.clan_tag if leave else None)
         if not from_clan or from_clan == e.new_clan_tag:
+            return
+        if leave is not None and leave.clan_tag == from_clan:
+            del self._left[e.player_tag]
+            leave.moved = e
+            if not leave.sending:  # otherwise the leave listener adds it once its posts are out
+                await self._add_new_clan(leave, e)
             return
         targets = await self.db.clan_log_targets(from_clan, "join_leave")
         if not targets:
             return
-        old_name = await self._clan_name(from_clan)
-        own_guilds = set(await self.db.guilds_for_clan(e.new_clan_tag))
-        view = E.profile_view(e.player_tag)
+        collector = getattr(self.bot, "collector", None)
+        if collector is not None and collector.clan_lists_member(from_clan, e.player_tag):
+            self._early_moves[e.player_tag] = (e, now)  # the leave is posted on the next clan poll
+            return
         for target in targets:
-            embed = E.clan_move_embed(
-                e.name,
-                e.player_tag,
-                old_name,
-                e.new_clan_name,
-                e.new_clan_tag,
-                own_clan=target["guild_id"] in own_guilds,
-            )
-            # Same color/ping handling as outbox.send_clan_log, but the embed differs per guild.
-            if target["color"] is not None:
-                embed.color = discord.Color(target["color"])
-            ping = f"<@&{target['ping_role_id']}>" if target["ping_role_id"] else None
-            await send_to_channel(self.bot, target["channel_id"], content=ping, embed=embed, view=view)
+            await self._post_move(target, e, from_clan)
+
+    async def _add_new_clan(self, leave: LeavePost, e: ev.PlayerClanChanged) -> None:
+        own_guilds = set(await self.db.guilds_for_clan(e.new_clan_tag))
+        for target, message, embed in leave.posts:
+            own = target["guild_id"] in own_guilds
+            try:
+                await message.edit(embed=E.with_new_clan(embed, e.new_clan_name, e.new_clan_tag, own))
+            except discord.HTTPException as error:  # deleted, or no access any more
+                log.info("Couldn't add the new clan to leave post %s: %s", message.id, error)
+                await self._post_move(target, e, leave.clan_tag)
+
+    async def _post_move(self, target: Any, e: ev.PlayerClanChanged, from_clan: str) -> None:
+        """The move as its own post (same color/ping handling as outbox.send_clan_log)."""
+        own_guilds = set(await self.db.guilds_for_clan(e.new_clan_tag))
+        embed = E.clan_move_embed(
+            e.name,
+            e.player_tag,
+            await self._clan_name(from_clan),
+            e.new_clan_name,
+            e.new_clan_tag,
+            own_clan=target["guild_id"] in own_guilds,
+        )
+        if target["color"] is not None:
+            embed.color = discord.Color(target["color"])
+        ping = f"<@&{target['ping_role_id']}>" if target["ping_role_id"] else None
+        await send_to_channel(
+            self.bot, target["channel_id"], content=ping, embed=embed, view=E.profile_view(e.player_tag)
+        )
 
     @commands.Cog.listener()
     async def on_clash_role_change(self, e: ev.RoleChanged) -> None:

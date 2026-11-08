@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import discord
 
@@ -64,16 +64,21 @@ async def send_clan_log(
     *,
     content: str | None = None,
     view: discord.ui.View | None = None,
-) -> None:
+) -> list[tuple[Any, discord.Message, discord.Embed]]:
     """Send ``embed`` to every channel subscribed to ``log_type`` for ``clan_tag``.
-    Applies each subscription's color override and ping role."""
+    Applies each subscription's color override and ping role. Returns (subscription, message,
+    embed as sent) for each post that went out, so a caller can edit them later."""
+    posts = []
     for target in await bot.db.clan_log_targets(clan_tag, log_type):
         e = embed.copy()
         if target["color"] is not None:
             e.color = discord.Color(target["color"])
         ping = f"<@&{target['ping_role_id']}>" if target["ping_role_id"] else None
         text = " ".join(x for x in (ping, content) if x) or None
-        await send_to_channel(bot, target["channel_id"], content=text, embed=e, view=view)
+        msg = await send_to_channel(bot, target["channel_id"], content=text, embed=e, view=view)
+        if msg is not None:
+            posts.append((target, msg, e))
+    return posts
 
 
 async def send_server_log(bot: ClashHeroBot, guild_id: int, log_type: str, embed: discord.Embed):
