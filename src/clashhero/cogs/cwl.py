@@ -6,9 +6,15 @@ season stats and history come from wars the collector stored.
 
 from __future__ import annotations
 
+import asyncio
+import io
+import logging
 import re
+from collections.abc import Sequence
+from datetime import datetime
 from typing import Any
 
+import coc
 import discord
 from discord import app_commands
 
@@ -25,11 +31,15 @@ from clashhero.cogs._war_embeds import (
     war_overview_embed,
 )
 from clashhero.repos import war as war_repo
+from clashhero.services import cards
 from clashhero.utils.fmt import guild_color, make_embed
 from clashhero.utils.resolve import ResolveError, clan_autocomplete, player_autocomplete, resolve_clan
 from clashhero.utils.seasons import cwl_season_id
 
+log = logging.getLogger(__name__)
+
 SEASON_RE = re.compile(r"^\d{4}-\d{2}$")
+NOT_STARTED = ("preparation", "notInWar", "None")
 
 
 def _season(raw: str | None) -> str:
@@ -60,6 +70,45 @@ def war_to_standing_row(war: Any) -> dict:
 
 def spread_text(town_halls: list[int]) -> str:
     return " ".join(f"TH{th}×{n}" for th, n in war_repo.th_spread(town_halls).items()) or "—"
+
+
+def season_title(season: str | None) -> str:
+    """``2026-11`` -> ``November 2026``."""
+    try:
+        return datetime.strptime(season or "", "%Y-%m").strftime("%B %Y")
+    except ValueError:
+        return season or "?"
+
+
+def current_round(rounds: Sequence[Sequence[dict]]) -> int:
+    """Latest round (1-based) with a war that has started, 0 before the first battle day."""
+    return max(
+        (i + 1 for i, wars in enumerate(rounds) if any(w.get("state") not in NOT_STARTED for w in wars)),
+        default=0,
+    )
+
+
+def cwl_movement(rounds: Sequence[Sequence[dict]]) -> dict[str, str]:
+    """'up' / 'down' / 'same' per clan tag: its rank after the latest finished round against its
+    rank one round earlier (cwl_standings order). Clans missing from either are left out; with
+    fewer than two finished rounds there is nothing to compare."""
+    finished = [
+        i for i, wars in enumerate(rounds) if wars and all(w.get("state") == "warEnded" for w in wars)
+    ]
+    if not finished or finished[-1] < 1:
+        return {}
+    last = finished[-1]
+
+    def ranks(upto: int) -> dict[str, int]:
+        wars = [w for rnd in rounds[:upto] for w in rnd]
+        return {s.tag: i for i, s in enumerate(war_repo.cwl_standings(wars))}
+
+    now, before = ranks(last + 1), ranks(last)
+    out = {}
+    for tag, rank in now.items():
+        if tag in before:
+            out[tag] = "up" if rank < before[tag] else "down" if rank > before[tag] else "same"
+    return out
 
 
 class CWL(BaseCog):
@@ -145,8 +194,15 @@ class CWL(BaseCog):
         tag = await resolve_clan(interaction, clan, must_be_tracked=False)
         await interaction.response.defer()
         group = await self._group(tag)
-        all_tags = [t for rnd in self._round_tags(group) for t in rnd]
-        wars = [war_to_standing_row(w) for w in await self._round_wars(tag, all_tags)]
+        round_tags = self._round_tags(group)
+        round_of = {t: i for i, rnd in enumerate(round_tags) for t in rnd}
+        by_round: list[list[dict]] = [[] for _ in round_tags]
+        wars = []
+        for w in await self._round_wars(tag, [t for rnd in round_tags for t in rnd]):
+            row = war_to_standing_row(w)
+            wars.append(row)
+            if (i := round_of.get(getattr(w, "war_tag", None))) is not None:
+                by_round[i].append(row)
         for c in group.clans:  # make sure every clan shows even before its first war
             wars.append(
                 {
@@ -158,14 +214,67 @@ class CWL(BaseCog):
                 }
             )
         rows = war_repo.cwl_standings(wars)
-        played = sum(1 for r in self._round_tags(group) if r)
+        round_label = f"{max(current_round(by_round), 1)}/{group.number_of_rounds or 7}"
         e = await make_embed(
             self.bot,
             interaction.guild_id,
             title=f"CWL standings · {group.season}",
-            description=standings_table(rows) + f"\nRounds played: {played}/{group.number_of_rounds or 7}",
+            description=standings_table(rows) + f"\nRound {round_label}",
         )
-        await interaction.followup.send(embed=e)
+        card = await self._standings_card(group, tag, rows, cwl_movement(by_round), round_label)
+        if card is None:
+            await interaction.followup.send(embed=e)
+            return
+        e.set_image(url="attachment://cwl.png")
+        await interaction.followup.send(embed=e, file=discord.File(io.BytesIO(card), filename="cwl.png"))
+
+    async def _war_league(self, clan_tag: str) -> str | None:
+        """The clan's war league name, from the collector's copy or else the API."""
+        row = await self.db.get_clan_row(clan_tag)
+        name = row["war_league"] if row else None
+        if not name:
+            try:
+                clan = await self.coc.get_clan(clan_tag)
+            except (coc.ClashOfClansException, TimeoutError):
+                return None
+            name = getattr(getattr(clan, "war_league", None), "name", None)
+        return None if not name or name == "Unranked" else name
+
+    async def _standings_card(
+        self, group: Any, clan_tag: str, rows: Sequence[Any], movement: dict[str, str], round_label: str
+    ) -> bytes | None:
+        """The standings as a PNG image, or None if it can't be drawn (the text embed still goes out)."""
+        try:
+            badge_urls = {}
+            for c in group.clans:
+                badge = getattr(c, "badge", None)
+                badge_urls[c.tag] = getattr(badge, "medium", None) or getattr(badge, "url", None)
+            badges, league = await asyncio.gather(
+                cards.fetch_badges(badge_urls.values()), self._war_league(clan_tag)
+            )
+            card_rows = [
+                cards.CardRow(
+                    rank=i + 1,
+                    movement=movement.get(s.tag, "same"),
+                    name=s.name,
+                    badge=badges.get(badge_urls.get(s.tag) or ""),
+                    stars=s.total_stars,
+                    destruction=s.destruction,
+                    tag=s.tag,
+                )
+                for i, s in enumerate(rows)
+            ]
+            return await asyncio.to_thread(
+                cards.render_cwl_standings,
+                season=season_title(group.season),
+                round_label=round_label,
+                league=league,
+                rows=card_rows,
+                highlight=clan_tag,
+            )
+        except Exception:
+            log.exception("Couldn't draw the CWL standings card for %s", clan_tag)
+            return None
 
     @cwl.command(name="members", description="Town Hall spread of every clan in the CWL group")
     @app_commands.autocomplete(clan=clan_autocomplete)

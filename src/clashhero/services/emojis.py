@@ -80,6 +80,11 @@ class EmojiRegistry:
     def get(self, name: str, fallback: str = "") -> str:
         return self._by_name.get(name, fallback)
 
+    def emoji_id(self, name: str) -> int | None:
+        """The Discord ID of the uploaded emoji ``name``, or None."""
+        m = re.fullmatch(r"<a?:\w+:(\d+)>", self._by_name.get(name, ""))
+        return int(m.group(1)) if m else None
+
     def league(self, tier: str | None, fallback: str = "") -> str:
         return self.get(f"lt_{slug(tier)}"[:32], fallback) if tier else fallback
 

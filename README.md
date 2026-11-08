@@ -86,15 +86,24 @@ fallbacks when one isn't uploaded:
 
 - **Official icons** from the Clash API (ranked league tiers, clan and player labels) are uploaded
   automatically the first time the bot starts.
-- **Game art** (troops, heroes, pets, spells, equipment, Town Halls) isn't in the API. Download it
-  from Supercell's Fan Kit, put the icons in a folder named after each unit (`Barbarian King.png`,
-  `Rage Spell.png`, `Town Hall 18.png`), and upload them:
+- **Game art** (troops, heroes, pets, spells, equipment, Town Halls, resources) isn't in the API.
+  `scripts/game_icons.py` finds an icon for every home-village unit (the Clash of Clans wiki's
+  in-game icons first, then Supercell's Fan Kit) and saves them, resized, in the git-ignored
+  `game-assets/icons/` folder. Then upload them:
 
   ```bash
-  uv run clashhero-emojis path/to/icons        # or: docker compose exec clashhero clashhero-emojis /path
+  uv run python scripts/game_icons.py              # dry run: lists what it would download
+  uv run python scripts/game_icons.py --download
+  uv run clashhero-emojis game-assets/icons
   ```
 
-  Unit grids, profiles and Town Hall spreads then show the icons automatically.
+  You can also add your own PNGs to that folder, named after the emoji (`barbarian_king.png`,
+  `rage_spell.png`, `th18.png`). Unit grids, profiles, Town Hall spreads and image cards then show
+  the icons automatically. Docker mounts `game-assets/` read-only, so cards can draw the icons
+  straight from disk.
+
+Supercell's art is used under its [Fan Content Policy](https://supercell.com/en/fan-content-policy/)
+and isn't republished in this repository.
 
 ## Game updates
 

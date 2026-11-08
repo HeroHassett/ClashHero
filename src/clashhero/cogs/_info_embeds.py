@@ -26,6 +26,7 @@ from coc import (
 )
 from discord.utils import escape_markdown
 
+from clashhero.services.army import housing_space, parse_army
 from clashhero.services.emojis import EMOJIS
 from clashhero.services.snapshots import home_units
 from clashhero.utils.fmt import clan_link, pad, role_name, ts
@@ -724,6 +725,22 @@ def _housing(unit: Any) -> int:
 
 
 def summarize_army(recipe: Any) -> ArmySummary:
+    """Summary of a parsed army link.
+
+    Names come from ``services.army``, which knows units newer than coc.py's game data (coc.py
+    shows an unknown ID as the first unit of its kind, e.g. Dragon Duke as Barbarian King)."""
+    link = getattr(recipe, "link", None)
+    if isinstance(link, str) and (army := parse_army(link)):
+        return ArmySummary(
+            troops=[(u.label, u.count, housing_space(u.kind, u.id)) for u in army.troops],
+            spells=[(u.label, u.count, housing_space(u.kind, u.id)) for u in army.spells],
+            cc_troops=[(u.label, u.count) for u in army.cc_troops],
+            cc_spells=[(u.label, u.count) for u in army.cc_spells],
+            heroes=[
+                (h.hero.label, h.pet.label if h.pet else None, [e.label for e in h.equipment])
+                for h in army.heroes
+            ],
+        )
     heroes = []
     for h in recipe.heroes_loadout or []:
         hero = getattr(getattr(h, "hero", None), "name", None) or "?"

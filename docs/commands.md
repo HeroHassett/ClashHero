@@ -95,6 +95,7 @@ settings need **Manage Server** or the matching manager role set with `/config r
 | `/legendboard post` | Refresh (or re-post) the live leaderboard now |
 | `/legendboard remove player` | Remove a player from the leaderboard |
 | `/legendboard setchannel channel` | Post the live legend leaderboard in a channel |
+| `/legends armies [player] [user] [day_offset] [side]` | The armies a player faced on defense (or used to attack) on a legend day |
 | `/legends clan [clan]` | Today's legend leaderboard for a clan's members |
 | `/legends day [player] [user] [day_offset]` | A player's ranked attacks and defenses for a legend day |
 | `/legends history [player] [user]` | A player's legend results across seasons |

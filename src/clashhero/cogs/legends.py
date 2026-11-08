@@ -9,10 +9,12 @@ trophies are known. Everything here handles both.
 
 from __future__ import annotations
 
+import asyncio
+import io
 import logging
 import re
 import sqlite3
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -26,6 +28,9 @@ from clashhero.cogs._info_embeds import summarize_army
 from clashhero.cogs.army import army_embed_fields
 from clashhero.events import LegendBattle
 from clashhero.repos import legends as repo
+from clashhero.services import cards
+from clashhero.services import icons as unit_icons
+from clashhero.services.army import parse_army
 from clashhero.services.battlelog import army_link
 from clashhero.services.outbox import send_clan_log, send_to_channel, update_live_message
 from clashhero.utils.checks import has_permission, manager
@@ -100,6 +105,69 @@ async def _day_card(bot, tag: str, day: str, guild_id: int | None) -> discord.Em
         end=row["end_trophies"] if row else None,
         color=await guild_color(bot, guild_id),
     )
+
+
+def army_battles(hits: Sequence[repo.Hit]) -> list[cards.ArmyBattle]:
+    """Battles for the armies card, with each army code decoded."""
+    return [
+        cards.ArmyBattle(
+            trophies=h.trophies,
+            opponent=h.opponent_name or h.opponent_tag,
+            opponent_th=h.opponent_th,
+            occurred_at=h.occurred_at,
+            stars=h.stars,
+            destruction=h.destruction,
+            army=parse_army(h.army_share_code) if h.army_share_code else None,
+            autofill=h.autofill,
+        )
+        for h in hits
+    ]
+
+
+async def _armies_card(
+    bot, tag: str, day: str, kind: str, guild_id: int | None
+) -> tuple[discord.Embed, bytes | None]:
+    """The /legends armies reply: an embed and the PNG card, or the embed alone (listing the
+    battles as text) if the card can't be drawn."""
+    stats = await repo.day_stats(bot.db, tag, day)
+    row = await repo.legend_day_row(bot.db, tag, day)
+    name = await _player_name(bot, tag)
+    hits = stats.hits(kind)
+    trophies = None
+    if row is not None:
+        trophies = row["end_trophies"] if row["end_trophies"] is not None else row["start_trophies"]
+    card = None
+    try:
+        battles = army_battles(hits)
+        shown = battles[-cards.MAX_CARD_BATTLES :]
+        icons = await unit_icons.fetch_icons(n for b in shown if b.army for n in b.army.names())
+        values = [h.trophies for h in hits]
+        card = await asyncio.to_thread(
+            cards.render_legend_armies,
+            kind=kind,
+            player_name=name,
+            player_tag=tag,
+            day=day,
+            trophies=trophies,
+            total=sum(values),
+            count=E.count(values, stats.cap),
+            battles=battles,
+            icons=icons,
+        )
+    except Exception:
+        log.exception("Couldn't draw the legend armies card for %s on %s", tag, day)
+    embed = E.armies_embed(
+        name=name,
+        tag=tag,
+        day=day,
+        kind=kind,
+        hits=hits,
+        cap=stats.cap,
+        trophies=trophies,
+        color=await guild_color(bot, guild_id),
+        battles=card is None,
+    )
+    return embed, card
 
 
 # ------------------------------------------------------------------ persistent components
@@ -322,6 +390,10 @@ class Pager(OwnerView):
 DESTINATIONS = [
     app_commands.Choice(name="Direct message", value="dm"),
     app_commands.Choice(name="Channel", value="channel"),
+]
+SIDES = [
+    app_commands.Choice(name="Defenses", value="defense"),
+    app_commands.Choice(name="Attacks", value="attack"),
 ]
 
 
@@ -622,6 +694,36 @@ class Legends(BaseCog):
                     interaction.user.id, [(r["player_tag"], r["name"] or "?") for r in links], render
                 )
         await interaction.response.send_message(embed=await render(tag), view=view or discord.utils.MISSING)
+
+    @legends.command(
+        name="armies", description="The armies a player faced on defense (or used to attack) on a legend day"
+    )
+    @app_commands.autocomplete(player=player_autocomplete)
+    @app_commands.describe(
+        day_offset="0 = today, 1 = yesterday, ...",
+        side="Defenses: the attackers' armies (default); Attacks: the player's own",
+    )
+    @app_commands.choices(side=SIDES)
+    async def legends_armies(
+        self,
+        interaction: discord.Interaction,
+        player: str | None = None,
+        user: discord.User | None = None,
+        day_offset: app_commands.Range[int, 0, 60] = 0,
+        side: app_commands.Choice[str] | None = None,
+    ) -> None:
+        tag = await self._resolve_player(interaction, player, user)
+        kind = side.value if side else "defense"
+        day = legend_day_id(_now() - timedelta(days=day_offset))
+        await interaction.response.defer()
+        embed, card = await _armies_card(self.bot, tag, day, kind, interaction.guild_id)
+        if card is None:
+            await interaction.followup.send(embed=embed)
+            return
+        embed.set_image(url="attachment://armies.png")
+        await interaction.followup.send(
+            embed=embed, file=discord.File(io.BytesIO(card), filename="armies.png")
+        )
 
     @legends.command(name="week", description="A player's ranked week (weekly tournaments)")
     @app_commands.autocomplete(player=player_autocomplete)

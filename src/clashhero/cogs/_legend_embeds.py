@@ -11,6 +11,7 @@ import discord
 from clashhero.repos.legends import BoardEntry, DayStats, Hit, SeasonSummary, WeekDay, has_details
 from clashhero.utils.fmt import chunk_lines, player_link, signed, stars, table, ts
 from clashhero.utils.seasons import season_by_id, season_label
+from clashhero.utils.style import SEP
 
 ATTACK_COLOR = discord.Color.green()
 DEFENSE_COLOR = discord.Color.red()
@@ -202,6 +203,41 @@ def day_embed(
     if has_details(stats.hits("attack")):
         e.add_field(name="3★", value=f"{stats.triples}/{len(stats.attacks)}")
     e.set_footer(text=f"{tag} · {source_note(_day_hits(stats))}")
+    return e
+
+
+def armies_embed(
+    *,
+    name: str,
+    tag: str,
+    day: str,
+    kind: str,
+    hits: Sequence[Hit],
+    cap: int | None,
+    trophies: int | None,
+    color: discord.Color | None = None,
+    battles: bool = True,
+) -> discord.Embed:
+    """The /legends armies reply: the day's totals for one side (defenses or attacks). The
+    armies themselves are on the image card; with ``battles`` (the text fallback when the card
+    can't be drawn) each battle is listed as a line instead."""
+    noun = "Defenses" if kind == "defense" else "Attacks"
+    e = discord.Embed(
+        title=f"{name} · {'Defense' if kind == 'defense' else 'Attack'} armies",
+        url=player_link(tag),
+        color=color,
+    )
+    values = [h.trophies for h in hits]
+    parts = [f"Legend day {day}"]
+    if trophies is not None:
+        parts.append(f"🏆 **{trophies}**")
+    parts.append(f"{noun} {count(values, cap)} ({signed(sum(values))})")
+    e.description = SEP.join(parts)
+    if battles:
+        chunks = hit_chunks(hits) if hits else ["None recorded for this day."]
+        for i, value in enumerate(chunks):
+            e.add_field(name=noun if i == 0 else f"{noun} (cont.)", value=value, inline=False)
+    e.set_footer(text=f"{tag} · {source_note(hits)}" if hits else tag)
     return e
 
 

@@ -10,6 +10,9 @@ services:
       DATABASE_PATH: /app/data/clashhero.db
     volumes:
       - clashhero-data:/app/data
+      # Game icons and fonts from scripts/game_icons.py (git-ignored). Optional: without them,
+      # image cards use the bot's uploaded emojis and the bundled fonts.
+      - ./game-assets:/app/game-assets:ro
 
 volumes:
   clashhero-data:
