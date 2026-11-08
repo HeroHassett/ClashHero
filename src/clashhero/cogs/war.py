@@ -205,6 +205,7 @@ class War(BaseCog):
         owner = link["discord_user_id"] if link else interaction.user.id
         await war_repo.set_caller(
             self.db,
+            interaction.guild_id,
             w["id"],
             position,
             player_tag=tag,
@@ -227,14 +228,18 @@ class War(BaseCog):
         if position is None:
             await require(interaction, "bot")
         else:
-            existing = [c for c in await war_repo.get_callers(self.db, w["id"]) if c["position"] == position]
+            existing = [
+                c
+                for c in await war_repo.get_callers(self.db, interaction.guild_id, w["id"])
+                if c["position"] == position
+            ]
             if (
                 existing
                 and existing[0]["user_id"] != interaction.user.id
                 and not await has_permission(interaction, "bot")
             ):
                 raise ResolveError("Only the person who claimed that base (or a manager) can clear it.")
-        n = await war_repo.clear_caller(self.db, w["id"], position)
+        n = await war_repo.clear_caller(self.db, interaction.guild_id, w["id"], position)
         msg = f"Cleared {n} claim(s)."
         await interaction.response.send_message(msg, embed=await self._callers_embed(interaction, w))
 
@@ -245,7 +250,7 @@ class War(BaseCog):
         await interaction.response.send_message(embed=await self._callers_embed(interaction, w))
 
     async def _callers_embed(self, interaction: discord.Interaction, w: dict) -> discord.Embed:
-        callers = await war_repo.get_callers(self.db, w["id"])
+        callers = await war_repo.get_callers(self.db, interaction.guild_id, w["id"])
         enemies = {m["map_position"]: m for m in await war_repo.war_members(self.db, w["id"], opponent=True)}
         attacks = await war_repo.war_attacks(self.db, w["id"])
         best: dict[str, int] = {}

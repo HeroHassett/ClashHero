@@ -225,12 +225,45 @@ async def test_cwl_member_stats_and_history(db):
 
 
 async def test_callers(db, seeded):
-    await wr.set_caller(db, seeded, 1, player_tag="#A", user_id=5, note="hit me", assigned_by=5)
-    await wr.set_caller(db, seeded, 1, player_tag="#B", user_id=6, note=None, assigned_by=6)
-    rows = await wr.get_callers(db, seeded)
+    await wr.set_caller(db, 1, seeded, 1, player_tag="#A", user_id=5, note="hit me", assigned_by=5)
+    await wr.set_caller(db, 1, seeded, 1, player_tag="#B", user_id=6, note=None, assigned_by=6)
+    rows = await wr.get_callers(db, 1, seeded)
     assert [(r["position"], r["player_tag"]) for r in rows] == [(1, "#B")]
-    assert await wr.clear_caller(db, seeded, 1) == 1
-    assert await wr.get_callers(db, seeded) == []
+    assert await wr.clear_caller(db, 1, seeded, 1) == 1
+    assert await wr.get_callers(db, 1, seeded) == []
+
+
+async def test_calls_are_private_to_each_server(db, seeded):
+    # Server 1 tracks its own clan; server 2 (the opponent) adds the same clan to snoop.
+    await wr.set_caller(db, 1, seeded, 3, player_tag="#A", user_id=5, note="ring base", assigned_by=5)
+    assert await wr.get_callers(db, 2, seeded) == []  # can't see it
+    assert await wr.clear_caller(db, 2, seeded) == 0  # can't clear it
+    assert await wr.clear_caller(db, 2, seeded, 3) == 0
+    assert [c["note"] for c in await wr.get_callers(db, 1, seeded)] == ["ring base"]
+
+
+async def test_old_shared_calls_move_to_the_owning_server(tmp_path):
+    from clashhero.db import Database
+
+    path = tmp_path / "old.db"
+    db = Database(path)
+    await db.connect()
+    await db.add_guild_clan(7, "#OURS")
+    war_id = await db.execute(
+        "INSERT INTO wars (clan_tag, war_type, state, preparation_start) "
+        "VALUES ('#OURS', 'cwl', 'inWar', 'x')"
+    )
+    await db.execute(
+        "INSERT INTO war_callers (war_id, position, player_tag, user_id, assigned_by) "
+        "VALUES (?, 4, '#A', 5, 5)",
+        (war_id,),
+    )
+    await db.close()
+    db = Database(path)  # restart runs the one-time move
+    await db.connect()
+    assert [(c["position"], c["player_tag"]) for c in await wr.get_callers(db, 7, war_id)] == [(4, "#A")]
+    assert await db.fetchval("SELECT COUNT(*) FROM war_callers") == 0
+    await db.close()
 
 
 async def test_current_war_and_names(db, seeded):

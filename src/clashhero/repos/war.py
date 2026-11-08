@@ -536,6 +536,7 @@ async def player_cwl_history(
 
 async def set_caller(
     db: Database,
+    guild_id: int,
     war_id: int,
     position: int,
     *,
@@ -545,22 +546,28 @@ async def set_caller(
     assigned_by: int,
 ) -> None:
     await db.execute(
-        "INSERT INTO war_callers (war_id, position, player_tag, user_id, note, assigned_by) "
-        "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (war_id, position) DO UPDATE SET "
+        "INSERT INTO war_calls (guild_id, war_id, position, player_tag, user_id, note, assigned_by) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (guild_id, war_id, position) DO UPDATE SET "
         "player_tag = excluded.player_tag, user_id = excluded.user_id, note = excluded.note, "
         "assigned_by = excluded.assigned_by, assigned_at = datetime('now')",
-        (war_id, position, player_tag, user_id, note, assigned_by),
+        (guild_id, war_id, position, player_tag, user_id, note, assigned_by),
     )
 
 
-async def clear_caller(db: Database, war_id: int, position: int | None = None) -> int:
+async def clear_caller(db: Database, guild_id: int, war_id: int, position: int | None = None) -> int:
     if position is None:
-        return await db.execute_rowcount("DELETE FROM war_callers WHERE war_id = ?", (war_id,))
+        return await db.execute_rowcount(
+            "DELETE FROM war_calls WHERE guild_id = ? AND war_id = ?", (guild_id, war_id)
+        )
     return await db.execute_rowcount(
-        "DELETE FROM war_callers WHERE war_id = ? AND position = ?", (war_id, position)
+        "DELETE FROM war_calls WHERE guild_id = ? AND war_id = ? AND position = ?",
+        (guild_id, war_id, position),
     )
 
 
-async def get_callers(db: Database, war_id: int) -> list[dict]:
-    rows = await db.fetchall("SELECT * FROM war_callers WHERE war_id = ? ORDER BY position", (war_id,))
+async def get_callers(db: Database, guild_id: int, war_id: int) -> list[dict]:
+    """This server's calls for a war. Other servers tracking the same clan have their own."""
+    rows = await db.fetchall(
+        "SELECT * FROM war_calls WHERE guild_id = ? AND war_id = ? ORDER BY position", (guild_id, war_id)
+    )
     return [dict(r) for r in rows]
