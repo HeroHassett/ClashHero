@@ -21,6 +21,7 @@ from clashhero.cogs._info_embeds import (
     unit_levels,
     upgrade_progress,
 )
+from clashhero.constants import CLAN_TYPE_LABELS, WAR_FREQUENCY_LABELS
 from clashhero.repos import stats
 from clashhero.utils.fmt import chunk_lines, clan_link, make_embed, player_link, role_name, table, ts
 from clashhero.utils.ranked import league_icon, league_name
@@ -123,7 +124,7 @@ class Info(BaseCog):
             e.set_thumbnail(url=badge)
         e.add_field(name="Level", value=str(c.level))
         e.add_field(name="Members", value=f"{c.member_count}/50")
-        e.add_field(name="Type", value=_enum(c.type))
+        e.add_field(name="Type", value=CLAN_TYPE_LABELS.get(_enum(c.type), _enum(c.type)))
         e.add_field(name="War League", value=getattr(c.war_league, "name", "—") or "—")
         e.add_field(name="Capital League", value=getattr(c.capital_league, "name", "—") or "—")
         loc = getattr(c, "location", None)
@@ -133,7 +134,10 @@ class Info(BaseCog):
             record += f" / {c.war_losses or 0} L / {c.war_ties or 0} T"
         record += f"\nStreak: {c.war_win_streak or 0}"
         e.add_field(name="War Record", value=record)
-        e.add_field(name="War Frequency", value=_enum(c.war_frequency))
+        e.add_field(
+            name="War Frequency",
+            value=WAR_FREQUENCY_LABELS.get(_enum(c.war_frequency), _enum(c.war_frequency)),
+        )
         e.add_field(name="War Log", value="Public" if c.public_war_log else "Private")
         reqs = [f"{c.required_trophies or 0} trophies"]
         if getattr(c, "required_townhall", None):

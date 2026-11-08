@@ -53,6 +53,17 @@ LIVE_KINDS: dict[str, str] = {
     "legend_board": "Legend leaderboard",
 }
 
+# In-game wording for the API's clan setting codes.
+CLAN_TYPE_LABELS = {"open": "Anyone Can Join", "inviteOnly": "Invite Only", "closed": "Closed"}
+WAR_FREQUENCY_LABELS = {
+    "always": "Always",
+    "moreThanOncePerWeek": "Twice a Week",
+    "oncePerWeek": "Once a Week",
+    "lessThanOncePerWeek": "Rarely",
+    "never": "Never",
+    "unknown": "Not Set",
+}
+
 ROLE_NAMES = {"leader": "Leader", "coLeader": "Co-Leader", "admin": "Elder", "member": "Member"}
 ROLE_RANK = {"leader": 4, "coLeader": 3, "admin": 2, "member": 1}
 

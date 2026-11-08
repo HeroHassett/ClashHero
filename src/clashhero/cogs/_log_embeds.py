@@ -9,6 +9,7 @@ from typing import Any
 
 import discord
 
+from clashhero.constants import CLAN_TYPE_LABELS, WAR_FREQUENCY_LABELS
 from clashhero.utils.fmt import chunk_lines, clan_link, duration, player_link, role_name, stars, table, ts
 
 GREEN = discord.Color.green()
@@ -37,15 +38,6 @@ SETTING_LABELS = {
     "location": "Location",
     "chat_language": "Chat language",
     "labels": "Labels",
-}
-CLAN_TYPE_LABELS = {"open": "Anyone can join", "inviteOnly": "Invite only", "closed": "Closed"}
-WAR_FREQUENCY_LABELS = {
-    "always": "Always",
-    "moreThanOncePerWeek": "Twice a week",
-    "oncePerWeek": "Once a week",
-    "lessThanOncePerWeek": "Rarely",
-    "never": "Never",
-    "unknown": "Not set",
 }
 # Display order for unit kinds inside a player's upgrade list.
 UNIT_KIND_ORDER = {"Hero": 0, "Equipment": 1, "Pet": 2, "Troop": 3, "Siege": 4, "Spell": 5}
