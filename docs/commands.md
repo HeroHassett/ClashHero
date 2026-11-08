@@ -116,7 +116,7 @@ settings need **Manage Server** or the matching manager role set with `/config r
 | `/caller assign position [player] [note] [clan]` | Claim an enemy base in the current war |
 | `/caller clear [position] [clan]` | Remove a claim (or all claims) in the current war |
 | `/caller list [clan]` | Show claimed bases in the current war |
-| `/stats attacks [clans] [period] [war_type] [town_hall] [min_attacks]` | War hit rates per player (3★ %, avg stars, missed) |
+| `/stats attacks [clans] [period] [war_type] [town_hall] [min_attacks]` | War 3★ hit rates per player |
 | `/stats defense [clans] [period] [war_type] [town_hall]` | War defense hold rates per player |
 | `/war current [clan]` | Score, timers and TH matchup of the current war |
 | `/war history [player] [user] [period] [war_type]` | A player's war performance (hit rate, 3★%, defense) |

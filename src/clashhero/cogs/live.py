@@ -19,12 +19,19 @@ from clashhero.utils.checks import manager
 from clashhero.utils.fmt import make_embed
 from clashhero.utils.resolve import clan_autocomplete, resolve_clan
 from clashhero.utils.seasons import clan_games
+from clashhero.utils.style import SEP, ok_embed
 
 log = logging.getLogger(__name__)
 
 OUR_KINDS = ("war_embed", "cwl_embed", "clan_games", "last_seen", "clan_embed")
 KIND_CHOICES = [app_commands.Choice(name=LIVE_KINDS[k], value=k) for k in OUR_KINDS]
 WAR_DEBOUNCE_SECONDS = 60
+
+
+def live_line(r) -> str:
+    """One /live list row: ``📡 **Current war** · `#TAG` → #channel``."""
+    kind = LIVE_KINDS.get(r["kind"], r["kind"])
+    return f"📡 **{kind}**{SEP}`{r['scope'] or 'server'}` → <#{r['channel_id']}>"
 
 
 class Live(BaseCog):
@@ -145,8 +152,10 @@ class Live(BaseCog):
             (interaction.guild_id, kind, tag),
         )
         await self.refresh_row(row)
+        name = await self._clan_name(tag)
+        label = f"**{name}** `{tag}`" if name != tag else f"`{tag}`"
         await interaction.followup.send(
-            f"Live **{LIVE_KINDS[kind]}** for `{tag}` posted in {target.mention}."
+            embed=ok_embed(f"Live **{LIVE_KINDS[kind]}** for {label} posted in {target.mention}.")
         )
 
     @live.command(name="war", description="Live embed of the clan's current war")
@@ -219,17 +228,16 @@ class Live(BaseCog):
     ) -> None:
         tag = await resolve_clan(interaction, clan)
         await self.db.delete_live_message(interaction.guild_id, kind.value, tag)
-        await interaction.response.send_message(f"Stopped **{kind.name}** for `{tag}`.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=ok_embed(f"Stopped **{kind.name}** for `{tag}`."), ephemeral=True
+        )
 
     @live.command(name="list", description="List live embeds in this server")
     async def live_list(self, interaction: discord.Interaction) -> None:
         rows = await self.db.fetchall(
             "SELECT * FROM live_messages WHERE guild_id = ? ORDER BY kind, scope", (interaction.guild_id,)
         )
-        lines = [
-            f"{LIVE_KINDS.get(r['kind'], r['kind'])} · `{r['scope'] or 'server'}` → <#{r['channel_id']}>"
-            for r in rows
-        ]
+        lines = [live_line(r) for r in rows]
         embed = await make_embed(
             self.bot,
             interaction.guild_id,

@@ -376,3 +376,27 @@ async def test_recent_leavers_expire(cog, db):
     cog._left["#A"] = ("#OLD", datetime.now(UTC) - logs_mod.MOVE_WINDOW - timedelta(seconds=1))
     cog._left["#B"] = ("#OLD", datetime.now(UTC))
     assert await cog._recent_leavers() == {"#B"}
+
+
+def test_log_list_lines_groups_by_clan():
+    from clashhero.cogs.logs import log_list_lines
+
+    clan_rows = [
+        {"clan_tag": "#A", "log_type": "donations", "channel_id": 1, "ping_role_id": None},
+        {"clan_tag": "#A", "log_type": "unknown_kind", "channel_id": 2, "ping_role_id": 9},
+        {"clan_tag": "#B", "log_type": "donations", "channel_id": 3, "ping_role_id": None},
+    ]
+    server_rows = [{"log_type": "welcome", "channel_id": 4}]
+    assert log_list_lines(clan_rows, server_rows, {"#A": "Alpha"}) == [
+        "🏳️ **Alpha** `#A`",
+        "Donation log → <#1>",
+        "unknown_kind → <#2> · ping <@&9>",
+        "",
+        "🏳️ **#B** `#B`",
+        "Donation log → <#3>",
+        "",
+        "🖥️ **Server**",
+        "Account linked (welcome) → <#4>",
+    ]
+    assert log_list_lines([], [], {}) == []
+    assert log_list_lines([], server_rows, {})[0] == "🖥️ **Server**"

@@ -22,10 +22,42 @@ from clashhero.services.outbox import send_server_log, send_to_channel
 from clashhero.services.snapshots import home_units
 from clashhero.utils.checks import has_permission
 from clashhero.utils.fmt import chunk_lines, display_width, make_embed, pad, ts
+from clashhero.utils.style import fail_embed, ok_embed
 
 log = logging.getLogger(__name__)
 
 FIELD_LIMIT = 1024
+
+
+def clip_lines(lines: Sequence[str], limit: int = FIELD_LIMIT) -> str:
+    """Join lines, dropping whole lines (with an "… N more" note) to stay under ``limit``."""
+    text = "\n".join(lines)
+    if len(text) <= limit:
+        return text
+    out: list[str] = []
+    used = 0
+    for i, line in enumerate(lines):
+        more = f"… {len(lines) - i} more"
+        if used + len(line) + 1 > limit - len(more) - 1:
+            out.append(more)
+            break
+        out.append(line)
+        used += len(line) + 1
+    return "\n".join(out)
+
+
+def names_text(names: Sequence[str], limit: int = 1500) -> str:
+    """Bold, comma-separated names, cut short with "… N more" past ``limit`` characters."""
+    out: list[str] = []
+    used = 0
+    for i, name in enumerate(names):
+        item = f"**{name}**"
+        if out and used + len(item) + 2 > limit:
+            out.append(f"… {len(names) - i} more")
+            break
+        out.append(item)
+        used += len(item) + 2
+    return ", ".join(out)
 
 
 @dataclass
@@ -40,8 +72,46 @@ class SignupResult:
             lines.append("Signed up: " + ", ".join(self.added))
         if self.updated:
             lines.append("Updated group: " + ", ".join(self.updated))
-        lines += [f"✗ {e}" for e in self.errors]
+        lines += [f"❌ {e}" for e in self.errors]
         return "\n".join(lines) or "Nothing changed."
+
+    def embed(self) -> discord.Embed:
+        """Green with what changed (and a "Skipped" field for errors), or red when nothing did."""
+        if self.added or self.updated:
+            parts = []
+            if self.added:
+                parts.append(f"Signed up {names_text(self.added)}.")
+            if self.updated:
+                parts.append(f"Updated the group for {names_text(self.updated)}.")
+            e = ok_embed("\n".join(parts))
+            if self.errors:
+                e.add_field(
+                    name=f"Skipped ({len(self.errors)})",
+                    value=clip_lines([f"❌ {x}" for x in self.errors]),
+                    inline=False,
+                )
+            return e
+        if len(self.errors) == 1:
+            return fail_embed(self.errors[0])
+        if not self.errors:
+            return fail_embed("Nothing changed.")
+        e = fail_embed(f"Nobody was signed up ({len(self.errors)} skipped).")
+        e.add_field(name="Why", value=clip_lines([f"• {x}" for x in self.errors]), inline=False)
+        return e
+
+
+def removed_embed(removed: Sequence[str], roster_name: str) -> discord.Embed:
+    """Result of an opt-out / removal."""
+    if not removed:
+        return fail_embed(f"None of those were on **{roster_name}**.")
+    return ok_embed(f"Removed {names_text(removed)} from **{roster_name}**.")
+
+
+def apply_embed(roster_name: str, summary: str) -> discord.Embed:
+    """Result of applying a suggested lineup (``summary`` from ``apply_suggestion``)."""
+    e = ok_embed(f"Lineup applied to **{roster_name}**.")
+    e.description += "\n\n" + summary[:3800]
+    return e
 
 
 # ------------------------------------------------------------------ player info
@@ -522,7 +592,9 @@ class _SignupPicker(discord.ui.View):
             await interaction.response.defer(ephemeral=True, thinking=True)
             roster_now = await repo.get_roster(interaction.client.db, self.roster["id"])
             if roster_now is None:
-                await interaction.followup.send("That roster no longer exists.", ephemeral=True)
+                await interaction.followup.send(
+                    embed=fail_embed("That roster no longer exists."), ephemeral=True
+                )
                 return
             res = await signup(
                 interaction.client,
@@ -532,7 +604,7 @@ class _SignupPicker(discord.ui.View):
                 actor=interaction.user,
                 group_id=self.group_id,
             )
-            await interaction.followup.send(res.summary(), ephemeral=True)
+            await interaction.followup.send(embed=res.embed(), ephemeral=True)
 
         asel.callback = on_accounts
         self.add_item(asel)
@@ -554,13 +626,15 @@ class _OptOutPicker(discord.ui.View):
         async def on_pick(interaction: discord.Interaction) -> None:
             roster_now = await repo.get_roster(interaction.client.db, roster["id"])
             if roster_now is None:
-                await interaction.response.send_message("That roster no longer exists.", ephemeral=True)
+                await interaction.response.send_message(
+                    embed=fail_embed("That roster no longer exists."), ephemeral=True
+                )
                 return
             removed = await opt_out(
                 interaction.client, interaction.guild, roster_now, sel.values, actor=interaction.user
             )
             await interaction.response.send_message(
-                ("Removed: " + ", ".join(removed)) if removed else "Nothing removed.", ephemeral=True
+                embed=removed_embed(removed, roster_now["name"]), ephemeral=True
             )
 
         sel.callback = on_pick
@@ -593,7 +667,9 @@ class _RosterButton:
         try:
             roster = await repo.get_roster(interaction.client.db, self.roster_id)
             if roster is None:
-                await interaction.response.send_message("This roster no longer exists.", ephemeral=True)
+                await interaction.response.send_message(
+                    embed=fail_embed("This roster no longer exists."), ephemeral=True
+                )
                 return
             await self.run(interaction, roster)
         except Exception as e:  # buttons have no command error handler
@@ -613,13 +689,15 @@ class SignupButton(
 
     async def run(self, interaction: discord.Interaction, roster) -> None:
         if roster["closed"]:
-            await interaction.response.send_message("This roster is closed.", ephemeral=True)
+            await interaction.response.send_message(
+                embed=fail_embed("This roster is closed."), ephemeral=True
+            )
             return
         db = interaction.client.db
         links = await db.get_links(interaction.user.id)
         if not links:
             await interaction.response.send_message(
-                "You have no linked accounts. Use `/link create` first.", ephemeral=True
+                embed=fail_embed("You have no linked accounts. Use `/link create` first."), ephemeral=True
             )
             return
         eligible = [
@@ -629,7 +707,7 @@ class SignupButton(
         ]
         if not eligible:
             await interaction.response.send_message(
-                "None of your linked accounts meet the requirements.", ephemeral=True
+                embed=fail_embed("None of your linked accounts meet the requirements."), ephemeral=True
             )
             return
         groups = await repo.list_groups(db, roster["id"])
@@ -656,7 +734,7 @@ class OptOutButton(
         ]
         if not members:
             await interaction.response.send_message(
-                "None of your accounts are on this roster.", ephemeral=True
+                embed=fail_embed("None of your accounts are on this roster."), ephemeral=True
             )
             return
         await interaction.response.send_message(

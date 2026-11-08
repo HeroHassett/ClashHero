@@ -19,8 +19,15 @@ from clashhero.cogs._base import BaseCog
 from clashhero.constants import SUPERCELL_DISCLAIMER
 from clashhero.services import privacy
 from clashhero.utils.fmt import make_embed
+from clashhero.utils.style import chip, chip_width, ok_embed
 
 log = logging.getLogger(__name__)
+
+
+def record_lines(summary: dict[str, int]) -> list[str]:
+    """/privacy mydata rows: a right-aligned count chip, then the table name."""
+    width = chip_width(f"{n:,}" for n in summary.values())
+    return [f"{chip(f'{n:,}', width)} {name}" for name, n in sorted(summary.items())]
 
 
 class ConfirmDelete(discord.ui.View):
@@ -37,9 +44,12 @@ class ConfirmDelete(discord.ui.View):
         report = await privacy.purge_user(self.cog.db, self.user_id)
         self.stop()
         await interaction.response.edit_message(
-            content=f"Done. Removed or anonymised {report.total} record(s) linked to your Discord "
-            "account across all servers. Public Clash of Clans game data is no longer associated "
-            "with you.",
+            content=None,
+            embed=ok_embed(
+                f"Done. Removed or anonymised {chip(report.total)} record(s) linked to your Discord "
+                "account across all servers. Public Clash of Clans game data is no longer associated "
+                "with you."
+            ),
             view=None,
         )
 
@@ -69,14 +79,14 @@ class Privacy(BaseCog):
             e.add_field(
                 name="Linked Clash accounts",
                 value="\n".join(
-                    f"`{r['player_tag']}` {r['name'] or ''}{' (verified)' if r['verified'] else ''}"
+                    f"`{r['player_tag']}` **{r['name'] or '?'}**{' · ✅ verified' if r['verified'] else ''}"
                     for r in links
-                ),
+                )[:1024],
                 inline=False,
             )
         e.add_field(
             name="Records linked to your Discord ID",
-            value="\n".join(f"{t}: {n}" for t, n in sorted(summary.items())) or "None",
+            value="\n".join(record_lines(summary))[:1024] or "None",
             inline=False,
         )
         e.set_footer(text="Use /privacy delete to remove all of it.")

@@ -89,6 +89,7 @@ def test_summarize_attacks_and_buckets():
     ]
     s = wr.summarize_attacks(rows, missed=1)
     assert (s.attacks, s.triples, s.zeros, s.missed, s.possible) == (3, 1, 1, 1, 4)
+    assert s.town_hall == 16  # from the latest attack
     assert s.avg_stars == pytest.approx(5 / 3)
     assert s.fresh_triple_rate == 0.5
     assert s.bucket_rate("up") == (1, 1.0)
@@ -97,7 +98,11 @@ def test_summarize_attacks_and_buckets():
 
 def test_summarize_defenses():
     d = wr.summarize_defenses([{"stars": 3, "destruction": 100}, {"stars": 1, "destruction": 40}])
-    assert d.hold_rate == 0.5 and d.avg_stars == 2
+    assert d.hold_rate == 0.5 and d.avg_stars == 2 and d.town_hall is None
+    d = wr.summarize_defenses(
+        [{"stars": 1, "destruction": 40, "defender_th": 15}, {"stars": 0, "destruction": 9}]
+    )
+    assert d.town_hall == 15
 
 
 def test_remaining_attacks():
@@ -124,6 +129,23 @@ async def test_defense_leaderboard(db, seeded):
     rows = dict(await wr.defense_leaderboard(db, ["#C"]))
     assert rows["#B"].triples_allowed == 1 and rows["#B"].hold_rate == 0
     assert rows["#A"].hold_rate == 1
+    assert (rows["#A"].town_hall, rows["#B"].town_hall) == (16, 15)
+
+
+async def test_leaderboards_carry_town_hall(db, seeded):
+    rows = dict(await wr.attack_leaderboard(db, ["#C"]))
+    assert rows["#A"].town_hall == 16 and rows["#B"].town_hall is None  # Bob only missed
+
+
+async def test_count_wars(db, seeded):
+    await add_war(db, war_type="cwl", season="2026-11", rnd=1, days_ago=3, opp="R1")
+    await add_war(db, state="preparation", days_ago=0, opp="Next")  # not started: not counted
+    await add_war(db, days_ago=40, opp="Old")
+    assert await wr.count_wars(db, ["#C"]) == 3
+    assert await wr.count_wars(db, ["#C"], war_type="cwl") == 1
+    assert await wr.count_wars(db, ["#C"], since=NOW - timedelta(days=30)) == 2
+    assert await wr.count_wars(db, ["#C"], until=NOW - timedelta(days=30)) == 1
+    assert await wr.count_wars(db, []) == 0
 
 
 async def test_player_war_history(db, seeded):
@@ -222,6 +244,21 @@ async def test_cwl_member_stats_and_history(db):
     assert [h["cwl_round"] for h in hist] == [2, 1]
     assert hist[1]["attack"]["stars"] == 3 and hist[1]["defense"]["stars"] == 2
     assert hist[0]["attack"] is None
+    assert hist[1]["attack"]["target_pos"] == 1  # from war_members when defender_pos is missing
+    assert hist[0]["clan_name"] is None  # clan not stored yet
+
+
+async def test_cwl_history_clan_name_and_stored_position(db):
+    await db.execute(
+        "INSERT INTO clans (clan_tag, name, updated_at) VALUES ('#C', 'Heroes', ?)", (NOW.isoformat(),)
+    )
+    w = await add_war(db, war_type="cwl", season="2026-11", rnd=1, per=1, opp="R1")
+    await add_member(db, w, "#A", "Alice", 16, 3)
+    await add_member(db, w, "#E", "Enemy", 16, 1, opp=True)
+    await add_attack(db, w, 1, "#A", "#E", 2, 80.0, 16, 16)
+    await db.execute("UPDATE war_attacks SET defender_pos = 7 WHERE war_id = ?", (w,))
+    (h,) = await wr.player_cwl_history(db, ["#A"])
+    assert (h["clan_name"], h["map_position"], h["attack"]["target_pos"]) == ("Heroes", 3, 7)
 
 
 async def test_callers(db, seeded):
@@ -317,19 +354,30 @@ def test_war_embeds():
     color = discord.Color.blue()
     e = war_overview_embed(fake_war(), "#C", color)
     assert e.title == "Us vs Them"
-    assert "5 - 2" in e.fields[0].value and "3/4" in e.fields[0].value
+    status, score, attacks = e.description.split("\n")
+    assert status.startswith("**Battle day** · 2v2 · ends <t:")
+    assert score == "⚔️ 5★ – 2★ · 60.0% – 40.0%"
+    assert attacks == "🗡️ `3/4` – `2/4` attacks"
+    assert e.fields[0].name == "Town Halls"
     prep = war_overview_embed(fake_war("preparation"), "#C", color)
-    assert all(f.name != "Score" for f in prep.fields)
+    assert "battle day starts <t:" in prep.description and "★" not in prep.description
     lineup = lineup_embed(fake_war(), "#C", color)
     assert "Alice" in lineup.description and "★★★" in lineup.description
 
 
 def test_th_matchup():
     w = fake_war()
-    assert th_matchup(w.opponent.members, w.clan.members) == "TH16: 1 vs 2\nTH15: 1 vs 0"
+    assert th_matchup(w.opponent.members, w.clan.members) == "`TH16` `1` – `2`\n`TH15` `1` – `0`"
+    assert th_matchup([], []) == "—"
 
 
 async def test_history_embed(db, seeded):
     h = await wr.player_war_history(db, ["#A"])
     e = history_embed("Alice", "all time", h, discord.Color.blue())
-    assert "Attacks: 2" in e.fields[0].value and "Hitting up: 1 hits, 100%" in e.fields[2].value
+    assert e.description == "⚔️ 1 war · all time"
+    offense, defense, buckets, recent = (f.value for f in e.fields)
+    assert offense.split("\n")[0] == "`    2` hits"  # chips padded to the widest value (90.0%)
+    assert "`  50%` 3★ rate (1)" in offense
+    assert defense.split("\n")[0] == "`   1` times attacked"
+    assert buckets.split("\n")[0] == "`up  ` `1` hits · `100%` 3★"
+    assert recent.split("\n") == ["★★☆ ` 80%` TH16→TH16 · Opp", "★★★ `100%` TH16→TH17 · Opp"]

@@ -165,3 +165,11 @@ async def test_top_today_and_daily_posted(db):
     assert await repo.daily_posted(db, "#C", DAY)
     await db.set_clan_log(1, "#C", "legend_daily", 9)
     assert await repo.clans_with_daily_log(db) == ["#C"]
+
+
+def test_alert_line():
+    from clashhero.cogs.legends import alert_line
+
+    sub = {"id": 12, "name": "Amy", "player_tag": "#P", "attacks": 1, "defenses": 0}
+    assert alert_line(sub, "DM") == "`#12` **Amy** `#P` → DM · ⚔️ on · 🛡️ off"
+    assert alert_line({**sub, "name": None}, "<#5>").startswith("`#12` **?** `#P` → <#5>")

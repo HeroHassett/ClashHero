@@ -15,6 +15,7 @@ from clashhero.utils.checks import require
 from clashhero.utils.fmt import chunk_lines, make_embed, role_name, table, ts
 from clashhero.utils.resolve import ResolveError, clan_autocomplete, resolve_clan
 from clashhero.utils.seasons import utcnow
+from clashhero.utils.style import fail_embed, ok_embed
 
 MAX_FIELDS = 25
 MAX_ROWS = 60
@@ -118,7 +119,9 @@ class Todo(BaseCog):
         rows = T.pick_inactive(members, now, days)
         if not rows:
             await interaction.response.send_message(
-                f"Everyone in **{clan_name}** has been seen in the last {_plural(days, 'day')}."
+                embed=ok_embed(
+                    f"Everyone in **{clan_name}** has been seen in the last {_plural(days, 'day')}."
+                )
             )
             return
         body = table(
@@ -145,7 +148,10 @@ class Todo(BaseCog):
         lines, unlinked = ping_lines(rows, await self.db.links_for_tags([r["player_tag"] for r in rows]))
         if not lines:
             await interaction.response.send_message(
-                "None of them have a linked Discord account, so nobody was pinged.", embed=embed
+                embeds=[
+                    embed,
+                    fail_embed("None of them have a linked Discord account, so nobody was pinged."),
+                ]
             )
             return
         head = f"Not seen in {clan_name} for {days}+ days:"

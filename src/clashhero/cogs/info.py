@@ -8,23 +8,28 @@ from typing import Any
 import discord
 from discord import app_commands
 
-from clashhero.cogs._base import BaseCog
+from clashhero.cogs._base import BaseCog, send_error
 from clashhero.cogs._info_embeds import (
+    PAGE_LABELS,
+    PLAYER_PAGE_TEMPLATE,
+    PLAYER_PAGES,
     activity_histogram,
     ago,
-    format_units,
+    pack_blocks,
+    player_page_id,
+    profile_parts,
     render_histogram,
     render_th_distribution,
-    rushed_progress,
+    rushed_blocks,
     short,
     th_distribution,
     unit_levels,
-    upgrade_progress,
+    units_blocks,
+    upgrades_blocks,
 )
 from clashhero.constants import CLAN_TYPE_LABELS, WAR_FREQUENCY_LABELS
 from clashhero.repos import stats
-from clashhero.services.snapshots import home_units
-from clashhero.utils.fmt import chunk_lines, clan_link, make_embed, player_link, role_name, table, ts
+from clashhero.utils.fmt import clan_link, make_embed, player_link, role_name, table, ts
 from clashhero.utils.ranked import league_icon, league_name
 from clashhero.utils.resolve import (
     clan_autocomplete,
@@ -48,15 +53,6 @@ MEMBER_VIEWS = [
     app_commands.Choice(name="Join date", value="join-date"),
 ]
 
-CATEGORY_TITLES = {
-    "troops": "Troops",
-    "sieges": "Siege Machines",
-    "spells": "Spells",
-    "heroes": "Heroes",
-    "pets": "Pets",
-    "equipment": "Hero Equipment",
-}
-
 
 def season_window(choice: app_commands.Choice[str] | None):
     if choice is not None and choice.value == "previous":
@@ -68,19 +64,18 @@ def _enum(v: Any) -> str:
     return str(getattr(v, "value", v)) if v is not None else "—"
 
 
-def add_chunked_fields(embed: discord.Embed, title: str, lines: list[str]) -> None:
-    """Add lines as one or more fields, each under the 1024-char limit."""
-    for i, chunk in enumerate(chunk_lines(lines, 1000)):
-        if len(embed.fields) >= 25:
-            return
-        embed.add_field(name=title if i == 0 else f"{title} (cont.)", value=chunk or "—", inline=False)
-
-
 class Info(BaseCog):
     """Clan and player information."""
 
     clan = app_commands.Group(name="clan", description="Clan information", guild_only=True)
     player = app_commands.Group(name="player", description="Player information")
+
+    async def cog_load(self) -> None:
+        # The page buttons are persistent: register them so they keep working after a restart.
+        self.bot.add_dynamic_items(PlayerPageButton)
+
+    async def cog_unload(self) -> None:
+        self.bot.remove_dynamic_items(PlayerPageButton)
 
     # ------------------------------------------------------------------ helpers
 
@@ -326,120 +321,128 @@ class Info(BaseCog):
 
     # ------------------------------------------------------------------ /player
 
+    async def _send_page(
+        self, interaction: discord.Interaction, player: str | None, user: discord.User | None, page: str
+    ) -> None:
+        tag = await resolve_player(interaction, player, user)
+        await interaction.response.defer()
+        embeds, view = await render_player_page(self.bot, interaction.guild_id, tag, page)
+        await interaction.followup.send(embeds=embeds, view=view)
+
     @player.command(name="info", description="Player profile, linked user, name history and activity")
     @app_commands.autocomplete(player=player_autocomplete)
     async def player_info(
         self, interaction: discord.Interaction, player: str | None = None, user: discord.User | None = None
     ) -> None:
-        tag = await resolve_player(interaction, player, user)
-        await interaction.response.defer()
-        p = await self.coc.get_player(tag)
-        e = await make_embed(
-            self.bot, interaction.guild_id, title=f"{p.name} ({p.tag})", url=player_link(p.tag)
-        )
-        icon = league_icon(p)
-        if icon:
-            e.set_thumbnail(url=icon)
-        e.add_field(
-            name="Town Hall",
-            value=str(p.town_hall)
-            + (f" (weapon {p.town_hall_weapon})" if getattr(p, "town_hall_weapon", None) else ""),
-        )
-        e.add_field(name="Level", value=str(p.exp_level))
-        e.add_field(name="Trophies", value=f"{p.trophies} (best {p.best_trophies})")
-        e.add_field(name="League", value=league_name(p) or "Unranked")
-        e.add_field(name="War Stars", value=str(p.war_stars))
-        pref = getattr(p, "war_opted_in", None)
-        e.add_field(name="War Preference", value="In" if pref else "Out" if pref is False else "—")
-        if p.clan:
-            e.add_field(
-                name="Clan", value=f"[{p.clan.name}]({clan_link(p.clan.tag)}) · {role_name(_enum(p.role))}"
-            )
-        if p.attack_wins or p.defense_wins:  # the API reports 0/0 for everyone since the ranked rework
-            e.add_field(name="Attacks / Defenses won", value=f"{p.attack_wins} / {p.defense_wins}")
-        e.add_field(name="Capital Gold", value=f"{getattr(p, 'clan_capital_contributions', 0) or 0:,}")
-
-        for title, kind, sep in (
-            ("Heroes", "heroes", " · "),
-            ("Equipment", "equipment", ", "),
-            ("Pets", "pets", ", "),
-        ):
-            units = home_units(p, kind)
-            if units:
-                e.add_field(name=title, value=sep.join(f"{n} {lvl}" for n, lvl in units)[:1024], inline=False)
-
-        link = await self.db.get_link(p.tag)
-        if link:
-            e.add_field(
-                name="Discord", value=f"<@{link['discord_user_id']}>" + (" ✅" if link["verified"] else "")
-            )
-        row = await self.db.get_player_row(p.tag)
-        if row and row["last_seen"]:
-            e.add_field(name="Last Seen", value=ts(row["last_seen"]))
-        totals = await stats.player_season_totals(self.db, p.tag, game_season().id)
-        if totals and totals["donations"] is not None:
-            e.add_field(
-                name="Season Donations", value=f"{totals['donations']:,} / {totals['received']:,} received"
-            )
-        names = [r["name"] for r in await self.db.name_history(p.tag) if r["name"] != p.name]
-        if names:
-            e.add_field(name="Previous Names", value=", ".join(names[-10:])[:1024], inline=False)
-        await interaction.followup.send(embed=e)
-
-    async def _units(self, interaction: discord.Interaction, player: str | None, user: discord.User | None):
-        tag = await resolve_player(interaction, player, user)
-        await interaction.response.defer()
-        p = await self.coc.get_player(tag)
-        return p, unit_levels(p)
+        await self._send_page(interaction, player, user, "profile")
 
     @player.command(name="units", description="Troop, spell, hero and pet levels vs max for the TH")
     @app_commands.autocomplete(player=player_autocomplete)
     async def player_units(
         self, interaction: discord.Interaction, player: str | None = None, user: discord.User | None = None
     ) -> None:
-        p, units = await self._units(interaction, player, user)
-        _, prog = upgrade_progress(units)
-        e = await make_embed(self.bot, interaction.guild_id, title=f"Units · {p.name} (TH{p.town_hall})")
-        for cat, lines in format_units(units).items():
-            add_chunked_fields(e, CATEGORY_TITLES.get(cat, cat), lines)
-        e.set_footer(text=f"{prog.percent:.1f}% of TH{p.town_hall} max levels")
-        await interaction.followup.send(embed=e)
+        await self._send_page(interaction, player, user, "units")
 
     @player.command(name="upgrades", description="Remaining upgrades for the current Town Hall")
     @app_commands.autocomplete(player=player_autocomplete)
     async def player_upgrades(
         self, interaction: discord.Interaction, player: str | None = None, user: discord.User | None = None
     ) -> None:
-        p, units = await self._units(interaction, player, user)
-        pending, prog = upgrade_progress(units)
-        e = await make_embed(
-            self.bot, interaction.guild_id, title=f"Remaining upgrades · {p.name} (TH{p.town_hall})"
-        )
-        if not pending:
-            e.description = "Everything is maxed for this Town Hall. 🎉"
-        for cat, lines in format_units(pending, show="remaining").items():
-            add_chunked_fields(e, CATEGORY_TITLES.get(cat, cat), lines)
-        e.set_footer(text=f"{prog.percent:.1f}% complete · {prog.total - prog.done} levels remaining")
-        await interaction.followup.send(embed=e)
+        await self._send_page(interaction, player, user, "upgrades")
 
     @player.command(name="rushed", description="Units below the previous Town Hall's max levels")
     @app_commands.autocomplete(player=player_autocomplete)
     async def player_rushed(
         self, interaction: discord.Interaction, player: str | None = None, user: discord.User | None = None
     ) -> None:
-        p, units = await self._units(interaction, player, user)
-        rushed, prog = rushed_progress(units)
-        e = await make_embed(
-            self.bot,
-            interaction.guild_id,
-            title=f"Rushed check · {p.name} (TH{p.town_hall})",
-            description=f"**{prog.percent:.1f}% rushed** ({prog.done} levels below TH{p.town_hall - 1} max)"
-            if rushed
-            else f"Not rushed: everything is at least TH{p.town_hall - 1} max. ✅",
+        await self._send_page(interaction, player, user, "rushed")
+
+
+# ------------------------------------------------------------------ player pages
+
+
+async def render_player_page(
+    client, guild_id: int | None, tag: str, page: str
+) -> tuple[list[discord.Embed], discord.ui.View]:
+    """Fetch a player and build one page of their card (embeds plus the page buttons)."""
+    p = await client.coc.get_player(tag)
+    title, url = f"{p.name} ({p.tag})", player_link(p.tag)
+    if page == "profile":
+        embed = await make_embed(client, guild_id, title=title, url=url)
+        link = await client.db.get_link(p.tag)
+        row = await client.db.get_player_row(p.tag)
+        totals = await stats.player_season_totals(client.db, p.tag, game_season().id)
+        names = [r["name"] for r in await client.db.name_history(p.tag) if r["name"] != p.name]
+        embed.description, fields = profile_parts(
+            p,
+            discord_id=link["discord_user_id"] if link else None,
+            verified=bool(link and link["verified"]),
+            last_seen=row["last_seen"] if row else None,
+            season=(totals["donations"], totals["received"] or 0)
+            if totals and totals["donations"] is not None
+            else None,
+            names=names,
         )
-        for cat, lines in format_units(rushed, show="rushed").items():
-            add_chunked_fields(e, CATEGORY_TITLES.get(cat, cat), lines)
-        await interaction.followup.send(embed=e)
+        for name, value, inline in fields[:25]:
+            embed.add_field(name=name, value=value or "—", inline=inline)
+        icon = league_icon(p)
+        if icon:
+            embed.set_thumbnail(url=icon)
+        embeds = [embed]
+    else:
+        builder = {"units": units_blocks, "upgrades": upgrades_blocks, "rushed": rushed_blocks}[page]
+        pages = pack_blocks(builder(unit_levels(p), p.town_hall or 0))
+        first = await make_embed(client, guild_id, title=title, url=url, description=pages[0])
+        embeds = [first, *(discord.Embed(color=first.color, description=d) for d in pages[1:])]
+    embeds[-1].set_footer(text=f"{PAGE_LABELS[page]} · TH{p.town_hall}")
+    embeds[-1].timestamp = datetime.now(UTC)
+    return embeds, player_page_view(page, p.tag)
+
+
+def player_page_view(page: str, tag: str) -> discord.ui.View:
+    """Profile · Units · Upgrades · Rushed · ↻ buttons; the current page's button is highlighted
+    and disabled."""
+    view = discord.ui.View(timeout=None)
+    for name in PLAYER_PAGES:
+        view.add_item(PlayerPageButton(name, tag, current=name == page))
+    view.add_item(PlayerPageButton(page, tag, refresh=True))
+    return view
+
+
+class PlayerPageButton(discord.ui.DynamicItem[discord.ui.Button], template=PLAYER_PAGE_TEMPLATE):
+    """Switches a player card to another page (or refreshes it), fetching the player again.
+    Persistent: works on old messages after a restart. Anyone may click; the pages are read-only."""
+
+    def __init__(self, page: str, tag: str, *, current: bool = False, refresh: bool = False) -> None:
+        if refresh:
+            button = discord.ui.Button(
+                label="↻",
+                style=discord.ButtonStyle.secondary,
+                custom_id=player_page_id(page, tag, refresh=True),
+            )
+        else:
+            button = discord.ui.Button(
+                label=PAGE_LABELS[page],
+                style=discord.ButtonStyle.primary if current else discord.ButtonStyle.secondary,
+                disabled=current,
+                custom_id=player_page_id(page, tag),
+            )
+        super().__init__(button)
+        self.page, self.tag = page, f"#{tag.lstrip('#')}"
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match):
+        return cls(match["page"], match["tag"], refresh=bool(match["refresh"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            await interaction.response.defer()
+            embeds, view = await render_player_page(
+                interaction.client, interaction.guild_id, self.tag, self.page
+            )
+            await interaction.edit_original_response(embeds=embeds, view=view)
+        except Exception as e:  # buttons have no command error handler
+            await send_error(interaction, e)
 
 
 async def setup(bot) -> None:

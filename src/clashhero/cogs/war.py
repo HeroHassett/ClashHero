@@ -12,13 +12,16 @@ from clashhero.cogs._base import BaseCog
 from clashhero.cogs._war_embeds import (
     PERIOD_CHOICES,
     WAR_TYPE_CHOICES,
-    attack_table,
-    defense_table,
+    attack_rank_table,
+    attack_totals,
+    defense_rank_table,
+    defense_totals,
     history_embed,
     lineup_embed,
     period_bounds,
     resolve_player_tags,
     state_value,
+    stats_footer,
     war_overview_embed,
     war_sides,
 )
@@ -276,7 +279,7 @@ class War(BaseCog):
 
     # ------------------------------------------------------------------ /stats
 
-    @stats.command(name="attacks", description="War hit rates per player (3★ %, avg stars, missed)")
+    @stats.command(name="attacks", description="War 3★ hit rates per player")
     @app_commands.describe(
         clans="Clan tags/aliases separated by spaces (default: all)", town_hall="Only attackers of this TH"
     )
@@ -293,27 +296,25 @@ class War(BaseCog):
     ) -> None:
         tags = await resolve_clans(interaction, clans)
         since, until, label = period_bounds(period.value if period else None)
+        kind = war_type.value if war_type else None
         rows = await war_repo.attack_leaderboard(
-            self.db,
-            tags,
-            since=since,
-            until=until,
-            war_type=war_type.value if war_type else None,
-            town_hall=town_hall,
+            self.db, tags, since=since, until=until, war_type=kind, town_hall=town_hall
         )
-        rows = [r for r in rows if r[1].attacks >= min_attacks][:40]
-        names = await war_repo.player_names(self.db, [t for t, _ in rows])
-        desc = (
-            f"{label}"
-            + (f" · TH{town_hall}" if town_hall else "")
-            + (f" · {war_type.name}" if war_type else "")
-        )
+        rows = [r for r in rows if r[1].attacks >= min_attacks]
+        wars = await war_repo.count_wars(self.db, tags, since=since, until=until, war_type=kind)
+        top = rows[:40]
+        names = await war_repo.player_names(self.db, [t for t, _ in top])
         e = await make_embed(
             self.bot,
             interaction.guild_id,
-            title="War attack stats",
-            description=(desc + "\n" + attack_table(rows, names))[:4096],
+            title="War hit rates (3★)",
+            description=(
+                attack_totals(rows) + "\n" + attack_rank_table(top, names)
+                if rows
+                else "No war attacks recorded for these filters."
+            ),
         )
+        e.set_footer(text=stats_footer(war_type.name if war_type else None, label, wars, town_hall))
         await interaction.response.send_message(embed=e)
 
     @stats.command(name="defense", description="War defense hold rates per player")
@@ -332,23 +333,24 @@ class War(BaseCog):
     ) -> None:
         tags = await resolve_clans(interaction, clans)
         since, until, label = period_bounds(period.value if period else None)
-        rows = (
-            await war_repo.defense_leaderboard(
-                self.db,
-                tags,
-                since=since,
-                until=until,
-                war_type=war_type.value if war_type else None,
-                town_hall=town_hall,
-            )
-        )[:40]
-        names = await war_repo.player_names(self.db, [t for t, _ in rows])
+        kind = war_type.value if war_type else None
+        rows = await war_repo.defense_leaderboard(
+            self.db, tags, since=since, until=until, war_type=kind, town_hall=town_hall
+        )
+        wars = await war_repo.count_wars(self.db, tags, since=since, until=until, war_type=kind)
+        top = rows[:40]
+        names = await war_repo.player_names(self.db, [t for t, _ in top])
         e = await make_embed(
             self.bot,
             interaction.guild_id,
-            title="War defense stats",
-            description=(label + "\n" + defense_table(rows, names))[:4096],
+            title="War defense hold rates (not tripled)",
+            description=(
+                defense_totals(rows) + "\n" + defense_rank_table(top, names)
+                if rows
+                else "No war defenses recorded for these filters."
+            ),
         )
+        e.set_footer(text=stats_footer(war_type.name if war_type else None, label, wars, town_hall))
         await interaction.response.send_message(embed=e)
 
 

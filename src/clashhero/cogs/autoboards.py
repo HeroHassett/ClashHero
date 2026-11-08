@@ -22,6 +22,7 @@ from clashhero.utils.checks import manager
 from clashhero.utils.fmt import make_embed, signed, table, ts
 from clashhero.utils.resolve import ResolveError, resolve_clans
 from clashhero.utils.seasons import Window, clan_games, game_season, legend_day_id
+from clashhero.utils.style import ICONS, SEP, ok_embed
 
 log = logging.getLogger(__name__)
 
@@ -467,8 +468,10 @@ class Autoboards(BaseCog):
             row = await repo.get_board(self.db, gid, board_id)
         nxt = repo.next_post_time(sched, now, repo.from_iso(row["last_run"]) if row else None)
         await interaction.followup.send(
-            f"Board `#{board_id}` **{board.name}** · {sched.describe()} → {mention}. "
-            f"{note}{'next' if note else 'Next'} {'update' if sched.is_live else 'post'} {ts(nxt)}.",
+            embed=ok_embed(
+                f"Board `#{board_id}` **{board.name}** · {sched.describe()} → {mention}.\n"
+                f"{note}{'next' if note else 'Next'} {'update' if sched.is_live else 'post'} {ts(nxt)}."
+            ),
             ephemeral=True,
         )
 
@@ -487,7 +490,7 @@ class Autoboards(BaseCog):
             nxt = repo.next_post_time(s, now, repo.from_iso(r["last_run"]))
             lines.append(
                 f"`#{r['id']}` **{repo.BOARD_TYPES.get(r['board_type'], r['board_type'])}** → "
-                f"<#{r['channel_id']}>\n{s.describe()} · {clans} · next {ts(nxt)}"
+                f"<#{r['channel_id']}>\n{ICONS['time']} {SEP.join((s.describe(), clans, f'next {ts(nxt)}'))}"
             )
         embed = await make_embed(
             self.bot,
@@ -511,7 +514,9 @@ class Autoboards(BaseCog):
                     await ch.get_partial_message(row["message_id"]).delete()  # type: ignore[attr-defined]
             except discord.HTTPException:
                 pass
-        await interaction.response.send_message(f"Deleted board `#{board_id}`.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=ok_embed(f"Deleted board `#{board_id}`."), ephemeral=True
+        )
 
     @autoboard.command(
         name="post-now", description="Post (or refresh, if live) a board right now (Bot Manager)"
@@ -538,7 +543,7 @@ class Autoboards(BaseCog):
         if status != "ok":
             raise ResolveError(f"Couldn't post in <#{row['channel_id']}>. Check my permissions there.")
         await interaction.followup.send(
-            f"Posted board `#{board_id}` in <#{row['channel_id']}>.", ephemeral=True
+            embed=ok_embed(f"Posted board `#{board_id}` in <#{row['channel_id']}>."), ephemeral=True
         )
 
 

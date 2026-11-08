@@ -19,6 +19,7 @@ from clashhero import __version__
 from clashhero.cogs._base import BaseCog
 from clashhero.events import MaintenanceChanged
 from clashhero.utils.fmt import duration, make_embed, ts
+from clashhero.utils.style import SEP, chip
 
 log = logging.getLogger(__name__)
 
@@ -134,10 +135,13 @@ class Status(BaseCog):
         ):
             e.add_field(name=name, value=value, inline=False)
         players = await self.db.fetchval("SELECT COUNT(*) FROM players", (), 0)
-        e.add_field(name="Tracking", value=f"{await self._clan_count()} clans · {players} players")
-        e.add_field(name="Servers", value=str(len(self.bot.guilds)))
+        clans = await self._clan_count()
+        e.add_field(name="Tracking", value=f"{chip(f'{clans:,}')} clans{SEP}{chip(f'{players:,}')} players")
+        e.add_field(name="Servers", value=chip(f"{len(self.bot.guilds):,}"))
         latency = self.bot.latency
-        e.add_field(name="Discord latency", value=f"{latency * 1000:.0f} ms" if latency == latency else "—")
+        e.add_field(
+            name="Discord latency", value=chip(f"{latency * 1000:.0f} ms") if latency == latency else "—"
+        )
         e.set_footer(text=f"ClashHero {__version__} · up {duration((now - self.started_at).total_seconds())}")
         await interaction.response.send_message(embed=e, ephemeral=True)
 

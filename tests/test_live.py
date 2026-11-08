@@ -80,3 +80,12 @@ def test_clan_showcase():
     e = L.clan_showcase_embed(clan, [{"town_hall": 16}, {"town_hall": 16}], "desc")
     assert "TH16×2" in e.fields[-1].value
     assert L.clan_showcase_embed(None, [], None).title
+
+
+def test_live_line():
+    from clashhero.cogs.live import live_line
+
+    assert (
+        live_line({"kind": "war_embed", "scope": "#A", "channel_id": 5}) == "📡 **Current war** · `#A` → <#5>"
+    )
+    assert live_line({"kind": "other", "scope": "", "channel_id": 5}) == "📡 **other** · `server` → <#5>"

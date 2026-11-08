@@ -25,6 +25,7 @@ from clashhero.utils.checks import manager
 from clashhero.utils.fmt import make_embed
 from clashhero.utils.resolve import ResolveError, clan_autocomplete, resolve_clan
 from clashhero.utils.seasons import game_season
+from clashhero.utils.style import header, ok_embed
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +45,30 @@ def parse_color(raw: str | None) -> int | None:
         return int(raw.strip().lstrip("#").removeprefix("0x"), 16) & 0xFFFFFF
     except ValueError as e:
         raise ResolveError(f"`{raw}` isn't a hex color like `#00ff88`.") from e
+
+
+def log_list_lines(clan_rows, server_rows, clan_names: dict[str, str]) -> list[str]:
+    """/logs list body: one block per clan (header with name and tag), then server logs."""
+    lines: list[str] = []
+    current = None
+    for r in clan_rows:
+        tag = r["clan_tag"]
+        if tag != current:
+            if lines:
+                lines.append("")
+            lines.append(header(clan_names.get(tag) or tag, "clan", f"`{tag}`"))
+            current = tag
+        ping = f" · ping <@&{r['ping_role_id']}>" if r["ping_role_id"] else ""
+        lines.append(f"{CLAN_LOG_TYPES.get(r['log_type'], r['log_type'])} → <#{r['channel_id']}>{ping}")
+    if server_rows:
+        if lines:
+            lines.append("")
+        lines.append(header("Server", "🖥️"))
+        lines += [
+            f"{SERVER_LOG_TYPES.get(r['log_type'], r['log_type'])} → <#{r['channel_id']}>"
+            for r in server_rows
+        ]
+    return lines
 
 
 def merge_unit_changes(
@@ -107,10 +132,12 @@ class Logs(BaseCog):
         disable: bool = False,
     ) -> None:
         tag = await resolve_clan(interaction, clan)
+        row = await self.db.get_clan_row(tag)
+        label = f"**{row['name']}** `{tag}`" if row and row["name"] else f"`{tag}`"
         if disable:
             await self.db.set_clan_log(interaction.guild_id, tag, log_type.value, None)
             await interaction.response.send_message(
-                f"Disabled **{log_type.name}** for `{tag}`.", ephemeral=True
+                embed=ok_embed(f"Disabled **{log_type.name}** for {label}."), ephemeral=True
             )
             return
         target = channel or interaction.channel
@@ -122,8 +149,10 @@ class Logs(BaseCog):
             ping_role.id if ping_role else None,
             parse_color(color),
         )
+        ping = f", pinging {ping_role.mention}" if ping_role else ""
         await interaction.response.send_message(
-            f"**{log_type.name}** for `{tag}` will post in {target.mention}.", ephemeral=True
+            embed=ok_embed(f"**{log_type.name}** for {label} will post in {target.mention}{ping}."),
+            ephemeral=True,
         )
 
     @logs.command(name="server", description="Enable or disable a server-wide log")
@@ -138,12 +167,14 @@ class Logs(BaseCog):
     ) -> None:
         if disable:
             await self.db.set_server_log(interaction.guild_id, log_type.value, None)
-            await interaction.response.send_message(f"Disabled **{log_type.name}**.", ephemeral=True)
+            await interaction.response.send_message(
+                embed=ok_embed(f"Disabled **{log_type.name}**."), ephemeral=True
+            )
             return
         target = channel or interaction.channel
         await self.db.set_server_log(interaction.guild_id, log_type.value, target.id)
         await interaction.response.send_message(
-            f"**{log_type.name}** will post in {target.mention}.", ephemeral=True
+            embed=ok_embed(f"**{log_type.name}** will post in {target.mention}."), ephemeral=True
         )
 
     @logs.command(name="list", description="Show configured logs")
@@ -152,17 +183,8 @@ class Logs(BaseCog):
         server_rows = await self.db.fetchall(
             "SELECT * FROM server_logs WHERE guild_id = ? ORDER BY log_type", (interaction.guild_id,)
         )
-        lines = []
-        for r in clan_rows:
-            ping = f" ping <@&{r['ping_role_id']}>" if r["ping_role_id"] else ""
-            lines.append(
-                f"`{r['clan_tag']}` {CLAN_LOG_TYPES.get(r['log_type'], r['log_type'])} "
-                f"→ <#{r['channel_id']}>{ping}"
-            )
-        for r in server_rows:
-            lines.append(
-                f"Server: {SERVER_LOG_TYPES.get(r['log_type'], r['log_type'])} → <#{r['channel_id']}>"
-            )
+        names = {r["clan_tag"]: r["name"] for r in await self.db.get_guild_clan_rows(interaction.guild_id)}
+        lines = log_list_lines(clan_rows, server_rows, names)
         embed = await make_embed(
             self.bot,
             interaction.guild_id,

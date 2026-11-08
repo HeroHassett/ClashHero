@@ -49,6 +49,7 @@ from clashhero.utils.seasons import (
     season_for_date,
     season_label,
 )
+from clashhero.utils.style import SEP, chip, fail_embed, header, ok_embed
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +66,18 @@ def _now() -> datetime:
 async def _player_name(bot, tag: str) -> str:
     row = await bot.db.get_player_row(tag)
     return row["name"] if row else tag
+
+
+def alert_line(sub, where: str) -> str:
+    """One /track list row: ``` `#12` **Name** `#TAG` → DM · ⚔️ on · 🛡️ off```."""
+    name = sub["name"] or "?"
+    return SEP.join(
+        (
+            f"`#{sub['id']}` **{name}** `{sub['player_tag']}` → {where}",
+            f"⚔️ {'on' if sub['attacks'] else 'off'}",
+            f"🛡️ {'on' if sub['defenses'] else 'off'}",
+        )
+    )
 
 
 async def _can_manage_sub(interaction: discord.Interaction, sub) -> bool:
@@ -112,17 +125,21 @@ class MuteAttacksButton(discord.ui.DynamicItem[discord.ui.Button], template=r"lg
         db = interaction.client.db
         sub = await repo.get_subscription(db, self.sub_id)
         if sub is None:
-            await interaction.response.send_message("This alert no longer exists.", ephemeral=True)
+            await interaction.response.send_message(
+                embed=fail_embed("This alert no longer exists."), ephemeral=True
+            )
             return
         if not await _can_manage_sub(interaction, sub):
             await interaction.response.send_message(
-                "Only the subscriber, whoever set this up, or a manager can do that.", ephemeral=True
+                embed=fail_embed("Only the subscriber, whoever set this up, or a manager can do that."),
+                ephemeral=True,
             )
             return
         new = 0 if sub["attacks"] else 1
         await repo.update_subscription(db, self.sub_id, attacks=new)
         await interaction.response.send_message(
-            f"Attack alerts {'unmuted' if new else 'muted'} for `{sub['player_tag']}`.", ephemeral=True
+            embed=ok_embed(f"Attack alerts {'unmuted' if new else 'muted'} for `{sub['player_tag']}`."),
+            ephemeral=True,
         )
 
 
@@ -173,11 +190,15 @@ class ViewArmyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"lg:ar
         client = interaction.client
         battle = await repo.get_battle(client.db, self.event_id)
         if battle is None or not battle["army_share_code"]:
-            await interaction.response.send_message("No army is recorded for this battle.", ephemeral=True)
+            await interaction.response.send_message(
+                embed=fail_embed("No army is recorded for this battle."), ephemeral=True
+            )
             return
         embed = battle_army_embed(client, battle, await guild_color(client, interaction.guild_id))
         if embed is None:
-            await interaction.response.send_message("Couldn't read this battle's army.", ephemeral=True)
+            await interaction.response.send_message(
+                embed=fail_embed("Couldn't read this battle's army."), ephemeral=True
+            )
             return
         view = discord.ui.View()
         url = _copy_army_url(battle["army_share_code"])
@@ -245,7 +266,9 @@ class OwnerView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("This menu isn't yours.", ephemeral=True)
+            await interaction.response.send_message(
+                embed=fail_embed("This menu isn't yours."), ephemeral=True
+            )
             return False
         return True
 
@@ -496,9 +519,9 @@ class Legends(BaseCog):
         what = " and ".join(x for x, on in (("attacks", attacks), ("defenses", defenses)) if on)
         note = ""
         if not is_tracked_ranked(league_name(p)):
-            note = "\nNote: alerts start once the player reaches Dragon League 28 or higher."
+            note = "\nℹ️ Alerts start once the player reaches Dragon League 28 or higher."
         await interaction.followup.send(
-            f"Tracking **{p.name}** (`{p.tag}`): {what} → {where}.{note}", ephemeral=True
+            embed=ok_embed(f"Tracking **{p.name}** `{p.tag}`: {what} → {where}.{note}"), ephemeral=True
         )
 
     @track.command(name="remove", description="Stop alerts for a player")
@@ -510,31 +533,21 @@ class Legends(BaseCog):
             raise ResolveError(f"You have no alerts for `{tag}` that you can remove.")
         for s in subs:
             await repo.delete_subscription(self.db, s["id"])
-        await interaction.response.send_message(f"Removed {len(subs)} alert(s) for `{tag}`.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=ok_embed(f"Removed {chip(len(subs))} alert(s) for `{tag}`."), ephemeral=True
+        )
 
     @track.command(name="list", description="List your alerts (managers also see this server's)")
     async def track_list(self, interaction: discord.Interaction) -> None:
         gid = interaction.guild_id if await has_permission(interaction) else None
         subs = await repo.list_subscriptions(self.db, user_id=interaction.user.id, guild_id=gid)
-        if not subs:
-            await interaction.response.send_message("No alerts set up.", ephemeral=True)
-            return
-        rows = [
-            [
-                s["id"],
-                (s["name"] or s["player_tag"])[:15],
-                "DM"
-                if s["channel_id"] == 0
-                else f"#{getattr(self.bot.get_channel(s['channel_id']), 'name', s['channel_id'])}"[:15],
-                "on" if s["attacks"] else "off",
-                "on" if s["defenses"] else "off",
-            ]
-            for s in subs
-        ]
+        lines = [alert_line(s, "DM" if s["channel_id"] == 0 else f"<#{s['channel_id']}>") for s in subs]
+        if lines:
+            lines.insert(0, header("Alerts", "🔔", chip(len(subs))))
         embed = discord.Embed(
             title="Legend alerts",
             color=await guild_color(self.bot, interaction.guild_id),
-            description=table(rows, ["ID", "Player", "To", "Atk", "Def"])[:4000],
+            description="\n".join(lines)[:4000] or "No alerts set up. Use `/track add`.",
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -575,7 +588,9 @@ class Legends(BaseCog):
                 await repo.update_subscription(self.db, s["id"], **changes)
             except sqlite3.IntegrityError as e:  # would duplicate an existing alert
                 raise ResolveError("That would duplicate an existing alert.") from e
-        await interaction.response.send_message(f"Updated {len(subs)} alert(s).", ephemeral=True)
+        await interaction.response.send_message(
+            embed=ok_embed(f"Updated {chip(len(subs))} alert(s) for `{tag}`."), ephemeral=True
+        )
 
     # -------------------------------------------------------------- /legends
 
@@ -758,7 +773,7 @@ class Legends(BaseCog):
                     pass
         await self.db.upsert_live_message(interaction.guild_id, BOARD_KIND, "", channel.id, None)
         await interaction.response.send_message(
-            f"Leaderboard will live in {channel.mention}.", ephemeral=True
+            embed=ok_embed(f"The live legend leaderboard will post in {channel.mention}."), ephemeral=True
         )
         await self._refresh_board(await self._board_row(interaction.guild_id))
 
@@ -770,8 +785,14 @@ class Legends(BaseCog):
         await interaction.response.defer(ephemeral=True)
         p = await self.coc.get_player(tag)
         added = await repo.board_add(self.db, interaction.guild_id, [p.tag])
-        msg = f"Added **{p.name}**." if added else f"Not added (already listed or {repo.BOARD_LIMIT} max)."
-        await interaction.followup.send(msg, ephemeral=True)
+        embed = (
+            ok_embed(f"Added **{p.name}** `{p.tag}` to the leaderboard.")
+            if added
+            else fail_embed(
+                f"Not added: **{p.name}** is already listed, or the board is full ({repo.BOARD_LIMIT})."
+            )
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @legendboard.command(
         name="import", description="Add a clan's ranked members (Dragon 28+) to the leaderboard"
@@ -797,7 +818,10 @@ class Legends(BaseCog):
             await repo.board_clear(self.db, interaction.guild_id)
         added = await repo.board_add(self.db, interaction.guild_id, tags)
         await interaction.followup.send(
-            f"Imported {added} of {len(tags)} ranked members (Dragon 28+) from **{c.name}**.", ephemeral=True
+            embed=ok_embed(
+                f"Imported {chip(f'{added}/{len(tags)}')} ranked members (Dragon 28+) from **{c.name}**."
+            ),
+            ephemeral=True,
         )
 
     @legendboard.command(name="remove", description="Remove a player from the leaderboard")
@@ -807,7 +831,10 @@ class Legends(BaseCog):
         tag = parse_tag(player)
         ok = await repo.board_remove(self.db, interaction.guild_id, tag)
         await interaction.response.send_message(
-            f"Removed `{tag}`." if ok else f"`{tag}` isn't on the leaderboard.", ephemeral=True
+            embed=ok_embed(f"Removed `{tag}` from the leaderboard.")
+            if ok
+            else fail_embed(f"`{tag}` isn't on the leaderboard."),
+            ephemeral=True,
         )
 
     @legendboard.command(name="list", description="Players on the leaderboard")
@@ -830,14 +857,16 @@ class Legends(BaseCog):
         row = await self._board_row(interaction.guild_id)
         if row is None:
             raise ResolveError("Set a channel first with `/legendboard setchannel`.")
-        await interaction.response.send_message("Refreshing the leaderboard.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=ok_embed(f"Refreshing the leaderboard in <#{row['channel_id']}>."), ephemeral=True
+        )
         await self._refresh_board(row)
 
     @legendboard.command(name="disable", description="Stop updating the live leaderboard")
     @manager()
     async def board_disable(self, interaction: discord.Interaction) -> None:
         await self.db.delete_live_message(interaction.guild_id, BOARD_KIND, "")
-        await interaction.response.send_message("Live leaderboard disabled.", ephemeral=True)
+        await interaction.response.send_message(embed=ok_embed("Live leaderboard disabled."), ephemeral=True)
 
     # -------------------------------------------------------------- /top
 

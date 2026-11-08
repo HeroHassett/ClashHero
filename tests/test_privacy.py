@@ -90,3 +90,13 @@ async def test_retention(db):
     report = await privacy.purge_old_data(db, NOW)
     assert report.rows["activity"] == 1 and report.rows["wars"] == 1 and report.rows["players"] == 1
     assert await db.fetchval("SELECT COUNT(*) FROM players") == 1
+
+
+def test_record_lines_align_counts():
+    from clashhero.cogs.privacy import record_lines
+
+    assert record_lines({"links": 3, "flags (created by you)": 1200}) == [
+        "`1,200` flags (created by you)",
+        "`    3` links",
+    ]
+    assert record_lines({}) == []

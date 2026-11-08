@@ -19,6 +19,7 @@ from clashhero.repos import rosters as repo
 from clashhero.utils.checks import manager, require
 from clashhero.utils.fmt import make_embed
 from clashhero.utils.resolve import ResolveError, clan_autocomplete, player_autocomplete, resolve_clan
+from clashhero.utils.style import SEP, chip, chip_width, fail_embed, ok_embed
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +60,24 @@ def parse_color(raw: str | None) -> int | None:
         return int(raw.strip().lstrip("#"), 16)
     except ValueError as e:
         raise ResolveError(f"`{raw}` isn't a hex color like `#ff8800`.") from e
+
+
+def roster_count(r) -> str:
+    return f"{r['member_count']}/{r['max_members']}"
+
+
+def roster_list_line(r, width: int | None = None) -> str:
+    """One /roster list row: ``` `12/15` **CWL main** · CWL · Clan · 🔔 · 🔒```."""
+    parts = [
+        f"{chip(roster_count(r), width)} **{r['name']}**",
+        r["category"].upper(),
+        r["clan_name"] or r["clan_tag"],
+    ]
+    if repo.describe_autoping(r):
+        parts.append("🔔")
+    if r["closed"]:
+        parts.append("🔒")
+    return SEP.join(parts)
 
 
 async def roster_autocomplete(
@@ -228,7 +247,7 @@ class Rosters(BaseCog):
             end_time=parse_time(end_time),
             color=parse_color(color),
         )
-        msg = f"Created roster **{name}** (#{rid}). Post it with `/roster post`."
+        msg = f"Created roster **{name}** `#{rid}`. Post it with `/roster post`."
         if import_members:
             await interaction.response.defer(ephemeral=True, thinking=True)
             roster = await repo.get_roster(self.db, rid)
@@ -236,10 +255,10 @@ class Rosters(BaseCog):
             res = await views.signup(
                 self.bot, interaction.guild, roster, tags, actor=interaction.user, as_manager=True
             )
-            msg += f"\nImported {len(res.added)} member(s); skipped {len(res.errors)}."
-            await interaction.followup.send(msg, ephemeral=True)
+            msg += f"\nImported {chip(len(res.added))} member(s){SEP}skipped {chip(len(res.errors))}."
+            await interaction.followup.send(embed=ok_embed(msg), ephemeral=True)
             return
-        await interaction.response.send_message(msg, ephemeral=True)
+        await interaction.response.send_message(embed=ok_embed(msg), ephemeral=True)
 
     @roster.command(name="edit", description="Change a roster's settings")
     @app_commands.choices(category=CATEGORY_CHOICES, sort_by=SORT_CHOICES)
@@ -313,12 +332,12 @@ class Rosters(BaseCog):
         if color:
             fields["color"] = parse_color(color)
         if not fields:
-            await interaction.response.send_message("Nothing to change.", ephemeral=True)
+            await interaction.response.send_message(embed=fail_embed("Nothing to change."), ephemeral=True)
             return
         await repo.update_roster(self.db, row["id"], **fields)
         await views.refresh_post(self.bot, row["id"])
         await interaction.response.send_message(
-            f"Updated **{fields.get('name', row['name'])}**.", ephemeral=True
+            embed=ok_embed(f"Updated roster **{fields.get('name', row['name'])}**."), ephemeral=True
         )
 
     @roster.command(name="clone", description="Copy a roster's settings and groups (not members)")
@@ -332,7 +351,7 @@ class Rosters(BaseCog):
             raise ResolveError(f"A roster named **{new_name}** already exists.")
         rid = await repo.clone_roster(self.db, row["id"], new_name)
         await interaction.response.send_message(
-            f"Cloned **{row['name']}** → **{new_name}** (#{rid}).", ephemeral=True
+            embed=ok_embed(f"Cloned **{row['name']}** → **{new_name}** `#{rid}`."), ephemeral=True
         )
 
     @roster.command(name="delete", description="Delete a roster and its signups")
@@ -341,7 +360,9 @@ class Rosters(BaseCog):
     async def delete(self, interaction: discord.Interaction, roster: str) -> None:
         row = await get_roster_or_fail(interaction, roster)
         await repo.delete_roster(self.db, row["id"])
-        await interaction.response.send_message(f"Deleted roster **{row['name']}**.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=ok_embed(f"Deleted roster **{row['name']}** and its signups."), ephemeral=True
+        )
 
     # ------------------------------------------------------------------ viewing / posting
 
@@ -359,7 +380,7 @@ class Rosters(BaseCog):
         )
         await repo.update_roster(self.db, row["id"], channel_id=target.id, message_id=msg.id)
         await interaction.response.send_message(
-            f"Posted **{row['name']}** in {target.mention}.", ephemeral=True
+            embed=ok_embed(f"Posted **{row['name']}** in {target.mention}."), ephemeral=True
         )
 
     @roster.command(name="show", description="Show a roster")
@@ -381,19 +402,16 @@ class Rosters(BaseCog):
         rows = await repo.list_rosters(
             self.db, interaction.guild_id, tag, category.value if category else None
         )
-        lines = [
-            f"**{r['name']}** · {r['category'].upper()} · {r['clan_name'] or r['clan_tag']} · "
-            f"{r['member_count']}/{r['max_members']}"
-            + (" · 🔔" if repo.describe_autoping(r) else "")
-            + (" · 🔒" if r["closed"] else "")
-            for r in rows
-        ]
+        width = chip_width(roster_count(r) for r in rows)
+        lines = [roster_list_line(r, width) for r in rows]
         embed = await make_embed(
             self.bot,
             interaction.guild_id,
             title="Rosters",
-            description="\n".join(lines) or "No rosters yet. Use `/roster create`.",
+            description="\n".join(lines)[:4000] or "No rosters yet. Use `/roster create`.",
         )
+        if rows:
+            embed.set_footer(text="🔔 auto-ping on · 🔒 closed")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @roster.command(name="export", description="Download a roster as CSV")
@@ -404,7 +422,9 @@ class Rosters(BaseCog):
         data = repo.members_csv(members).encode()
         file = discord.File(io.BytesIO(data), filename=f"roster-{row['name'].replace(' ', '_')}.csv")
         await interaction.response.send_message(
-            f"**{row['name']}**: {len(members)} member(s).", file=file, ephemeral=True
+            embed=ok_embed(f"Exported **{row['name']}**: {chip(len(members))} member(s)."),
+            file=file,
+            ephemeral=True,
         )
 
     # ------------------------------------------------------------------ self service
@@ -422,7 +442,7 @@ class Rosters(BaseCog):
         res = await views.signup(
             self.bot, interaction.guild, row, [self.parse_tag(account)], actor=interaction.user, group_id=gid
         )
-        await interaction.followup.send(res.summary(), ephemeral=True)
+        await interaction.followup.send(embed=res.embed(), ephemeral=True)
 
     @roster.command(name="optout", description="Remove one of your accounts from a roster")
     @app_commands.autocomplete(roster=roster_autocomplete, account=player_autocomplete)
@@ -440,7 +460,9 @@ class Rosters(BaseCog):
         ):
             raise ResolveError("That account isn't yours.")
         removed = await views.opt_out(self.bot, interaction.guild, row, [tag], actor=interaction.user)
-        await interaction.response.send_message("Removed: " + ", ".join(removed), ephemeral=True)
+        await interaction.response.send_message(
+            embed=views.removed_embed(removed, row["name"]), ephemeral=True
+        )
 
     # ------------------------------------------------------------------ manager actions
 
@@ -460,8 +482,9 @@ class Rosters(BaseCog):
         row = await get_roster_or_fail(interaction, raw)
         await repo.update_roster(self.db, row["id"], closed=int(closed))
         await views.refresh_post(self.bot, row["id"])
+        state = "closed 🔒 (no self signups)" if closed else "open 🔓 for signups"
         await interaction.response.send_message(
-            f"**{row['name']}** is now {'closed 🔒' if closed else 'open'}.", ephemeral=True
+            embed=ok_embed(f"**{row['name']}** is now {state}."), ephemeral=True
         )
 
     @roster.command(name="clear", description="Remove every signup from a roster")
@@ -474,7 +497,7 @@ class Rosters(BaseCog):
             self.bot, interaction.guild, row, [m["player_tag"] for m in members], actor=interaction.user
         )
         await interaction.response.send_message(
-            f"Cleared {len(removed)} signup(s) from **{row['name']}**.", ephemeral=True
+            embed=ok_embed(f"Cleared {chip(len(removed))} signup(s) from **{row['name']}**."), ephemeral=True
         )
 
     @roster.command(name="ping", description="Ping roster members (asks for confirmation)")
@@ -498,7 +521,7 @@ class Rosters(BaseCog):
         option = ping_option.value if ping_option else "everyone"
         users = repo.compute_ping_targets(option, members, clan_tags, links, gid)
         if not users:
-            await interaction.response.send_message("Nobody to ping.", ephemeral=True)
+            await interaction.response.send_message(embed=fail_embed("Nobody to ping."), ephemeral=True)
             return
         label = f"group **{group}**" if gid else f"**{option}**"
         view = _ConfirmPing(row["name"], users, message)
@@ -609,17 +632,17 @@ class Rosters(BaseCog):
         updated = await repo.get_roster(self.db, row["id"])
         lines = [f"**{row['name']}**: {repo.describe_autoping(updated)}, in <#{channel_id}>."]
         if hours_before_end and not row["end_time"]:
-            lines.append("This roster has no end time yet; set one with `/roster edit end_time`.")
+            lines.append("⚠️ This roster has no end time yet; set one with `/roster edit end_time`.")
         if hours_before_start and not row["start_time"]:
-            lines.append("This roster has no start time yet; set one with `/roster edit start_time`.")
+            lines.append("⚠️ This roster has no start time yet; set one with `/roster edit start_time`.")
         if row["closed"]:
-            lines.append("The roster is closed, so nothing is sent until it's opened again.")
+            lines.append("🔒 The roster is closed, so nothing is sent until it's opened again.")
         elif repo.autoping_due(updated, datetime.now(UTC)):
             lines.append(
-                f"That window is already open: the first ping goes out within "
+                f"🔔 That window is already open: the first ping goes out within "
                 f"{AUTOPING_INTERVAL_MINUTES} minutes."
             )
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        await interaction.response.send_message(embed=ok_embed("\n".join(lines)), ephemeral=True)
 
     @autoping.command(name="off", description="Stop automatic pings for a roster")
     @app_commands.autocomplete(roster=roster_autocomplete)
@@ -630,7 +653,9 @@ class Rosters(BaseCog):
             self.db, row["id"], start_hours=None, end_hours=None, message=None, channel_id=None
         )
         await views.refresh_post(self.bot, row["id"])
-        await interaction.response.send_message(f"Auto-ping is off for **{row['name']}**.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=ok_embed(f"Auto-ping is off for **{row['name']}**."), ephemeral=True
+        )
 
     @manage.command(
         name="add", description="Add players to a roster (tags in any format, or a user's accounts)"
@@ -659,7 +684,7 @@ class Rosters(BaseCog):
         res = await views.signup(
             self.bot, interaction.guild, row, found, actor=interaction.user, group_id=gid, as_manager=True
         )
-        await interaction.followup.send(res.summary()[:2000], ephemeral=True)
+        await interaction.followup.send(embed=res.embed(), ephemeral=True)
 
     @manage.command(name="remove", description="Remove players from a roster")
     @app_commands.autocomplete(roster=roster_autocomplete)
@@ -681,8 +706,7 @@ class Rosters(BaseCog):
             ]
         removed = await views.opt_out(self.bot, interaction.guild, row, found, actor=interaction.user)
         await interaction.response.send_message(
-            ("Removed: " + ", ".join(removed)) if removed else "None of those were on the roster.",
-            ephemeral=True,
+            embed=views.removed_embed(removed, row["name"]), ephemeral=True
         )
 
     @manage.command(name="move", description="Move players to another roster and/or group")
@@ -716,10 +740,7 @@ class Rosters(BaseCog):
             await views.refresh_post(self.bot, rid)
         if moved:
             await views._log_change(self.bot, interaction.guild, dst, interaction.user, "moved", moved)
-        text = f"Moved {len(moved)} to **{dst['name']}**."
-        if missing:
-            text += "\nNot moved: " + ", ".join(missing)
-        await interaction.response.send_message(text, ephemeral=True)
+        await interaction.response.send_message(embed=move_embed(moved, missing, dst["name"]), ephemeral=True)
 
     # ------------------------------------------------------------------ groups
 
@@ -735,7 +756,7 @@ class Rosters(BaseCog):
         await repo.create_group(self.db, row["id"], name)
         await views.refresh_post(self.bot, row["id"])
         await interaction.response.send_message(
-            f"Added group **{name}** to **{row['name']}**.", ephemeral=True
+            embed=ok_embed(f"Added group **{name}** to **{row['name']}**."), ephemeral=True
         )
 
     @groups.command(name="rename", description="Rename a roster group")
@@ -752,7 +773,9 @@ class Rosters(BaseCog):
         gid = await group_id_or_fail(interaction, row, group)
         await repo.rename_group(self.db, gid, new_name)
         await views.refresh_post(self.bot, row["id"])
-        await interaction.response.send_message(f"Renamed **{group}** → **{new_name}**.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=ok_embed(f"Renamed group **{group}** → **{new_name}**."), ephemeral=True
+        )
 
     @groups.command(name="delete", description="Delete a roster group (its members become ungrouped)")
     @app_commands.autocomplete(roster=roster_autocomplete, group=group_autocomplete)
@@ -762,16 +785,34 @@ class Rosters(BaseCog):
         gid = await group_id_or_fail(interaction, row, group)
         await repo.delete_group(self.db, gid)
         await views.refresh_post(self.bot, row["id"])
-        await interaction.response.send_message(f"Deleted group **{group}**.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=ok_embed(f"Deleted group **{group}**. Its members are now ungrouped."), ephemeral=True
+        )
 
     @groups.command(name="list", description="List a roster's groups")
     @app_commands.autocomplete(roster=roster_autocomplete)
     async def group_list(self, interaction: discord.Interaction, roster: str) -> None:
         row = await get_roster_or_fail(interaction, roster)
         groups = await repo.list_groups(self.db, row["id"])
-        await interaction.response.send_message(
-            f"**{row['name']}** groups: " + (", ".join(g["name"] for g in groups) or "none"), ephemeral=True
+        embed = await make_embed(
+            self.bot,
+            interaction.guild_id,
+            title=f"Groups · {row['name']}",
+            description=SEP.join(f"**{g['name']}**" for g in groups)[:4000]
+            or "No groups. Add one with `/roster groups create`.",
         )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+def move_embed(moved: list[str], missing: list[str], roster_name: str) -> discord.Embed:
+    """Result of /roster manage move: green if anyone moved, with a "Not moved" field."""
+    if not moved:
+        e = fail_embed(f"Nobody was moved to **{roster_name}**.")
+    else:
+        e = ok_embed(f"Moved {chip(len(moved))} to **{roster_name}**.")
+    if missing:
+        e.add_field(name=f"Not moved ({len(missing)})", value=views.clip_lines(missing), inline=False)
+    return e
 
 
 class _ConfirmPing(discord.ui.View):
@@ -785,7 +826,11 @@ class _ConfirmPing(discord.ui.View):
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         header = f"**{self.roster_name}**" + (f": {self.message}" if self.message else "")
         chunks = views.ping_chunks(header, self.users)
-        await interaction.response.edit_message(content=f"Pinging {len(self.users)} user(s)…", view=None)
+        await interaction.response.edit_message(
+            content=None,
+            embed=ok_embed(f"Pinging {len(self.users)} user(s) for **{self.roster_name}**."),
+            view=None,
+        )
         for chunk in chunks:
             await interaction.channel.send(chunk, allowed_mentions=discord.AllowedMentions(users=True))
         self.stop()
@@ -813,7 +858,9 @@ class _ConfirmSuggest(discord.ui.View):
         await require(interaction, "roster")
         roster = await repo.get_roster(interaction.client.db, self.roster_id)
         if roster is None:
-            await interaction.response.edit_message(content="That roster no longer exists.", view=None)
+            await interaction.response.edit_message(
+                content=None, embed=fail_embed("That roster no longer exists."), view=None
+            )
             return
         await interaction.response.edit_message(content=f"Applying to **{roster['name']}**…", view=None)
         self.stop()
@@ -825,7 +872,7 @@ class _ConfirmSuggest(discord.ui.View):
             self.substitutes,
             actor=interaction.user,
         )
-        await interaction.followup.send(summary[:2000], ephemeral=True)
+        await interaction.followup.send(embed=views.apply_embed(roster["name"], summary), ephemeral=True)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:

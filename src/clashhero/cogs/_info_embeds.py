@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -12,12 +13,23 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from coc import (
+    DARK_ELIXIR_TROOP_ORDER,
+    ELIXIR_TROOP_ORDER,
+    EQUIPMENT,
+    HERO_ORDER,
     PETS_ORDER,
     SEASONAL_SPELL_ORDER,
     SEASONAL_TROOP_ORDER,
     SIEGE_MACHINE_ORDER,
+    SPELL_ORDER,
     SUPER_TROOP_ORDER,
 )
+from discord.utils import escape_markdown
+
+from clashhero.services.snapshots import home_units
+from clashhero.utils.fmt import clan_link, pad, role_name, ts
+from clashhero.utils.ranked import league_name
+from clashhero.utils.style import ICONS, SEP, bar, chip, chip_width, grid, header, summary
 
 # ------------------------------------------------------------------ time
 
@@ -238,19 +250,395 @@ def _unit_levels_from_models(player: Any, th: int) -> list[UnitLevel]:
     return out
 
 
-def format_units(units: Sequence[UnitLevel], *, show: str = "level") -> dict[str, list[str]]:
-    """Group into category -> lines. show='level' => 'Name 5/7'; 'remaining' => 'Name 5→7'."""
-    out: dict[str, list[str]] = {}
+# ------------------------------------------------------------------ player pages
+#
+# /player info, units, upgrades and rushed are four pages of one card, switched with buttons. The
+# builders below return "blocks" (lists of lines: a bold header, rows, an optional summary line);
+# pack_blocks() fits them into embed descriptions under Discord's limits.
+
+PLAYER_PAGES = ("profile", "units", "upgrades", "rushed")
+PAGE_LABELS = {"profile": "Profile", "units": "Units", "upgrades": "Upgrades", "rushed": "Rushed"}
+# Button custom_id: pl:<page>:<tag without #>, plus ":r" on the refresh button (custom_ids must be
+# unique within a message, and the current page's own button is also on it).
+PLAYER_PAGE_TEMPLATE = (
+    r"pl:(?P<page>profile|units|upgrades|rushed):(?P<tag>[0289PYLQGRJCUV]{3,15})(?P<refresh>:r)?"
+)
+_PLAYER_PAGE_RE = re.compile(PLAYER_PAGE_TEMPLATE)
+
+
+def player_page_id(page: str, tag: str, *, refresh: bool = False) -> str:
+    """custom_id for a player page button: ``pl:units:2PP`` (``pl:units:2PP:r`` to refresh)."""
+    if page not in PLAYER_PAGES:
+        raise ValueError(f"unknown player page {page!r}")
+    return f"pl:{page}:{tag.lstrip('#').upper()}" + (":r" if refresh else "")
+
+
+def parse_player_page_id(custom_id: str) -> tuple[str, str, bool] | None:
+    """(page, "#TAG", refresh) from a player page button's custom_id, or None."""
+    m = _PLAYER_PAGE_RE.fullmatch(custom_id)
+    return (m["page"], f"#{m['tag']}", bool(m["refresh"])) if m else None
+
+
+DESC_LIMIT = 4096  # embed description
+FIELD_LIMIT = 1024  # embed field value
+# Discord caps a message's embeds at 6000 characters in all; leave room for titles, footers and the
+# maintenance notice.
+MESSAGE_BUDGET = 5600
+GRID_COLUMNS = 52  # monospace columns a row of chips may take (fits a desktop embed)
+MORE_NOT_SHOWN = "-# … more not shown (too long for one Discord message)"
+
+UNIT_GROUPS = ("troops", "dark", "spells", "heroes", "pets", "equipment", "sieges")
+GROUP_TITLES = {
+    "troops": "Troops",
+    "dark": "Dark Troops",
+    "spells": "Spells",
+    "heroes": "Heroes",
+    "pets": "Pets",
+    "equipment": "Hero Equipment",
+    "sieges": "Siege Machines",
+}
+LAB_CATEGORIES = ("troops", "spells", "sieges")
+_DARK_TROOPS = frozenset(DARK_ELIXIR_TROOP_ORDER)
+_GAME_ORDER = {
+    name: i
+    for i, name in enumerate(
+        [
+            *ELIXIR_TROOP_ORDER,
+            *DARK_ELIXIR_TROOP_ORDER,
+            *SPELL_ORDER,
+            *HERO_ORDER,
+            *PETS_ORDER,
+            *EQUIPMENT,
+            *SIEGE_MACHINE_ORDER,
+        ]
+    )
+}
+APPROX_NOTE = "`~` this Town Hall's max isn't known yet, so the game's overall max is shown"
+EQUIPMENT_NOTE = "-# Equipment isn't counted: it's limited by ore, not lab or builder time."
+
+
+def unit_group(u: UnitLevel) -> str:
+    """Page section for a unit: its category, with dark elixir troops split from troops."""
+    return "dark" if u.category == "troops" and u.name in _DARK_TROOPS else u.category
+
+
+def group_units(units: Iterable[UnitLevel]) -> list[tuple[str, list[UnitLevel]]]:
+    """[(group, units)] in page order, units in the game's order (units it doesn't know last)."""
+    groups: dict[str, list[UnitLevel]] = {}
     for u in units:
-        mx = u.max_for_th or u.level
-        if show == "remaining":
-            line = f"{u.name} {u.level}→{mx}"
-        elif show == "rushed":
-            line = f"{u.name} {u.level}/{u.max_for_prev_th}"
+        groups.setdefault(unit_group(u), []).append(u)
+    order = [g for g in UNIT_GROUPS if g in groups] + [g for g in groups if g not in UNIT_GROUPS]
+    last = len(_GAME_ORDER)
+    return [(g, sorted(groups[g], key=lambda u: _GAME_ORDER.get(u.name, last))) for g in order]
+
+
+def group_header(group: str, extra: str | None = None) -> str:
+    return header(GROUP_TITLES.get(group, group.title()), group if group in ICONS else "▫️", extra)
+
+
+def unit_label(u: UnitLevel) -> str:
+    """Display name; spells drop the " Spell" suffix (the section header already says Spells)."""
+    return u.name.removesuffix(" Spell") if u.category == "spells" else u.name
+
+
+def level_text(level: int, max_level: int | None, approximate: bool = False) -> str:
+    """``10/14``; ``10/~14`` when the max is the game's overall max rather than the TH's."""
+    if max_level is None:
+        return f"{level}/?"
+    return f"{level}/{'~' if approximate and level < max_level else ''}{max_level}"
+
+
+def is_maxed(u: UnitLevel) -> bool:
+    return u.max_for_th is not None and u.level >= u.max_for_th
+
+
+def counts_as_rushed(u: UnitLevel) -> bool:
+    """Below the previous TH's max, in a category the rushed check counts (not equipment)."""
+    return u.is_rushed and u.category in RUSH_CATEGORIES
+
+
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def percent(part: int, total: int, *, digits: int = 1, round_up: bool = False, empty: float = 0.0) -> str:
+    """``part/total`` as ``82.4%``. Rounds down by default, so unfinished work never shows 100%;
+    ``round_up`` for rushed %, so a small gap never shows 0%. ``empty`` is used when total is 0."""
+    if total <= 0:
+        value = empty
+    else:
+        scale = 10**digits
+        n = 100 * scale * part
+        value = (-(-n // total) if round_up else n // total) / scale
+    return f"{value:.{digits}f}%"
+
+
+def progress_bar(done: int, total: int, width: int = 12) -> str:
+    """``▰▰▰▱`` rounded down, so the bar is only full when everything is done."""
+    filled = width if total <= 0 else width * min(done, total) // total
+    return bar(filled / width, width)
+
+
+def chip_grid(
+    cells: Sequence[tuple[str, str, str]], *, columns: int = GRID_COLUMNS, max_per_row: int = 3
+) -> list[str]:
+    """Rows of ``Name  10/14✓`` chips. Cells are (name, level text, mark). Takes as many chips
+    per row as fit in ``columns`` monospace columns, and pads each column's chips to one width so
+    the columns line up."""
+    if not cells:
+        return []
+    for per_row in range(max(1, min(max_per_row, len(cells))), 0, -1):
+        widths = [
+            tuple(chip_width(cell[k] for cell in cells[c::per_row]) for k in range(3)) for c in range(per_row)
+        ]
+        if per_row == 1 or sum(n + 1 + lv + m for n, lv, m in widths) + per_row - 1 <= columns:
+            break
+    chips = []
+    for i, (name, lv, mark) in enumerate(cells):
+        nw, lw, mw = widths[i % per_row]
+        chips.append(chip(f"{pad(name, nw)} {pad(lv, lw, right=True)}{pad(mark, mw)}"))
+    return grid(chips, per_row)
+
+
+def pack_blocks(
+    blocks: Iterable[Sequence[str]],
+    *,
+    limit: int = DESC_LIMIT,
+    budget: int = MESSAGE_BUDGET,
+    max_pages: int = 10,
+) -> list[str]:
+    """Join blocks into embed descriptions (blank line between blocks), each under ``limit``
+    characters and all together under ``budget``. A block is only split (between lines) when it
+    is longer than ``limit`` by itself. What doesn't fit is dropped with a short note."""
+    pieces: list[str] = []
+    for block in blocks:
+        cur = ""
+        for line in (ln[:limit] for ln in block if ln):
+            if cur and len(cur) + 1 + len(line) > limit:
+                pieces.append(cur)
+                cur = line
+            else:
+                cur = f"{cur}\n{line}" if cur else line
+        if cur:
+            pieces.append(cur)
+    pages: list[str] = []
+    used, reserve = 0, len(MORE_NOT_SHOWN) + 2
+    for i, piece in enumerate(pieces):
+        joins = bool(pages) and len(pages[-1]) + 2 + len(piece) <= limit
+        cost = len(piece) + (2 if joins else 0)
+        room = budget - used - (0 if i == len(pieces) - 1 else reserve)
+        if cost > room or (not joins and len(pages) >= max_pages):
+            if pages and len(pages[-1]) + reserve <= limit:
+                pages[-1] += "\n\n" + MORE_NOT_SHOWN
+            elif len(pages) < max_pages:
+                pages.append(MORE_NOT_SHOWN)
+            break
+        if joins:
+            pages[-1] += "\n\n" + piece
         else:
-            line = f"{u.name} {u.level}/{mx}" + (" ✅" if u.level >= mx else "")
-        out.setdefault(u.category, []).append(line)
-    return out
+            pages.append(piece)
+        used += cost
+    return pages or [""]
+
+
+def units_blocks(units: Sequence[UnitLevel], town_hall: int) -> list[list[str]]:
+    """/player units: every unit's level against its max at the player's Town Hall."""
+    if not units:
+        return [["No units found for this player."]]
+    _, prog = upgrade_progress(units)
+    maxed = sum(is_maxed(u) for u in units)
+    blocks = [
+        [
+            header("Units", "📊", f"at TH{town_hall}"),
+            f"{progress_bar(prog.done, prog.total)} **{percent(prog.done, prog.total, empty=100)}**"
+            f" of max levels{SEP}{maxed}/{len(units)} maxed",
+        ]
+    ]
+    for group, members in group_units(units):
+        cells = [
+            (unit_label(u), level_text(u.level, u.max_for_th, u.approximate), "✓" if is_maxed(u) else "")
+            for u in members
+        ]
+        done = sum(is_maxed(u) for u in members)
+        blocks.append([group_header(group, f"· {done}/{len(members)} maxed"), *chip_grid(cells)])
+    if any(u.approximate and not is_maxed(u) for u in units):
+        blocks.append([f"-# {APPROX_NOTE}"])
+    return blocks
+
+
+def upgrades_blocks(units: Sequence[UnitLevel], town_hall: int) -> list[list[str]]:
+    """/player upgrades: units below their max at the player's Town Hall, per section."""
+    pending, prog = upgrade_progress(units)
+    if not pending:
+        return [[header("Upgrades", "⬆️", f"at TH{town_hall}"), f"Everything is maxed for TH{town_hall}. 🎉"]]
+    levels_left = sum(u.remaining for u in pending)
+    blocks = [
+        [
+            header("Upgrades left", "⬆️", f"at TH{town_hall}"),
+            f"{plural(len(pending), 'upgrade')}{SEP}{plural(levels_left, 'level')}",
+        ]
+    ]
+    for group, members in group_units(units):
+        todo = [u for u in members if u.remaining]
+        if not todo:
+            continue
+        _, gp = upgrade_progress(members)
+        names = [unit_label(u) for u in todo]
+        levels = [level_text(u.level, u.max_for_th, u.approximate) for u in todo]
+        nw, lw = chip_width(names), chip_width(levels)
+        rows = [
+            chip(f"{pad(name, nw)} {pad(lv, lw, right=True)}")
+            + (f" {chip('R')}" if counts_as_rushed(u) else "")
+            for name, lv, u in zip(names, levels, todo, strict=True)
+        ]
+        blocks.append(
+            [
+                group_header(group),
+                *rows,
+                summary(
+                    "time",
+                    plural(len(todo), "upgrade"),
+                    plural(sum(u.remaining for u in todo), "level"),
+                    f"{percent(gp.done, gp.total, digits=0, empty=100)} done",
+                ),
+            ]
+        )
+    blocks.append(
+        [
+            f"{progress_bar(prog.done, prog.total)} **{percent(prog.done, prog.total, empty=100)}**"
+            f" of TH{town_hall} max levels done"
+        ]
+    )
+    notes = []
+    if any(counts_as_rushed(u) for u in pending):
+        notes.append(f"`R` rushed: below the TH{town_hall - 1} max")
+    if any(u.approximate for u in pending):
+        notes.append(APPROX_NOTE)
+    if notes:
+        blocks.append([f"-# {SEP.join(notes)}"])
+    return blocks
+
+
+@dataclass(frozen=True)
+class RushReport:
+    lab: Progress  # done = levels missing below the previous TH's max
+    heroes: Progress
+    overall: Progress
+    rushed: list[UnitLevel]
+    skipped: int  # units whose previous-TH max isn't known (coc.py's data is behind the game)
+
+
+def rush_report(units: Iterable[UnitLevel]) -> RushReport:
+    """Rushed % for the lab (troops, spells, siege machines), heroes and overall (also pets).
+    Equipment isn't counted (see rushed_progress)."""
+    units = list(units)
+    rushed, overall = rushed_progress(units)
+    _, lab = rushed_progress(u for u in units if u.category in LAB_CATEGORIES)
+    _, heroes = rushed_progress(u for u in units if u.category == "heroes")
+    skipped = sum(1 for u in units if u.category in RUSH_CATEGORIES and u.approximate)
+    return RushReport(lab, heroes, overall, rushed, skipped)
+
+
+def rushed_blocks(units: Sequence[UnitLevel], town_hall: int) -> list[list[str]]:
+    """/player rushed: units below the previous Town Hall's max, with rushed percentages."""
+    r = rush_report(units)
+    prev = town_hall - 1
+    if r.rushed:
+        top = [
+            header("Rushed", "rushed", f"vs TH{prev} max"),
+            SEP.join(
+                f"{icon} {name} {chip(percent(p.done, p.total, round_up=True))}"
+                for icon, name, p in (
+                    ("🧪", "Lab", r.lab),
+                    (ICONS["heroes"], "Heroes", r.heroes),
+                    ("📊", "Overall", r.overall),
+                )
+            ),
+        ]
+    else:
+        top = [header("Not rushed", "done", "🎉")]
+        if prev >= 1:
+            top.append(f"Every unit is at least TH{prev} max.")
+    top.append(EQUIPMENT_NOTE)
+    if r.skipped:
+        top.append(f"-# {plural(r.skipped, 'unit')} skipped (TH{prev} max not known yet).")
+    blocks = [top]
+    for group, members in group_units(r.rushed):
+        cells = [(unit_label(u), f"{u.level}/{u.max_for_prev_th}", "") for u in members]
+        blocks.append([group_header(group, f"· {len(members)} rushed"), *chip_grid(cells)])
+    return blocks
+
+
+def fit(text: str, limit: int = FIELD_LIMIT, sep: str = SEP) -> str:
+    """Cut a ``sep``-joined list to ``limit`` characters at an item boundary, ending with ``…``."""
+    if len(text) <= limit:
+        return text
+    cut = text.rfind(sep, 0, limit - 2)
+    return (text[:cut] if cut > 0 else text[: limit - 2]) + " …"
+
+
+def unit_chips(units: Iterable[tuple[str, int]]) -> str:
+    """``Barbarian King `95` · Archer Queen `95``` for the profile page."""
+    return fit(SEP.join(f"{escape_markdown(name)} {chip(level)}" for name, level in units))
+
+
+def profile_parts(
+    p: Any,
+    *,
+    discord_id: int | None = None,
+    verified: bool = False,
+    last_seen: str | datetime | None = None,
+    season: tuple[int, int] | None = None,
+    names: Sequence[str] = (),
+) -> tuple[str, list[tuple[str, str, bool]]]:
+    """(description, [(field name, value, inline)]) for /player info.
+
+    ``p`` is a coc.py Player; the rest comes from the database (linked Discord user, last seen,
+    season donations given/received, earlier names)."""
+    weapon = getattr(p, "town_hall_weapon", None)
+    th = [header(f"Town Hall {p.town_hall}", "🏠"), *([f"weapon {chip(weapon)}"] if weapon else [])]
+    lines = [SEP.join([*th, f"level {chip(p.exp_level)}"])]
+    clan = getattr(p, "clan", None)
+    if clan:
+        role = role_name(_enum(getattr(p, "role", None)) or None)
+        lines.append(f"{ICONS['clan']} [{escape_markdown(clan.name)}]({clan_link(clan.tag)}){SEP}{role}")
+    else:
+        lines.append(f"{ICONS['clan']} Not in a clan")
+
+    fields: list[tuple[str, str, bool]] = []
+    league = league_name(p) or "Unranked"
+    fields.append(
+        (
+            f"{ICONS['trophy']} Trophies",
+            f"{chip(f'{p.trophies:,}')} best {chip(f'{p.best_trophies:,}')}\n{league}",
+            True,
+        )
+    )
+    pref = getattr(p, "war_opted_in", None)
+    pref_text = "Opted in" if pref else "Opted out" if pref is False else "Preference unknown"
+    fields.append((f"{ICONS['war']} War", f"{chip(f'{p.war_stars:,}★')}\n{pref_text}", True))
+    gold = getattr(p, "clan_capital_contributions", 0) or 0
+    fields.append((f"{ICONS['capital']} Capital", f"{chip(f'{gold:,}')} gold", True))
+    if season is not None:
+        given, received = season
+        fields.append(("🎁 Donations", f"{chip(f'{given:,}')} given\n{chip(f'{received:,}')} received", True))
+    if p.attack_wins or p.defense_wins:  # the API reports 0/0 for everyone since the ranked rework
+        fields.append(("🗡️ Wins", f"{chip(p.attack_wins)} attacks\n{chip(p.defense_wins)} defenses", True))
+    if discord_id:
+        fields.append(("🔗 Discord", f"<@{discord_id}>" + (" ✅" if verified else ""), True))
+    if last_seen:
+        fields.append(("👀 Last seen", ts(last_seen), True))
+    for title, kind in (("Heroes", "heroes"), ("Equipment", "equipment"), ("Pets", "pets")):
+        units = home_units(p, kind)
+        if units:
+            fields.append((f"{ICONS[kind]} {title}", unit_chips(units), False))
+    if names:
+        fields.append(("📝 Previous names", fit(SEP.join(escape_markdown(n) for n in names[-10:])), False))
+    return "\n".join(lines), fields
+
+
+def _enum(v: Any) -> str:
+    return str(getattr(v, "value", v)) if v is not None else ""
 
 
 # ------------------------------------------------------------------ CSV

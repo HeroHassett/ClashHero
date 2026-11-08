@@ -9,6 +9,7 @@ dependencies = [
     "coc.py>=3.6",
     "aiosqlite>=0.20",
     "python-dotenv>=1.0",
+    "pillow>=11",
 ]
 
 [dependency-groups]

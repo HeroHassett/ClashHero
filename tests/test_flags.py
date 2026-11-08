@@ -142,9 +142,26 @@ def test_flag_line_shows_weight():
         "created_by": 9,
         "created_at": NOW.isoformat(),
     }
-    assert "⚠️ ×3" in cog.flag_line(base)
+    assert cog.flag_line(base).startswith("`#3` ⚠️ **A** `#P1` · `×3` · missed war · by <@9>")
     assert "×" not in cog.flag_line({**base, "weight": 1})
     assert "⛔" in cog.flag_line({**base, "flag_type": "ban", "weight": 1})
+    expiring = cog.flag_line({**base, "reason": None, "expires_at": NOW.isoformat()})
+    assert "missed war" not in expiring and expiring.endswith(":R>") and " · expires <t:" in expiring
+
+
+def test_flags_summary_counts_bans_and_strikes():
+    rows = [{"flag_type": "ban"}, {"flag_type": "strike"}, {"flag_type": "strike"}]
+    assert cog.flags_summary(rows) == "⛔ `1` ban · ⚠️ `2` strikes"
+    assert cog.flags_summary([]) == "⛔ `0` bans · ⚠️ `0` strikes"
+
+
+def test_summary_line_pads_total():
+    r = {"total": 7, "name": "A", "player_tag": "#P1", "strikes": 3, "last_strike": NOW.isoformat()}
+    line = cog.summary_line(1, {**r, "banned": 0}, width=2)
+    assert line.startswith("` 1.` ` 7` **A** `#P1` · 3 strikes · last <t:")
+    assert "banned" not in line
+    assert cog.summary_line(2, {**r, "strikes": 1, "banned": 1}).endswith(" · ⛔ banned")
+    assert "1 strike ·" in cog.summary_line(2, {**r, "strikes": 1, "banned": 0})
 
 
 def test_dm_embed():
@@ -224,7 +241,7 @@ async def test_join_alert_still_fires_with_strike_total(db):
     assert len(channel.sent) == 1
     embed = channel.sent[0]["embed"]
     fields = {f.name: f.value for f in embed.fields}
-    assert "⚠️ ×4" in fields["Flags"] and "⛔" in fields["Flags"]
+    assert "`×4`" in fields["Flags"] and "⛔" in fields["Flags"]
     assert fields["Active strike total"] == "4"
     # Not flagged: no alert.
     await flags.on_clash_member_join(

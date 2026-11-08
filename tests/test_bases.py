@@ -2,6 +2,7 @@ import sqlite3
 
 import pytest
 
+from clashhero.cogs.bases import base_list_line, usage_line
 from clashhero.repos import bases as repo
 
 
@@ -59,3 +60,28 @@ def test_is_copy_link():
     assert repo.is_copy_link("https://link.clashofclans.com/en?action=OpenLayout&id=x")
     assert not repo.is_copy_link("hello")
     assert not repo.is_copy_link(None)
+
+
+def test_base_list_and_usage_lines():
+    row = {
+        "town_hall": 9,
+        "name": "Ring",
+        "type": "war",
+        "uses": 2,
+        "link": "https://link.clashofclans.com/x",
+    }
+    assert (
+        base_list_line(row, 4)
+        == "` TH9` **Ring** · war · used `2×` · [link](https://link.clashofclans.com/x)"
+    )
+    assert base_list_line({**row, "uses": 0, "link": None}) == "`TH9` **Ring** · war · unused"
+    use = {
+        "war_round": None,
+        "town_hall": 17,
+        "base_name": "Box",
+        "player_name": None,
+        "player_tag": "#P",
+        "used_at": "2026-11-02T10:00:00+00:00",
+    }
+    assert usage_line(use).startswith("`R?` `TH17` **Box** · #P · <t:")
+    assert usage_line({**use, "war_round": 3, "player_tag": None}).startswith("`R3` `TH17` **Box** · — · ")

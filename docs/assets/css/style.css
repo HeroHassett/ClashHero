@@ -60,7 +60,10 @@ a:hover { text-decoration: underline; }
   border: 1px solid transparent; transition: transform .15s ease, box-shadow .15s ease, background .15s ease;
 }
 .btn:hover { text-decoration: none; transform: translateY(-1px); }
-.btn-primary { background: var(--grad); color: #1a0d05; box-shadow: 0 6px 24px rgba(214, 47, 47, .28); }
+.btn-primary {
+  background: var(--grad); background-origin: border-box; /* no repeat under the 1px border */
+  color: #1a0d05; box-shadow: 0 6px 24px rgba(214, 47, 47, .28);
+}
 .btn-primary:hover { box-shadow: 0 10px 32px rgba(229, 172, 82, .35); }
 .btn-ghost { border-color: var(--border); color: var(--text); background: var(--surface); }
 .btn-ghost:hover { border-color: var(--gold); }

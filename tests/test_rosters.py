@@ -462,3 +462,58 @@ async def test_run_autopings_pings_unregistered_once(db):
     # closed rosters stay quiet
     await repo.update_roster(db, rid, end_time="2026-11-07T17:00:00+00:00", closed=1)
     assert await cog.run_autopings(now) == 0 and len(sent) == 2
+
+
+def test_roster_list_line():
+    from clashhero.cogs.rosters import roster_list_line
+
+    r = {
+        "name": "CWL main",
+        "category": "cwl",
+        "clan_name": None,
+        "clan_tag": "#C",
+        "member_count": 3,
+        "max_members": 15,
+        "closed": 1,
+        "autoping_end_hours": 6,
+    }
+    assert roster_list_line(r, 5) == "` 3/15` **CWL main** · CWL · #C · 🔔 · 🔒"
+    plain = {**r, "clan_name": "Clan", "closed": 0, "autoping_end_hours": None}
+    assert roster_list_line(plain) == "`3/15` **CWL main** · CWL · Clan"
+
+
+def test_signup_result_embeds():
+    from clashhero.cogs._roster_views import SignupResult
+    from clashhero.utils.style import FAILURE, SUCCESS
+
+    ok = SignupResult(added=["A", "B"], updated=["C"], errors=["`#X`: player not found."])
+    e = ok.embed()
+    assert e.color == SUCCESS
+    assert e.description == "✅ Signed up **A**, **B**.\nUpdated the group for **C**."
+    assert e.fields[0].name == "Skipped (1)" and e.fields[0].value == "❌ `#X`: player not found."
+    one = SignupResult(errors=["This roster is closed."]).embed()
+    assert one.color == FAILURE and one.description == "❌ This roster is closed." and not one.fields
+    many = SignupResult(errors=["a", "b"]).embed()
+    assert many.description == "❌ Nobody was signed up (2 skipped)." and many.fields[0].value == "• a\n• b"
+    assert SignupResult().embed().description == "❌ Nothing changed."
+    assert "❌ `#X`" in ok.summary()
+
+
+def test_roster_result_helpers():
+    from clashhero.cogs import _roster_views as views
+    from clashhero.cogs.rosters import move_embed
+    from clashhero.utils.style import FAILURE, SUCCESS
+
+    assert views.clip_lines(["a", "b"]) == "a\nb"
+    clipped = views.clip_lines([f"line {i:03}" for i in range(300)], limit=100)
+    assert len(clipped) <= 100 and clipped.endswith("more") and clipped.startswith("line 000\n")
+    assert views.names_text(["A", "B"]) == "**A**, **B**"
+    assert views.names_text([f"N{i}" for i in range(50)], limit=30) == "**N0**, **N1**, **N2**, … 47 more"
+    assert views.removed_embed(["A"], "CWL").description == "✅ Removed **A** from **CWL**."
+    assert views.removed_embed([], "CWL").color == FAILURE
+    applied = views.apply_embed("CWL", "**Confirmed**\nSigned up: A")
+    assert applied.description == "✅ Lineup applied to **CWL**.\n\n**Confirmed**\nSigned up: A"
+    moved = move_embed(["#A"], ["#B (destination full)"], "Subs")
+    assert moved.color == SUCCESS and moved.description == "✅ Moved `1` to **Subs**."
+    assert moved.fields[0].name == "Not moved (1)" and moved.fields[0].value == "#B (destination full)"
+    assert move_embed([], ["#B"], "Subs").color == FAILURE

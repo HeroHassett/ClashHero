@@ -14,6 +14,7 @@ from clashhero.utils.checks import manager
 from clashhero.utils.fmt import chunk_lines, make_embed, ts
 from clashhero.utils.resolve import ResolveError, player_autocomplete
 from clashhero.utils.seasons import cwl_season_id
+from clashhero.utils.style import SEP, chip, chip_width, ok_embed
 
 TYPE_CHOICES = [
     app_commands.Choice(name=t.upper() if t == "cwl" else t.title(), value=t) for t in repo.BASE_TYPES
@@ -34,6 +35,24 @@ async def get_base_or_fail(interaction: discord.Interaction, name: str):
     if row is None:
         raise ResolveError(f"No base named **{name}**.")
     return row
+
+
+def base_list_line(r, th_width: int | None = None) -> str:
+    """One /bases list row: ``` `TH16` **Ring** · war · used `2×` · [link]```."""
+    th = chip(f"TH{r['town_hall']}", th_width)
+    uses = r["uses"]
+    parts = [f"{th} **{r['name']}**", r["type"], f"used {chip(f'{uses}×')}" if uses else "unused"]
+    if repo.is_copy_link(r["link"]):
+        parts.append(f"[link]({r['link']})")
+    return SEP.join(parts)
+
+
+def usage_line(r, th_width: int | None = None) -> str:
+    """One /bases usage row: round, base, who used it and when."""
+    rnd = f"R{r['war_round']}" if r["war_round"] else "R?"
+    who = r["player_name"] or r["player_tag"] or "—"
+    th = chip(f"TH{r['town_hall']}", th_width)
+    return SEP.join((f"`{rnd}` {th} **{r['base_name']}**", who, ts(r["used_at"], "d")))
 
 
 def render_base_card(base, color: discord.Color, uses_this_cwl: int | None = None) -> discord.Embed:
@@ -98,7 +117,11 @@ class Bases(BaseCog):
             )
         except sqlite3.IntegrityError as e:
             raise ResolveError(f"A base named **{name}** already exists.") from e
-        await interaction.response.send_message(f"Added base **{name}** (TH{town_hall}).", ephemeral=True)
+        kind = type.name if type else "War"
+        await interaction.response.send_message(
+            embed=ok_embed(f"Added base **{name}** (TH{town_hall}, {kind}). Post it with `/bases post`."),
+            ephemeral=True,
+        )
 
     @bases.command(name="edit", description="Edit a base layout")
     @app_commands.choices(type=TYPE_CHOICES)
@@ -138,7 +161,7 @@ class Bases(BaseCog):
             raise ResolveError(f"A base named **{new_name}** already exists.") from e
         await self._refresh_post(base["id"])
         await interaction.response.send_message(
-            f"Updated **{fields.get('name', base['name'])}**.", ephemeral=True
+            embed=ok_embed(f"Updated base **{fields.get('name', base['name'])}**."), ephemeral=True
         )
 
     @bases.command(name="delete", description="Delete a base layout and its usage history")
@@ -147,7 +170,9 @@ class Bases(BaseCog):
     async def delete(self, interaction: discord.Interaction, name: str) -> None:
         base = await get_base_or_fail(interaction, name)
         await repo.delete_base(self.db, base["id"])
-        await interaction.response.send_message(f"Deleted **{base['name']}**.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=ok_embed(f"Deleted base **{base['name']}** and its usage history."), ephemeral=True
+        )
 
     @bases.command(name="post", description="Post a base card with a copy-link button")
     @app_commands.autocomplete(name=base_autocomplete)
@@ -169,7 +194,7 @@ class Bases(BaseCog):
                     break
         await repo.update_base(self.db, base["id"], channel_id=target.id, message_id=msg.id)
         await interaction.response.send_message(
-            f"Posted **{base['name']}** in {target.mention}.", ephemeral=True
+            embed=ok_embed(f"Posted **{base['name']}** in {target.mention}."), ephemeral=True
         )
 
     @bases.command(name="voting", description="Turn vote reactions on base posts on or off")
@@ -177,7 +202,8 @@ class Bases(BaseCog):
     async def voting(self, interaction: discord.Interaction, enabled: bool) -> None:
         await repo.set_voting(self.db, interaction.guild_id, enabled)
         await interaction.response.send_message(
-            f"Vote reactions on base posts are now **{'on' if enabled else 'off'}**.", ephemeral=True
+            embed=ok_embed(f"Vote reactions on base posts are now **{'on' if enabled else 'off'}**."),
+            ephemeral=True,
         )
 
     # ------------------------------------------------------------------ CWL usage
@@ -204,9 +230,10 @@ class Bases(BaseCog):
                 if r["base_id"] == base["id"]
             ]
         )
-        warn = " ⚠️ It had already been used this CWL." if uses > 1 else ""
+        where = f" in round {war_round}" if war_round else ""
+        warn = "\n⚠️ It had already been used this CWL." if uses > 1 else ""
         await interaction.response.send_message(
-            f"Marked **{base['name']}** as used ({uses}x this CWL).{warn}"
+            embed=ok_embed(f"Marked **{base['name']}** as used{where}{SEP}{chip(f'{uses}×')} this CWL.{warn}")
         )
 
     @bases.command(name="unuse", description="Undo the latest usage of a base this CWL")
@@ -225,7 +252,7 @@ class Bases(BaseCog):
                 + (f" in round {war_round}." if war_round else ".")
             )
         await interaction.response.send_message(
-            f"Removed the latest usage of **{base['name']}**.", ephemeral=True
+            embed=ok_embed(f"Removed the latest usage of **{base['name']}**."), ephemeral=True
         )
 
     @bases.command(name="list", description="List bases and how often each was used this CWL")
@@ -246,12 +273,8 @@ class Bases(BaseCog):
             type=type.value if type else None,
             unused_only=unused_only,
         )
-        lines = [
-            f"TH{r['town_hall']} · **{r['name']}** · {r['type']} · "
-            + (f"used {r['uses']}x" if r["uses"] else "unused")
-            + (f" · [link]({r['link']})" if repo.is_copy_link(r["link"]) else "")
-            for r in rows
-        ]
+        width = chip_width(f"TH{r['town_hall']}" for r in rows)
+        lines = [base_list_line(r, width) for r in rows]
         pages = chunk_lines(lines) if lines else ["No bases match. Add one with `/bases add`."]
         embed = await make_embed(
             self.bot, interaction.guild_id, title=f"War bases · CWL {season}", description=pages[0]
@@ -266,11 +289,8 @@ class Bases(BaseCog):
     async def usage(self, interaction: discord.Interaction) -> None:
         season = cwl_season_id()
         rows = await repo.usage_report(self.db, interaction.guild_id, season)
-        lines = []
-        for r in rows:
-            rnd = f"R{r['war_round']}" if r["war_round"] else "R?"
-            who = r["player_name"] or r["player_tag"] or "—"
-            lines.append(f"`{rnd}` TH{r['town_hall']} **{r['base_name']}** · {who} · {ts(r['used_at'], 'd')}")
+        width = chip_width(f"TH{r['town_hall']}" for r in rows)
+        lines = [usage_line(r, width) for r in rows]
         embed = await make_embed(
             self.bot,
             interaction.guild_id,

@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from clashhero.cogs.reminders import build_messages
+from clashhero.cogs.reminders import build_messages, reminder_block
 from clashhero.repos import reminders as R
 
 NOW = datetime(2026, 11, 7, 12, tzinfo=UTC)
@@ -222,3 +222,19 @@ async def test_war_type_and_pending_details(db):
         ("#A", 16, "coLeader", 0),
         ("#M", 11, "member", 0),
     ]
+
+
+def test_reminder_block():
+    row = {
+        "id": 3,
+        "type": "war",
+        "duration_seconds": 7200,
+        "channel_id": 55,
+        "clans": "#A #B",
+        "message": "Attack!",
+    }
+    assert reminder_block(row) == "`#3` ⚔️ **Clan War** · `2h` before the end\n<#55> · `#A` `#B`\n> Attack!"
+    filtered = reminder_block({**row, "type": "raid", "clans": "", "min_th": 14})
+    assert filtered.splitlines()[0].startswith("`#3` 🏰 **Capital Raid Weekend**")
+    assert filtered.splitlines()[1] == "<#55>"
+    assert filtered.splitlines()[-1] == "> Only: TH14+"

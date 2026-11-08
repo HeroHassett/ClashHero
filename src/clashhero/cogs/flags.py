@@ -17,6 +17,7 @@ from clashhero.services.outbox import send_server_log
 from clashhero.utils.checks import manager
 from clashhero.utils.fmt import chunk_lines, make_embed, player_link, ts
 from clashhero.utils.resolve import ResolveError, parse_tag, player_autocomplete, resolve_clans
+from clashhero.utils.style import SEP, chip, chip_width, ok_embed
 
 log = logging.getLogger(__name__)
 
@@ -28,22 +29,40 @@ TYPE_CHOICES = [
 
 def flag_line(r) -> str:
     icon = "⛔" if r["flag_type"] == "ban" else "⚠️"
-    strength = f" ×{r['weight']}" if r["flag_type"] == "strike" and r["weight"] != 1 else ""
-    expiry = f" · expires {ts(r['expires_at'], 'R')}" if r["expires_at"] else ""
-    reason = f" — {r['reason']}" if r["reason"] else ""
-    return (
-        f"`#{r['id']}` {icon}{strength} **{r['name'] or '?'}** `{r['player_tag']}`{reason} "
-        f"· by <@{r['created_by']}> {ts(r['created_at'], 'd')}{expiry}"
+    parts = [f"`#{r['id']}` {icon} **{r['name'] or '?'}** `{r['player_tag']}`"]
+    if r["flag_type"] == "strike" and r["weight"] != 1:
+        parts.append(chip(f"×{r['weight']}"))
+    if r["reason"]:
+        parts.append(r["reason"])
+    parts.append(f"by <@{r['created_by']}> {ts(r['created_at'], 'd')}")
+    if r["expires_at"]:
+        parts.append(f"expires {ts(r['expires_at'], 'R')}")
+    return SEP.join(parts)
+
+
+def flags_summary(rows) -> str:
+    """Count line above /flag list: ``⛔ `2` bans · ⚠️ `3` strikes``."""
+    bans = sum(1 for r in rows if r["flag_type"] == "ban")
+    strikes = len(rows) - bans
+    return SEP.join(
+        (
+            f"⛔ {chip(bans)} ban{'s' if bans != 1 else ''}",
+            f"⚠️ {chip(strikes)} strike{'s' if strikes != 1 else ''}",
+        )
     )
 
 
-def summary_line(rank: int, r) -> str:
-    ban = " ⛔ banned" if r["banned"] else ""
+def summary_line(rank: int, r, width: int | None = None) -> str:
+    """One /flag summary row; ``width`` pads the strike-total chip so a page lines up."""
     plural = "s" if r["strikes"] != 1 else ""
-    return (
-        f"`{rank:>2}.` **{r['total']}** · {r['name'] or '?'} `{r['player_tag']}` · "
-        f"{r['strikes']} strike{plural}, last {ts(r['last_strike'], 'd')}{ban}"
-    )
+    parts = [
+        f"`{rank:>2}.` {chip(r['total'], width)} **{r['name'] or '?'}** `{r['player_tag']}`",
+        f"{r['strikes']} strike{plural}",
+        f"last {ts(r['last_strike'], 'd')}",
+    ]
+    if r["banned"]:
+        parts.append("⛔ banned")
+    return SEP.join(parts)
 
 
 def dm_embed(
@@ -128,17 +147,21 @@ class Flags(BaseCog):
             expiry_days,
             weight,
         )
-        msg = f"Created {flag_type.name.lower()} flag `#{flag_id}` on `{tag}`"
+        player = await self.db.get_player_row(tag)
+        label = f"**{player['name']}** `{tag}`" if player and player["name"] else f"`{tag}`"
+        msg = f"Created {flag_type.name.lower()} flag `#{flag_id}` on {label}"
         total = None
         if flag_type.value == "strike":
             total = await repo.strike_total(self.db, interaction.guild_id, tag, now)
-            msg += f" (weight {weight}; active strike total {total})"
-        msg += "."
+            msg += f"{SEP}weight {chip(weight)}{SEP}active strike total {chip(total)}"
+        embed = ok_embed(msg + ".")
         if not dm:
-            await interaction.response.send_message(msg, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
-        msg += "\n" + await self._notify(interaction, tag, flag_id, total)
-        await interaction.followup.send(msg, ephemeral=True)
+        embed.add_field(
+            name="Direct message", value=await self._notify(interaction, tag, flag_id, total), inline=False
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def _notify(
         self, interaction: discord.Interaction, tag: str, flag_id: int, total: int | None
@@ -162,19 +185,19 @@ class Flags(BaseCog):
         sent, failed = await dm_users(self.bot, user_ids, embed)
         parts = []
         if sent:
-            parts.append("DM sent to " + ", ".join(f"<@{u}>" for u in sent) + ".")
+            parts.append("📨 Sent to " + ", ".join(f"<@{u}>" for u in sent) + ".")
         if failed:
             parts.append(
-                "Couldn't DM " + ", ".join(f"<@{u}>" for u in failed) + " (DMs closed or user not found)."
+                "❌ Couldn't DM " + ", ".join(f"<@{u}>" for u in failed) + " (DMs closed or user not found)."
             )
-        return " ".join(parts)
+        return "\n".join(parts)
 
     @flag.command(name="delete", description="Delete a flag by id (Flags Manager)")
     @manager("flags")
     async def delete(self, interaction: discord.Interaction, flag_id: int) -> None:
         if not await repo.delete_flag(self.db, interaction.guild_id, flag_id):
             raise ResolveError(f"No flag `#{flag_id}` in this server.")
-        await interaction.response.send_message(f"Deleted flag `#{flag_id}`.", ephemeral=True)
+        await interaction.response.send_message(embed=ok_embed(f"Deleted flag `#{flag_id}`."), ephemeral=True)
 
     @flag.command(name="list", description="List active flags")
     @app_commands.choices(flag_type=TYPE_CHOICES)
@@ -204,7 +227,8 @@ class Flags(BaseCog):
             include_expired=include_expired,
             min_strike_weight=min_strike_weight,
         )
-        chunks = chunk_lines([flag_line(r) for r in rows] or ["No flags."])
+        lines = [flags_summary(rows), "", *(flag_line(r) for r in rows)] if rows else ["No flags."]
+        chunks = chunk_lines(lines)
         embeds = []
         for i, c in enumerate(chunks[:10]):
             e = await make_embed(self.bot, interaction.guild_id, title="Flags" if i == 0 else None)
@@ -231,7 +255,8 @@ class Flags(BaseCog):
             clan_tags=clan_tags,
             min_weight=min_strike_weight,
         )
-        lines = [summary_line(i, r) for i, r in enumerate(rows, 1)] or ["No active strikes."]
+        width = chip_width(r["total"] for r in rows)
+        lines = [summary_line(i, r, width) for i, r in enumerate(rows, 1)] or ["No active strikes."]
         chunks = chunk_lines(lines)
         embeds = []
         for i, c in enumerate(chunks[:10]):

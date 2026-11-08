@@ -14,14 +14,18 @@ from discord import app_commands
 
 from clashhero.cogs._base import BaseCog
 from clashhero.cogs._war_embeds import (
+    cwl_member_table,
+    cwl_season_label,
+    fill_cwl_history,
     lineup_embed,
+    plural,
     resolve_player_tags,
     standings_table,
     state_value,
     war_overview_embed,
 )
 from clashhero.repos import war as war_repo
-from clashhero.utils.fmt import guild_color, make_embed, stars, table
+from clashhero.utils.fmt import guild_color, make_embed
 from clashhero.utils.resolve import ResolveError, clan_autocomplete, player_autocomplete, resolve_clan
 from clashhero.utils.seasons import cwl_season_id
 
@@ -77,6 +81,10 @@ class CWL(BaseCog):
         if not tags:
             return []
         return [w async for w in self.coc.get_league_wars(tags)]
+
+    async def _clan_name(self, clan_tag: str) -> str:
+        row = await self.db.get_clan_row(clan_tag)
+        return row["name"] if row else clan_tag
 
     async def _our_war(self, clan_tag: str, group: Any, round_no: int | None) -> tuple[int, Any]:
         """(round number, our war). Default round: latest one that has started."""
@@ -183,20 +191,17 @@ class CWL(BaseCog):
         tag = await resolve_clan(interaction, clan)
         s = _season(season)
         rows = await war_repo.cwl_member_stats(self.db, tag, s)
-        data = [
-            (m.name[:14], f"{m.attacks}/{m.rounds}", m.missed, m.stars, f"{m.avg_destruction:.0f}")
-            for m in sorted(rows, key=lambda m: (-m.missed, m.name))
-        ]
+        missed = sum(m.missed for m in rows)
         e = await make_embed(
             self.bot,
             interaction.guild_id,
-            title=f"CWL attacks · {s}",
+            title=f"CWL attacks · {await self._clan_name(tag)}",
             description=(
-                table(data, ["Player", "Hits", "Miss", "★", "Dst"])
-                if data
-                else "No CWL data recorded for this season."
-            )[:4096],
+                cwl_member_table(rows, missed=True) if rows else "No CWL data recorded for this season."
+            ),
         )
+        footer = f"CWL {cwl_season_label(s)}"
+        e.set_footer(text=footer + (f" · {plural(missed, 'missed attack')}" if missed else ""))
         await interaction.response.send_message(embed=e)
 
     @cwl.command(name="stars", description="Season star leaderboard for the clan's CWL")
@@ -208,20 +213,13 @@ class CWL(BaseCog):
         tag = await resolve_clan(interaction, clan)
         s = _season(season)
         rows = await war_repo.cwl_member_stats(self.db, tag, s)
-        data = [
-            (i + 1, m.name[:14], m.stars, m.new_stars, m.triples, f"{m.avg_destruction:.0f}", m.stars_allowed)
-            for i, m in enumerate(rows)
-        ]
         e = await make_embed(
             self.bot,
             interaction.guild_id,
-            title=f"CWL stars · {s}",
-            description=(
-                table(data, ["#", "Player", "★", "New★", "3★", "Dst", "★Def"])
-                if data
-                else "No CWL data recorded for this season."
-            )[:4096],
+            title=f"CWL stars · {await self._clan_name(tag)}",
+            description=cwl_member_table(rows) if rows else "No CWL data recorded for this season.",
         )
+        e.set_footer(text=f"CWL {cwl_season_label(s)}")
         await interaction.response.send_message(embed=e)
 
     @cwl.command(name="history", description="A player's round-by-round CWL attacks and defenses")
@@ -236,30 +234,14 @@ class CWL(BaseCog):
     ) -> None:
         tags = await resolve_player_tags(interaction, player, user)
         rows = await war_repo.player_cwl_history(self.db, tags, _season(season) if season else None)
-        lines = []
-        current = None
-        for r in rows[:40]:
-            if r["cwl_season"] != current:
-                current = r["cwl_season"]
-                lines.append(f"**{current}**")
-            a, d = r["attack"], r["defense"]
-            att = (
-                f"{stars(a['stars'])} {a['destruction']:.0f}% on TH{a['defender_th']}"
-                if a
-                else ("missed" if r["state"] == "warEnded" else "—")
-            )
-            dfn = f"gave {d['stars']}★ {d['destruction']:.0f}%" if d else "not attacked"
-            lines.append(
-                f"R{r['cwl_round'] or '?'} vs {discord.utils.escape_markdown(r['opponent_name'] or '?')}"
-                f" · {r['name']} (TH{r['town_hall']}): {att} · def {dfn}"
-            )
-        e = await make_embed(
-            self.bot,
-            interaction.guild_id,
-            title="CWL history",
-            description="\n".join(lines)[:4096] or "No CWL wars recorded for these accounts.",
-        )
-        await interaction.response.send_message(embed=e)
+        if len(tags) == 1:
+            latest = {r["player_tag"]: r["name"] for r in reversed(rows)}  # rows are newest first
+            names = latest or await war_repo.player_names(self.db, tags)
+            name = names.get(tags[0], tags[0])
+        else:
+            name = f"{(user or interaction.user).display_name} ({len(tags)} accounts)"
+        e = await make_embed(self.bot, interaction.guild_id, title=f"CWL history · {name}")
+        await interaction.response.send_message(embed=fill_cwl_history(e, rows))
 
 
 async def setup(bot) -> None:

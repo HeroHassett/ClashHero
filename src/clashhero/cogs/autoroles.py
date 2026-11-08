@@ -24,6 +24,7 @@ from clashhero.utils.checks import manager, require
 from clashhero.utils.fmt import make_embed
 from clashhero.utils.ranked import LEAGUE_TIERS
 from clashhero.utils.resolve import ResolveError, clan_autocomplete, resolve_clan
+from clashhero.utils.style import SEP, chip, fail_embed, ok_embed
 
 log = logging.getLogger(__name__)
 
@@ -40,7 +41,45 @@ KIND_CHOICES = [
         ("War lineup", "war"),
     ]
 ]
+KIND_LABEL = {c.value: c.name for c in KIND_CHOICES}
 DEFAULT_LEAGUES = list(LEAGUE_TIERS)  # ranked tiers, from utils/ranked.py
+
+
+def _onoff(value) -> str:
+    return "✅" if value else "❌"
+
+
+def settings_text(s) -> str:
+    """The Settings field of /autorole list."""
+    return "\n".join(
+        (
+            SEP.join(
+                (
+                    f"Auto update {_onoff(s['auto_update'])}",
+                    f"Removal delay {chip(str(s['removal_delay_hours']) + 'h')}",
+                    f"Allow not linked {_onoff(s['allow_not_linked'])}",
+                )
+            ),
+            SEP.join(
+                (
+                    f"Non-family accounts count {_onoff(s['allow_non_family'])}",
+                    f"Verified-only clan roles {_onoff(s['only_verified_clan_roles'])}",
+                )
+            ),
+        )
+    )
+
+
+def sync_text(added: int, removed: int, who: str | None = None, nick_changed: bool = False) -> str:
+    """``Roles synced for @user · `+2` added · `-1` removed · nickname updated``."""
+    parts = [
+        f"Roles synced for {who}" if who else "Roles synced",
+        f"{chip(f'+{added}')} added",
+        f"{chip(f'-{removed}')} removed",
+    ]
+    if nick_changed:
+        parts.append("nickname updated")
+    return SEP.join(parts) + "."
 
 
 @dataclass
@@ -273,7 +312,8 @@ class Autoroles(BaseCog):
                 self.db, interaction.guild_id, only_verified_clan_roles=int(only_verified)
             )
         await interaction.response.send_message(
-            f"Clan roles updated for `{tag}`. Run `/autorole refresh` to apply now.", ephemeral=True
+            embed=ok_embed(f"Clan roles updated for `{tag}`. Run `/autorole refresh` to apply now."),
+            ephemeral=True,
         )
 
     @autorole.command(name="town-hall", description="Role for a Town Hall level (omit role to remove)")
@@ -286,7 +326,7 @@ class Autoroles(BaseCog):
     ) -> None:
         await self._set(interaction, "town_hall", "", str(level), role)
         await interaction.response.send_message(
-            f"TH{level} → {role.mention if role else 'removed'}.", ephemeral=True
+            embed=ok_embed(f"TH{level} → {role.mention if role else 'removed'}."), ephemeral=True
         )
 
     @autorole.command(name="builder-hall", description="Role for a Builder Hall level")
@@ -299,7 +339,7 @@ class Autoroles(BaseCog):
     ) -> None:
         await self._set(interaction, "builder_hall", "", str(level), role)
         await interaction.response.send_message(
-            f"BH{level} → {role.mention if role else 'removed'}.", ephemeral=True
+            embed=ok_embed(f"BH{level} → {role.mention if role else 'removed'}."), ephemeral=True
         )
 
     async def _league_autocomplete(self, interaction, current: str):
@@ -341,7 +381,7 @@ class Autoroles(BaseCog):
         else:
             raise ResolveError("Give a league, or both min_trophies and max_trophies.")
         await interaction.response.send_message(
-            f"{label} → {role.mention if role else 'removed'}.", ephemeral=True
+            embed=ok_embed(f"{label} → {role.mention if role else 'removed'}."), ephemeral=True
         )
 
     @autorole.command(name="builder-leagues", description="Role for a Builder Base league")
@@ -352,7 +392,7 @@ class Autoroles(BaseCog):
     ) -> None:
         await self._set(interaction, "builder_league", "", league.strip().lower(), role)
         await interaction.response.send_message(
-            f"{league} → {role.mention if role else 'removed'}.", ephemeral=True
+            embed=ok_embed(f"{league} → {role.mention if role else 'removed'}."), ephemeral=True
         )
 
     @autorole.command(name="family", description="Family / guest / verified / linked / leader roles")
@@ -387,7 +427,10 @@ class Autoroles(BaseCog):
         for k in changed:
             await self._set(interaction, "family", "", k, given[k])
         await interaction.response.send_message(
-            f"Updated: {', '.join(changed) or 'nothing'}.", ephemeral=True
+            embed=ok_embed(f"Family roles updated: {', '.join(changed)}.")
+            if changed
+            else fail_embed("Nothing changed. Pick at least one role."),
+            ephemeral=True,
         )
 
     @autorole.command(name="wars", description="Role for a clan's war lineup while the war runs")
@@ -399,7 +442,7 @@ class Autoroles(BaseCog):
         tag = await resolve_clan(interaction, clan)
         await self._set(interaction, "war", tag, "war", role)
         await interaction.response.send_message(
-            f"War role for `{tag}` → {role.mention if role else 'removed'}.", ephemeral=True
+            embed=ok_embed(f"War role for `{tag}` → {role.mention if role else 'removed'}."), ephemeral=True
         )
 
     @autorole.command(name="list", description="Show autorole configuration")
@@ -411,18 +454,12 @@ class Autoroles(BaseCog):
             label = f"{m.scope} " if m.scope else ""
             groups.setdefault(m.kind, []).append(f"{label}{m.key} → <@&{m.role_id}>")
         for kind, lines in groups.items():
-            embed.add_field(name=kind, value="\n".join(lines)[:1024], inline=False)
-        s = ctx.settings
-        embed.add_field(
-            name="Settings",
-            value=(
-                f"auto update: {bool(s['auto_update'])} · removal delay: "
-                f"{s['removal_delay_hours']}h · allow not linked: {bool(s['allow_not_linked'])}\n"
-                f"non-family accounts count: {bool(s['allow_non_family'])} · "
-                f"verified-only clan roles: {bool(s['only_verified_clan_roles'])}"
-            ),
-            inline=False,
-        )
+            embed.add_field(
+                name=f"{KIND_LABEL.get(kind, kind)} ({len(lines)})",
+                value="\n".join(lines)[:1024],
+                inline=False,
+            )
+        embed.add_field(name="Settings", value=settings_text(ctx.settings), inline=False)
         if not groups:
             embed.description = "No autoroles configured."
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -440,7 +477,10 @@ class Autoroles(BaseCog):
         scope = await resolve_clan(interaction, clan) if clan else None
         n = await repo.delete_kind(self.db, interaction.guild_id, kind.value, scope)
         await interaction.response.send_message(
-            f"Removed {n} {kind.name.lower()} mapping(s). Existing roles stay until you remove them.",
+            embed=ok_embed(
+                f"Removed {chip(n)} {kind.name.lower()} mapping(s). "
+                "Existing roles stay until you remove them."
+            ),
             ephemeral=True,
         )
 
@@ -453,7 +493,7 @@ class Autoroles(BaseCog):
             await require(interaction, "bot")
             await interaction.response.defer(ephemeral=True)
             r = await self.sync_guild(interaction.guild)
-            await interaction.followup.send(f"Done: +{r.added} / -{r.removed} roles.")
+            await interaction.followup.send(embed=ok_embed(sync_text(r.added, r.removed, "everyone")))
             return
         target = user or interaction.user
         if target.id != interaction.user.id:
@@ -462,8 +502,9 @@ class Autoroles(BaseCog):
         ctx = await self.context(interaction.guild_id)
         accounts = (await repo.accounts_by_user(self.db, [target.id])).get(target.id, [])
         r = await self.sync_member(target, ctx, accounts)
-        nick = " Nickname updated." if r.nick_changed else ""
-        await interaction.followup.send(f"{target.mention}: +{r.added} / -{r.removed} roles.{nick}")
+        await interaction.followup.send(
+            embed=ok_embed(sync_text(r.added, r.removed, target.mention, r.nick_changed))
+        )
 
     @autorole.command(name="config", description="Autorole behaviour settings")
     @app_commands.describe(
@@ -489,7 +530,7 @@ class Autoroles(BaseCog):
             allow_not_linked=None if allow_not_linked is None else int(allow_not_linked),
             allow_non_family=None if allow_non_family is None else int(allow_non_family),
         )
-        await interaction.response.send_message("Autorole settings saved.", ephemeral=True)
+        await interaction.response.send_message(embed=ok_embed("Autorole settings saved."), ephemeral=True)
 
     # ------------------------------------------------------------------ /nickname
 
@@ -541,7 +582,7 @@ class Autoroles(BaseCog):
         await repo.get_settings(self.db, interaction.guild_id)
         await repo.update_settings(self.db, interaction.guild_id, **updates)
         await interaction.response.send_message(
-            "Nickname settings saved. Use `/nickname preview` to check.", ephemeral=True
+            embed=ok_embed("Nickname settings saved. Use `/nickname preview` to check."), ephemeral=True
         )
 
     @nickname.command(name="preview", description="Preview the nickname a user would get")
@@ -556,11 +597,14 @@ class Autoroles(BaseCog):
         # Preview even when disabled.
         ctx.settings = {**dict(s), "nick_enabled": 1}
         nick = self.nickname_for(target, accounts, ctx)
-        status = "" if enabled else " (nicknames are currently disabled)"
-        await interaction.response.send_message(
-            f"{target.mention} → `{nick}`{status}" if nick else f"No nickname would be set{status}.",
-            ephemeral=True,
+        status = "" if enabled else "\nℹ️ Nicknames are currently disabled."
+        embed = await make_embed(
+            self.bot,
+            interaction.guild_id,
+            title="Nickname preview",
+            description=(f"{target.mention} → `{nick}`" if nick else "No nickname would be set.") + status,
         )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 async def setup(bot) -> None:

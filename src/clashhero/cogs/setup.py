@@ -11,6 +11,7 @@ from clashhero.cogs._base import BaseCog
 from clashhero.utils.checks import has_permission, manager
 from clashhero.utils.fmt import make_embed
 from clashhero.utils.resolve import ResolveError, clan_autocomplete, parse_tag, resolve_clan
+from clashhero.utils.style import SEP, chip, fail_embed, ok_embed
 
 ROLE_OPTIONS = {
     "bot_manager": "bot_manager_role",
@@ -39,6 +40,12 @@ def parse_hex_color(raw: str) -> int:
     if len(value) != 6:
         raise ValueError(raw)
     return int(value, 16)
+
+
+def clan_linked_text(name: str, tag: str, channel_mention: str | None = None) -> str:
+    """Confirmation for /setup clan: what was linked and the next step."""
+    default = f" Default clan for {channel_mention}." if channel_mention else ""
+    return f"Linked **{name}** `{tag}` to this server.{default}\nNext: `/logs clan` to pick log channels."
 
 
 async def is_clan_leader(bot, user_id: int, clan_tag: str) -> bool:
@@ -86,17 +93,20 @@ class Setup(BaseCog):
         if channel is not None:
             await self.db.set_channel_clan(channel.id, interaction.guild_id, clan.tag)
         await self.collector.refresh_clan_now(clan.tag)
-        extra = f" Default clan for {channel.mention}." if channel else ""
-        await interaction.followup.send(f"Linked **{clan.name}** (`{clan.tag}`).{extra}")
+        await interaction.followup.send(
+            embed=ok_embed(clan_linked_text(clan.name, clan.tag, channel.mention if channel else None))
+        )
 
     @setup_group.command(name="remove-clan", description="Unlink a clan and all its features")
     @app_commands.autocomplete(clan=clan_autocomplete)
     @manager()
     async def setup_remove(self, interaction: discord.Interaction, clan: str) -> None:
         tag = await resolve_clan(interaction, clan)
+        row = await self.db.get_clan_row(tag)
         await self.db.remove_guild_clan(interaction.guild_id, tag)
+        label = f"**{row['name']}** `{tag}`" if row and row["name"] else f"`{tag}`"
         await interaction.response.send_message(
-            f"Unlinked `{tag}` and removed its logs and live messages.", ephemeral=True
+            embed=ok_embed(f"Unlinked {label} and removed its logs and live messages."), ephemeral=True
         )
 
     @setup_group.command(name="channel", description="Set or clear a channel's default clan")
@@ -117,7 +127,7 @@ class Setup(BaseCog):
             tag = await resolve_clan(interaction, clan)
             await self.db.set_channel_clan(target.id, interaction.guild_id, tag)
             msg = f"`{tag}` is now the default clan for {target.mention}."
-        await interaction.response.send_message(msg, ephemeral=True)
+        await interaction.response.send_message(embed=ok_embed(msg), ephemeral=True)
 
     @setup_group.command(name="list", description="Show linked clans and enabled features")
     async def setup_list(self, interaction: discord.Interaction) -> None:
@@ -136,11 +146,18 @@ class Setup(BaseCog):
             clan_live = sorted({lv["kind"] for lv in live if lv["scope"] == tag})
             chans = [f"<#{c['channel_id']}>" for c in channels if c["clan_tag"] == tag]
             lines = [
-                f"Alias: `{r['alias']}`" if r["alias"] else None,
-                f"Category: {r['category']}" if r["category"] else None,
-                f"Default in: {', '.join(chans)}" if chans else None,
-                f"Logs: {', '.join(clan_logs)}" if clan_logs else "Logs: none",
-                f"Live: {', '.join(clan_live)}" if clan_live else None,
+                SEP.join(
+                    x
+                    for x in (
+                        f"Alias {chip(r['alias'])}" if r["alias"] else None,
+                        f"Category **{r['category']}**" if r["category"] else None,
+                    )
+                    if x
+                )
+                or None,
+                f"📍 Default in {', '.join(chans)}" if chans else None,
+                f"📜 Logs: {SEP.join(clan_logs)}" if clan_logs else "📜 Logs: none",
+                f"📡 Live: {SEP.join(clan_live)}" if clan_live else None,
             ]
             embed.add_field(
                 name=f"{r['name'] or '?'} ({tag})",
@@ -150,7 +167,7 @@ class Setup(BaseCog):
         if server_logs:
             embed.add_field(
                 name="Server logs",
-                value="\n".join(f"{s['log_type']}: <#{s['channel_id']}>" for s in server_logs),
+                value="\n".join(f"{s['log_type']} → <#{s['channel_id']}>" for s in server_logs)[:1024],
                 inline=False,
             )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -169,7 +186,9 @@ class Setup(BaseCog):
             await self.db.set_clan_alias(interaction.guild_id, tag, alias)
         except sqlite3.IntegrityError as e:
             raise ResolveError(f"Alias `{alias}` is already used by another clan.") from e
-        await interaction.response.send_message(f"`{tag}` → alias `{alias}`.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=ok_embed(f"`{tag}` now has the alias `{alias}`."), ephemeral=True
+        )
 
     @alias.command(name="remove", description="Remove a clan's alias")
     @app_commands.autocomplete(clan=clan_autocomplete)
@@ -177,15 +196,26 @@ class Setup(BaseCog):
     async def alias_remove(self, interaction: discord.Interaction, clan: str) -> None:
         tag = await resolve_clan(interaction, clan)
         await self.db.set_clan_alias(interaction.guild_id, tag, None)
-        await interaction.response.send_message(f"Removed alias for `{tag}`.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=ok_embed(f"Removed the alias for `{tag}`."), ephemeral=True
+        )
 
     @alias.command(name="list", description="List clan aliases")
     async def alias_list(self, interaction: discord.Interaction) -> None:
         rows = await self.db.get_guild_clan_rows(interaction.guild_id)
-        lines = [f"`{r['alias']}` → {r['name'] or '?'} (`{r['clan_tag']}`)" for r in rows if r["alias"]]
-        await interaction.response.send_message(
-            "\n".join(lines) or "No aliases set. Use `/alias set`.", ephemeral=True
+        aliased = [r for r in rows if r["alias"]]
+        width = max((len(r["alias"]) for r in aliased), default=0)
+        lines = [
+            f"{chip(r['alias'], width, right=False)} → **{r['name'] or '?'}** `{r['clan_tag']}`"
+            for r in aliased
+        ]
+        embed = await make_embed(
+            self.bot,
+            interaction.guild_id,
+            title="Clan aliases",
+            description="\n".join(lines)[:4000] or "No aliases set. Use `/alias set`.",
         )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ------------------------------------------------------------------ /category
 
@@ -204,8 +234,8 @@ class Setup(BaseCog):
         await self.db.set_clan_category(
             interaction.guild_id, tag, category.strip() if category else None, order
         )
-        msg = f"`{tag}` → **{category}**" if category else f"Cleared category for `{tag}`"
-        await interaction.response.send_message(msg + ".", ephemeral=True)
+        msg = f"`{tag}` is now in **{category}**" if category else f"Cleared the category for `{tag}`"
+        await interaction.response.send_message(embed=ok_embed(msg + "."), ephemeral=True)
 
     @category.command(name="list", description="Show clans grouped by category")
     async def category_list(self, interaction: discord.Interaction) -> None:
@@ -217,7 +247,7 @@ class Setup(BaseCog):
             )
         embed = await make_embed(self.bot, interaction.guild_id, title="Clan categories")
         for name, clans in groups.items():
-            embed.add_field(name=name, value="\n".join(clans)[:1024], inline=False)
+            embed.add_field(name=f"{name} ({len(clans)})", value="\n".join(clans)[:1024], inline=False)
         if not groups:
             embed.description = "No clans linked yet."
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -253,7 +283,12 @@ class Setup(BaseCog):
         if clear is not None:
             await self.db.set_guild_setting(gid, ROLE_OPTIONS[clear.value], None)
             changed.append(f"{clear.name} cleared")
-        await interaction.response.send_message("\n".join(changed) or "Nothing changed.", ephemeral=True)
+        embed = (
+            ok_embed("Manager roles updated.\n" + "\n".join(changed))
+            if changed
+            else fail_embed("Nothing changed. Pick a role to set, or one to clear.")
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @config.command(name="color", description="Set the embed color (hex, e.g. #FF8800)")
     @manager()
@@ -263,7 +298,8 @@ class Setup(BaseCog):
         except ValueError as e:
             raise ResolveError("Use a hex color like `#FF8800`.") from e
         await self.db.set_guild_setting(interaction.guild_id, "embed_color", value)
-        embed = discord.Embed(description="Embed color updated.", color=value)
+        embed = ok_embed(f"Embed color set to `#{value:06X}`.")
+        embed.color = value  # preview the new color
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @config.command(name="show", description="Show current bot configuration")

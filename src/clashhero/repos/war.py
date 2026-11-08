@@ -37,6 +37,7 @@ class AttackSummary:
     fresh: int = 0
     fresh_triples: int = 0
     missed: int = 0
+    town_hall: int | None = None  # attacker's TH in their latest attack
     buckets: dict[str, list[int]] = field(
         default_factory=lambda: {"up": [0, 0], "even": [0, 0], "down": [0, 0]}
     )  # bucket -> [attacks, triples]
@@ -67,7 +68,7 @@ class AttackSummary:
 
 
 def summarize_attacks(rows: Iterable[Any], missed: int = 0) -> AttackSummary:
-    """Rows need stars, destruction, is_fresh, attacker_th, defender_th."""
+    """Rows need stars, destruction, is_fresh, attacker_th, defender_th (oldest first)."""
     s = AttackSummary(missed=missed)
     for r in rows:
         s.attacks += 1
@@ -79,6 +80,7 @@ def summarize_attacks(rows: Iterable[Any], missed: int = 0) -> AttackSummary:
         if r["is_fresh"]:
             s.fresh += 1
             s.fresh_triples += triple
+        s.town_hall = r["attacker_th"] or s.town_hall
         b = s.buckets[th_bucket(r["attacker_th"], r["defender_th"])]
         b[0] += 1
         b[1] += triple
@@ -91,6 +93,7 @@ class DefenseSummary:
     triples_allowed: int = 0
     stars_allowed: int = 0
     destruction: float = 0.0
+    town_hall: int | None = None  # defender's TH in their latest defense
 
     @property
     def hold_rate(self) -> float:
@@ -106,13 +109,15 @@ class DefenseSummary:
         return self.destruction / self.defenses if self.defenses else 0.0
 
 
-def summarize_defenses(rows: Iterable[Any]) -> DefenseSummary:
+def summarize_defenses(rows: Iterable[dict]) -> DefenseSummary:
+    """Rows need stars, destruction and optionally defender_th (oldest first)."""
     s = DefenseSummary()
     for r in rows:
         s.defenses += 1
         s.stars_allowed += r["stars"]
         s.destruction += r["destruction"]
         s.triples_allowed += r["stars"] == 3
+        s.town_hall = r.get("defender_th") or s.town_hall
     return s
 
 
@@ -345,6 +350,32 @@ async def player_names(db: Database, tags: Iterable[str]) -> dict[str, str]:
     return names
 
 
+async def count_wars(
+    db: Database,
+    clan_tags: Sequence[str],
+    *,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    war_type: str | None = None,
+) -> int:
+    """Wars our clans fought (battle day started) in the period, for stats footers."""
+    if not clan_tags:
+        return 0
+    sql = (
+        "SELECT COUNT(*) FROM wars w WHERE w.state != 'preparation' "
+        f"AND w.clan_tag IN ({','.join('?' * len(clan_tags))})"
+    )
+    params: list[Any] = list(clan_tags)
+    if since:
+        sql += " AND w.preparation_start >= ?"
+        params.append(since.isoformat())
+    if until:
+        sql += " AND w.preparation_start < ?"
+        params.append(until.isoformat())
+    clause, extra = _type_clause(war_type)
+    return await db.fetchval(sql + clause, params + extra, 0)
+
+
 async def attack_leaderboard(
     db: Database,
     clan_tags: Sequence[str],
@@ -502,14 +533,15 @@ async def cwl_member_stats(db: Database, clan_tag: str, season: str) -> list[CWL
 async def player_cwl_history(
     db: Database, player_tags: Sequence[str], season: str | None = None
 ) -> list[dict]:
-    """One row per CWL war the player was in: season, round, opponent, attack + best defense."""
+    """One row per CWL war the player was in, newest first: season, round, clan name, opponent,
+    the attack (with ``target_pos``, the enemy base's map position) and the best defense."""
     if not player_tags:
         return []
     q = ",".join("?" * len(player_tags))
     sql = (
         "SELECT w.id AS war_id, w.cwl_season, w.cwl_round, w.opponent_name, w.state, w.clan_tag, "
-        "m.player_tag, m.name, m.town_hall, m.map_position FROM war_members m "
-        "JOIN wars w ON w.id = m.war_id "
+        "c.name AS clan_name, m.player_tag, m.name, m.town_hall, m.map_position FROM war_members m "
+        "JOIN wars w ON w.id = m.war_id LEFT JOIN clans c ON c.clan_tag = w.clan_tag "
         f"WHERE w.war_type = 'cwl' AND m.is_opponent = 0 AND m.player_tag IN ({q})"
     )
     params: list[Any] = list(player_tags)
@@ -519,7 +551,9 @@ async def player_cwl_history(
     out = []
     for r in await db.fetchall(sql + " ORDER BY w.preparation_start DESC", params):
         att = await db.fetchone(
-            "SELECT * FROM war_attacks WHERE war_id = ? AND attacker_tag = ? AND is_opponent = 0",
+            "SELECT a.*, COALESCE(a.defender_pos, (SELECT d.map_position FROM war_members d "
+            " WHERE d.war_id = a.war_id AND d.player_tag = a.defender_tag)) AS target_pos "
+            "FROM war_attacks a WHERE a.war_id = ? AND a.attacker_tag = ? AND a.is_opponent = 0",
             (r["war_id"], r["player_tag"]),
         )
         dfn = await db.fetchone(

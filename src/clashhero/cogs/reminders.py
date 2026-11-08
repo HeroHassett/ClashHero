@@ -16,6 +16,7 @@ from clashhero.utils.checks import manager
 from clashhero.utils.fmt import make_embed
 from clashhero.utils.resolve import ResolveError, clan_autocomplete, resolve_clans
 from clashhero.utils.seasons import clan_games
+from clashhero.utils.style import ICONS, SEP, chip, fail_embed, ok_embed
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ TYPE_CHOICES = [
     app_commands.Choice(name="Clan Games", value="games"),
 ]
 TYPE_LABEL = {c.value: c.name for c in TYPE_CHOICES}
+TYPE_ICON = {"war": ICONS["war"], "cwl": ICONS["cwl"], "raid": ICONS["capital"], "games": ICONS["games"]}
 MODE_CHOICES = [
     app_commands.Choice(name="Opt-in: only ping members with the role", value="optin"),
     app_commands.Choice(name="Opt-out: don't ping members with the role", value="optout"),
@@ -52,6 +54,22 @@ def _dt(iso: str | None) -> datetime | None:
         return None
     d = datetime.fromisoformat(iso)
     return d if d.tzinfo else d.replace(tzinfo=UTC)
+
+
+def reminder_block(r) -> str:
+    """One reminder in /reminders list: header line, channel and clans, then the message and
+    any ping filters as quotes."""
+    type_ = r["type"]
+    head = (
+        f"`#{r['id']}` {TYPE_ICON.get(type_, '⏰')} **{TYPE_LABEL.get(type_, type_)}**"
+        f"{SEP}{chip(R.format_duration(r['duration_seconds']))} before the end"
+    )
+    clans = " ".join(chip(t) for t in (r["clans"] or "").split())
+    lines = [head, SEP.join(x for x in (f"<#{r['channel_id']}>", clans) if x), f"> {r['message'][:80]}"]
+    desc = R.Filters.from_row(r).describe()
+    if desc:
+        lines.append(f"> Only: {desc}")
+    return "\n".join(lines)
 
 
 def build_messages(
@@ -321,8 +339,11 @@ class Reminders(BaseCog):
         )
         desc = filters.describe()
         await interaction.response.send_message(
-            f"Reminder **#{rid}** created: {type.name}, {R.format_duration(seconds)} before the end, "
-            f"in {target.mention} for {len(tags)} clan(s)." + (f"\nOnly pinging: {desc}" if desc else ""),
+            embed=ok_embed(
+                f"Reminder `#{rid}` created: **{type.name}**, {chip(R.format_duration(seconds))} before "
+                f"the end, in {target.mention} for {len(tags)} clan(s)."
+                + (f"\nOnly pinging: {desc}" if desc else "")
+            ),
             ephemeral=True,
         )
 
@@ -332,20 +353,12 @@ class Reminders(BaseCog):
         self, interaction: discord.Interaction, type: app_commands.Choice[str] | None = None
     ) -> None:
         rows = await R.list_reminders(self.db, interaction.guild_id, type.value if type else None)
-        lines = []
-        for r in rows:
-            line = (
-                f"**#{r['id']}** {TYPE_LABEL.get(r['type'], r['type'])} · "
-                f"{R.format_duration(r['duration_seconds'])} "
-                f"before end · <#{r['channel_id']}> · {r['clans']}\n> {r['message'][:80]}"
-            )
-            desc = R.Filters.from_row(r).describe()
-            lines.append(line + (f"\n> Only: {desc}" if desc else ""))
         embed = await make_embed(
             self.bot,
             interaction.guild_id,
             title="Reminders",
-            description="\n".join(lines)[:4000] or "No reminders. Use `/reminders create`.",
+            description="\n\n".join(reminder_block(r) for r in rows)[:4000]
+            or "No reminders. Use `/reminders create`.",
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -412,7 +425,8 @@ class Reminders(BaseCog):
             **changes,
         )
         await interaction.response.send_message(
-            f"Reminder #{id} updated." if ok else "Nothing to change.", ephemeral=True
+            embed=ok_embed(f"Reminder `#{id}` updated.") if ok else fail_embed("Nothing to change."),
+            ephemeral=True,
         )
 
     @reminders.command(name="delete", description="Delete a reminder")
@@ -420,7 +434,8 @@ class Reminders(BaseCog):
     async def delete(self, interaction: discord.Interaction, id: int) -> None:
         ok = await R.delete_reminder(self.db, interaction.guild_id, id)
         await interaction.response.send_message(
-            f"Deleted reminder #{id}." if ok else f"No reminder #{id}.", ephemeral=True
+            embed=ok_embed(f"Deleted reminder `#{id}`.") if ok else fail_embed(f"No reminder `#{id}`."),
+            ephemeral=True,
         )
 
     @reminders.command(name="now", description="Ping members with remaining attacks right now")
@@ -443,14 +458,14 @@ class Reminders(BaseCog):
             if event:
                 sections.append((await self._clan_name(tag), event[2]))
         if not sections:
-            await interaction.followup.send(f"No active {type.name} for those clans.")
+            await interaction.followup.send(embed=fail_embed(f"No active {type.name} for those clans."))
             return
         links = await self.db.links_for_tags([p.player_tag for _, ps in sections for p in ps])
         msgs = build_messages(
             message, sections, links, True, await self._role_filter(interaction.guild_id, type.value)
         )
         if not msgs:
-            await interaction.followup.send("Everyone is done. 🎉")
+            await interaction.followup.send(embed=ok_embed("Everyone is done. 🎉"))
             return
         for text in msgs:
             await interaction.followup.send(text, allowed_mentions=discord.AllowedMentions(users=True))
@@ -467,13 +482,15 @@ class Reminders(BaseCog):
     ) -> None:
         if role is None:
             await R.set_config(self.db, interaction.guild_id, type.value, None, "optin")
-            await interaction.response.send_message(f"{type.name} reminders ping everyone.", ephemeral=True)
+            await interaction.response.send_message(
+                embed=ok_embed(f"**{type.name}** reminders ping everyone."), ephemeral=True
+            )
             return
         m = mode.value if mode else "optin"
         await R.set_config(self.db, interaction.guild_id, type.value, role.id, m)
         verb = "only members with" if m == "optin" else "everyone except members with"
         await interaction.response.send_message(
-            f"{type.name} reminders will ping {verb} {role.mention}.", ephemeral=True
+            embed=ok_embed(f"**{type.name}** reminders will ping {verb} {role.mention}."), ephemeral=True
         )
 
 

@@ -11,6 +11,7 @@ from clashhero.cogs import legends as cog
 from clashhero.events import LegendBattle
 from clashhero.repos import legends as repo
 from clashhero.services.battlelog import army_link
+from clashhero.utils.style import FAILURE
 
 DAY = "2026-11-07"
 SEASON = "2026-11-30"
@@ -233,7 +234,7 @@ async def test_view_army_button_without_army(db):
         inter = _interaction(db)
         await cog.ViewArmyButton(event_id).callback(inter)
         (msg,) = inter.response.sent
-        assert msg.ephemeral and msg.embed is None and "No army" in msg.content
+        assert msg.ephemeral and msg.embed.color == FAILURE and "No army" in msg.embed.description
 
 
 async def test_view_army_button_bad_code(db):
@@ -244,7 +245,7 @@ async def test_view_army_button_bad_code(db):
     inter = _interaction(db)
     await cog.ViewArmyButton(eid).callback(inter)
     (msg,) = inter.response.sent
-    assert "Couldn't read" in msg.content
+    assert msg.embed.color == FAILURE and "Couldn't read" in msg.embed.description
 
 
 def test_view_army_template_round_trip():

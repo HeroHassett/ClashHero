@@ -20,6 +20,7 @@ from clashhero.utils.resolve import (
     player_autocomplete,
     resolve_clan,
 )
+from clashhero.utils.style import SEP, chip, header, ok_embed
 
 MAX_ACCOUNTS = 25
 
@@ -29,20 +30,33 @@ def account_line(r, clan_names: dict[str, str]) -> str:
     name = r["name"] or "?"
     th = f"TH{r['town_hall']}" if r["town_hall"] else "TH?"
     clan = clan_names.get(r["clan_tag"] or "", r["clan_tag"] or "no clan")
-    trophies = f"🏆 {r['trophies']}" if r["trophies"] is not None else ""
-    return f"{marks}[{name}]({player_link(r['player_tag'])}) `{r['player_tag']}` {th} {trophies} · {clan}"
+    trophies = f"🏆 {r['trophies']:,}" if r["trophies"] is not None else None
+    facts = SEP.join(x for x in (chip(th), trophies, clan) if x)
+    return f"{marks}[{name}]({player_link(r['player_tag'])}) `{r['player_tag']}` · {facts}"
+
+
+def account_label(name: str, tag: str, town_hall: int | None = None) -> str:
+    """``**dev** `#20LGL8GV0` (TH18)`` for result messages."""
+    th = f" (TH{town_hall})" if town_hall else ""
+    return f"**{name}** `{tag}`{th}"
 
 
 def link_list_lines(members, links: dict[str, int]) -> list[str]:
-    """Clan members with their linked user; unlinked members listed last."""
+    """Clan members with their linked user under a "Linked" header; unlinked members last,
+    under their own header."""
     linked, unlinked = [], []
     for m in members:
         uid = links.get(m["player_tag"])
         if uid:
-            linked.append(f"✅ {m['name']} `{m['player_tag']}` → <@{uid}>")
+            linked.append(f"{m['name']} `{m['player_tag']}` → <@{uid}>")
         else:
-            unlinked.append(f"❌ {m['name']} `{m['player_tag']}`")
-    return linked + unlinked
+            unlinked.append(f"{m['name']} `{m['player_tag']}`")
+    lines = []
+    if linked:
+        lines += [header("Linked", "✅", chip(len(linked))), *linked]
+    if unlinked:
+        lines += ([""] if linked else []) + [header("Not linked", "❌", chip(len(unlinked))), *unlinked]
+    return lines
 
 
 class Accounts(BaseCog):
@@ -105,7 +119,10 @@ class Accounts(BaseCog):
             else ""
         )
         await interaction.followup.send(
-            f"Linked **{player.name}** (`{player.tag}`, TH{player.town_hall}) to {target.mention}{moved}."
+            embed=ok_embed(
+                f"Linked {account_label(player.name, player.tag, player.town_hall)} "
+                f"to {target.mention}{moved}."
+            )
         )
         await self._after_link(interaction, target, player)
 
@@ -118,9 +135,11 @@ class Accounts(BaseCog):
             raise ResolveError(f"`{tag}` isn't linked.")
         if link["discord_user_id"] != interaction.user.id:
             await require(interaction, "links")
+        player = await self.db.get_player_row(tag)
         await self.db.unlink_player(tag)
+        label = account_label(player["name"], tag) if player and player["name"] else f"`{tag}`"
         await interaction.response.send_message(
-            f"Unlinked `{tag}` from <@{link['discord_user_id']}>.", ephemeral=True
+            embed=ok_embed(f"Unlinked {label} from <@{link['discord_user_id']}>."), ephemeral=True
         )
 
     @link.command(name="default", description="Choose your default account")
@@ -130,7 +149,15 @@ class Accounts(BaseCog):
         if tag not in await self.db.get_linked_tags(interaction.user.id):
             raise ResolveError(f"`{tag}` isn't linked to you.")
         await self.db.set_default_account(interaction.user.id, tag)
-        await interaction.response.send_message(f"`{tag}` is now your default.", ephemeral=True)
+        player = await self.db.get_player_row(tag)
+        label = (
+            account_label(player["name"], tag, player["town_hall"])
+            if player and player["name"]
+            else f"`{tag}`"
+        )
+        await interaction.response.send_message(
+            embed=ok_embed(f"{label} is now your default account."), ephemeral=True
+        )
 
     @link.command(name="list", description="Show which clan members are linked")
     @app_commands.autocomplete(clan=clan_autocomplete)
@@ -141,12 +168,13 @@ class Accounts(BaseCog):
         clan_row = await self.db.get_clan_row(tag)
         title = f"Links · {clan_row['name'] if clan_row else tag}"
         lines = link_list_lines(members, links)
+        if members:
+            lines.insert(0, f"🔗 {chip(f'{len(links)}/{len(members)}')} linked\n")
         embeds = []
         for i, chunk in enumerate(chunk_lines(lines or ["No members known yet."])):
             e = await make_embed(self.bot, interaction.guild_id, title=title if i == 0 else None)
             e.description = chunk
             embeds.append(e)
-        embeds[-1].set_footer(text=f"{len(links)}/{len(members)} linked")
         await interaction.response.send_message(embeds=embeds[:10], ephemeral=True)
 
     # ------------------------------------------------------------------ /verify
@@ -164,7 +192,11 @@ class Accounts(BaseCog):
             raise ResolveError("That token is invalid or expired. Generate a fresh one in-game.")
         player = await self.coc.get_player(tag)
         await self.db.link_player(player.tag, interaction.user.id, verified=True)
-        await interaction.followup.send(f"✅ Verified and linked **{player.name}** (`{player.tag}`).")
+        await interaction.followup.send(
+            embed=ok_embed(
+                f"Account verified. You control {account_label(player.name, player.tag, player.town_hall)}"
+            )
+        )
         await self._after_link(interaction, interaction.user, player)
 
     # ------------------------------------------------------------------ /profile, /whois

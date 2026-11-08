@@ -139,3 +139,24 @@ async def test_accounts_by_user(db):
     assert accounts[0].verified and accounts[0].is_default and accounts[0].clan_role == "leader"
     assert accounts[1].name == "#B" and accounts[1].town_hall == 0
     assert await repo.accounts_by_user(db, []) == {}
+
+
+def test_autorole_result_text():
+    from clashhero.cogs.autoroles import settings_text, sync_text
+
+    s = {
+        "auto_update": 1,
+        "removal_delay_hours": 24,
+        "allow_not_linked": 0,
+        "allow_non_family": 0,
+        "only_verified_clan_roles": 1,
+    }
+    assert settings_text(s) == (
+        "Auto update ✅ · Removal delay `24h` · Allow not linked ❌\n"
+        "Non-family accounts count ❌ · Verified-only clan roles ✅"
+    )
+    assert sync_text(2, 1) == "Roles synced · `+2` added · `-1` removed."
+    assert (
+        sync_text(0, 0, "<@1>", True)
+        == "Roles synced for <@1> · `+0` added · `-0` removed · nickname updated."
+    )
