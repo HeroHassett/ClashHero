@@ -1,13 +1,14 @@
-"""Roster actions shared by slash commands and the persistent roster buttons.
+"""Roster actions shared by slash commands, the persistent roster buttons and the auto-ping loop.
 
-Signup / opt-out / refresh live here so the Signup button and ``/roster manage add`` apply the
-same rules (closed lock, capacity, eligibility, linking, per-user and per-category limits).
+Signup / opt-out / refresh live here so the Signup button, ``/roster manage add`` and applying a
+``/roster suggest`` lineup apply the same rules (closed lock, capacity, eligibility, linking,
+per-user and per-category limits) with the same role and log side effects.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -15,8 +16,9 @@ import coc
 import discord
 
 from clashhero.cogs._base import send_error
+from clashhero.repos import roster_scoring as scoring
 from clashhero.repos import rosters as repo
-from clashhero.services.outbox import send_server_log
+from clashhero.services.outbox import send_server_log, send_to_channel
 from clashhero.utils.checks import has_permission
 from clashhero.utils.fmt import chunk_lines, make_embed, ts
 
@@ -185,6 +187,96 @@ async def _log_change(bot, guild: discord.Guild, roster, actor, verb: str, names
     await send_server_log(bot, guild.id, "roster_change", embed)
 
 
+async def apply_suggestion(
+    bot,
+    guild: discord.Guild,
+    roster,
+    confirmed: Sequence[str],
+    substitutes: Sequence[str],
+    *,
+    actor: discord.abc.User,
+) -> str:
+    """Make the Confirmed group exactly ``confirmed`` and put ``substitutes`` in Substitute, via the
+    normal manager signup (rules, roles and logs apply). Other signups in Confirmed move to
+    Substitute; nobody is removed. Returns a summary."""
+    db = bot.db
+    conf_gid, sub_gid = await repo.suggestion_groups(db, roster["id"])
+    current = {m["player_tag"]: m for m in await repo.list_members(db, roster["id"])}
+    picked = set(confirmed) | set(substitutes)
+    demoted = []
+    for tag, m in current.items():
+        if m["group_id"] == conf_gid and tag not in picked:
+            await repo.move_member(db, roster["id"], tag, to_roster_id=roster["id"], group_id=sub_gid)
+            demoted.append(m["name"] or tag)
+    lines = []
+    for label, tags, gid in (("Confirmed", confirmed, conf_gid), ("Substitute", substitutes, sub_gid)):
+        todo = [t for t in tags if t not in current or current[t]["group_id"] != gid]
+        if not todo:
+            continue
+        res = await signup(bot, guild, roster, todo, actor=actor, group_id=gid, as_manager=True)
+        lines.append(f"**{label}**\n{res.summary()}")
+    if demoted:
+        await _log_change(bot, guild, roster, actor, "moved to Substitute", demoted)
+        await refresh_post(bot, roster["id"])
+        lines.append("**Moved out of Confirmed**: " + ", ".join(demoted))
+    return "\n".join(lines) or "Roster already matches the suggestion."
+
+
+# ------------------------------------------------------------------ auto-ping
+
+
+def ping_chunks(header: str, users: Iterable[int], limit: int = 1900) -> list[str]:
+    """Header followed by user mentions, split into messages under ``limit`` characters."""
+    chunks, cur = [], header + "\n"
+    for uid in sorted(users):
+        mention = f"<@{uid}> "
+        if len(cur) + len(mention) > limit:
+            chunks.append(cur.rstrip())
+            cur = ""
+        cur += mention
+    chunks.append(cur.rstrip())
+    return chunks
+
+
+def autoping_header(roster, kind: str, when: str) -> str:
+    if kind == "end":
+        text = f"Signups for **{roster['name']}** close {ts(when, 'R')}."
+    else:
+        text = f"**{roster['name']}** starts {ts(when, 'R')}."
+    text += " " + (roster["autoping_message"] or "You're in the clan but haven't signed up yet.")
+    if roster["channel_id"] and roster["message_id"]:
+        text += (
+            f"\nSign up here: https://discord.com/channels/"
+            f"{roster['guild_id']}/{roster['channel_id']}/{roster['message_id']}"
+        )
+    return text
+
+
+async def autoping_targets(db, roster) -> set[int]:
+    """Discord users with an eligible account in the roster's clan that isn't signed up."""
+    members = await repo.list_members(db, roster["id"])
+    clan_tags = [
+        r["player_tag"]
+        for r in await db.clan_member_rows(roster["clan_tag"])
+        if repo.check_eligibility(roster, r["town_hall"], r["heroes_total"]) is None
+    ]
+    links = await db.links_for_tags(set(clan_tags) | {m["player_tag"] for m in members})
+    return repo.compute_ping_targets("unregistered", members, clan_tags, links)
+
+
+async def send_autoping(bot, roster, kind: str, when: str) -> int:
+    """Ping unregistered members for one auto-ping window. Returns how many users were pinged."""
+    channel_id = roster["autoping_channel_id"] or roster["channel_id"]
+    if not channel_id:
+        return 0
+    users = await autoping_targets(bot.db, roster)
+    if not users:
+        return 0
+    for chunk in ping_chunks(autoping_header(roster, kind, when), users):
+        await send_to_channel(bot, channel_id, content=chunk)
+    return len(users)
+
+
 # ------------------------------------------------------------------ rendering
 
 
@@ -218,6 +310,9 @@ def render_roster_embed(
         info.append(f"Starts {ts(roster['start_time'], 'f')}")
     if roster["end_time"]:
         info.append(f"Signups close {ts(roster['end_time'], 'R')}")
+    autoping = repo.describe_autoping(roster)
+    if autoping:
+        info.append(f"🔔 {autoping}")
     if roster["closed"]:
         info.append("🔒 **Closed**")
     embed = discord.Embed(title=title, description="\n".join(info), color=color)
@@ -253,6 +348,105 @@ async def build_roster_embed(bot, roster) -> discord.Embed:
     clan = await bot.db.get_clan_row(roster["clan_tag"])
     color = (await make_embed(bot, roster["guild_id"])).color
     return render_roster_embed(roster, groups, members, clan["name"] if clan else None, color)
+
+
+SUGGEST_MAX_ROWS = 50
+SUGGEST_CHUNK = 3500
+SUGGEST_HEADERS = ("#", "Player", "TH", "Hero", "CWL3*", "War3*", "Avg*", "Used", "Seen", "Score")
+
+
+def _ratio(num: int, den: int) -> str:
+    return f"{num}/{den}" if den else "-"
+
+
+def suggestion_row(rank: int, s: scoring.Scored) -> list[str]:
+    c, h = s.candidate, s.history
+    name = c.name.replace("`", "'")[:12] + ("*" if c.signed_up else "")
+    return [
+        str(rank),
+        name,
+        str(c.town_hall or "?"),
+        str(c.heroes or "-"),
+        _ratio(h.cwl_triples, h.cwl_hits),
+        _ratio(h.war_triples, h.war_hits),
+        f"{h.avg_stars:.1f}" if h.avg_stars is not None else "-",
+        _ratio(h.used, h.available),
+        f"{int(s.seen_days)}d" if s.seen_days is not None else "?",
+        f"{s.score:.0f}",
+    ]
+
+
+def suggestion_table_lines(scored: Sequence[scoring.Scored], size: int, substitutes: int) -> list[str]:
+    """Monospace table lines (no code fences) with section markers for the picks."""
+    shown = list(scored[:SUGGEST_MAX_ROWS])
+    rows = [suggestion_row(i, s) for i, s in enumerate(shown, 1)]
+    widths = [max(len(r[i]) for r in [list(SUGGEST_HEADERS), *rows]) for i in range(len(SUGGEST_HEADERS))]
+    right = {0, 2, 3, 4, 5, 6, 7, 8, 9}
+
+    def fmt(cells: Sequence[str]) -> str:
+        return " ".join(
+            c.rjust(widths[i]) if i in right else c.ljust(widths[i]) for i, c in enumerate(cells)
+        ).rstrip()
+
+    lines = [fmt(SUGGEST_HEADERS)]
+    for i, row in enumerate(rows):
+        if i == 0:
+            lines.append(f"-- Confirmed (top {min(size, len(scored))})")
+        elif i == size and substitutes:
+            lines.append("-- Substitutes")
+        elif i == size + substitutes:
+            lines.append("-- Not picked")
+        lines.append(fmt(row))
+    if len(scored) > len(shown):
+        lines.append(f"... {len(scored) - len(shown)} more not shown")
+    return lines
+
+
+def render_suggestion_embeds(
+    roster,
+    scored: Sequence[scoring.Scored],
+    excluded: Sequence[tuple[scoring.Candidate, str]],
+    *,
+    size: int,
+    substitutes: int,
+    seasons: Sequence[str],
+    color: discord.Color,
+) -> list[discord.Embed]:
+    """Pure: the ranked suggestion table plus how the score works and who was left out."""
+    lines = suggestion_table_lines(scored, size, substitutes)
+    blocks = chunk_lines(lines, SUGGEST_CHUNK) if scored else []
+    head = (
+        f"{len(scored)} eligible candidate(s) from `{roster['clan_tag']}` and current signups. "
+        f"Top {size} → Confirmed, next {substitutes} → Substitute. `*` = already signed up."
+    )
+    embeds = [
+        discord.Embed(
+            title=f"Suggested lineup · {roster['name']}",
+            description=head + ("\n```\n" + blocks[0] + "```" if blocks else "\n\nNobody eligible."),
+            color=color,
+        )
+    ]
+    for block in blocks[1:]:
+        embeds.append(discord.Embed(description="```\n" + block + "```", color=color))
+    last = embeds[-1]
+    season_txt = ", ".join(sorted(seasons)) if seasons else "none recorded"
+    last.add_field(
+        name="How the score works",
+        value=(
+            f"0-100 = {scoring.describe_weights()}.\n"
+            f"3* = triples / attacks on an equal or higher TH (CWL seasons: {season_txt}; "
+            f"war: last {scoring.WAR_LOOKBACK_DAYS} days, no friendlies). Rates use a Wilson lower "
+            "bound and lean toward the pool median when there are few attacks; no history = pool "
+            "median. Used = attacks used / available in ended wars. Seen = days since last active."
+        )[:1024],
+        inline=False,
+    )
+    if excluded:
+        text = "\n".join(f"{c.name} `{c.tag}`: {reason}" for c, reason in excluded)
+        if len(text) > 1000:
+            text = text[:1000].rsplit("\n", 1)[0] + "\n…"
+        last.add_field(name=f"Not eligible ({len(excluded)})", value=text, inline=False)
+    return embeds
 
 
 def roster_view(roster_id: int, *, closed: bool = False) -> discord.ui.View:

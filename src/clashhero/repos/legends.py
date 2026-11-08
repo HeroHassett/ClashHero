@@ -18,12 +18,85 @@ BOARD_LIMIT = 50
 # ------------------------------------------------------------------ pure aggregation
 
 
+def _col(row: Any, key: str) -> Any:
+    """``row[key]`` for sqlite rows and dicts, None when the column is absent."""
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return None
+
+
+@dataclass(frozen=True)
+class Hit:
+    """One ranked battle. The opponent/stars/destruction/army fields are only set for battles read
+    from the battle log; battles inferred from trophy changes carry just the trophies."""
+
+    kind: str  # attack | defense
+    trophies: int
+    occurred_at: str | None = None
+    event_id: int | None = None
+    opponent_tag: str | None = None
+    opponent_name: str | None = None
+    opponent_th: int | None = None
+    stars: int | None = None
+    destruction: int | None = None
+    army_share_code: str | None = None
+
+    @property
+    def detailed(self) -> bool:
+        return self.stars is not None
+
+    @property
+    def triple(self) -> bool:
+        """3 stars; for battles without star data, a max-trophy attack is the best proxy."""
+        return self.stars == 3 if self.stars is not None else self.trophies >= MAX_HIT
+
+    @classmethod
+    def from_row(cls, r: Any) -> Hit:
+        return cls(
+            kind=r["kind"],
+            trophies=r["trophies"],
+            occurred_at=_col(r, "occurred_at"),
+            event_id=_col(r, "id"),
+            opponent_tag=_col(r, "opponent_tag"),
+            opponent_name=_col(r, "opponent_name"),
+            opponent_th=_col(r, "opponent_th"),
+            stars=_col(r, "stars"),
+            destruction=_col(r, "destruction"),
+            army_share_code=_col(r, "army_share_code"),
+        )
+
+
+def has_details(hits: Iterable[Hit]) -> bool:
+    return any(h.detailed for h in hits)
+
+
 @dataclass
 class DayStats:
     player_tag: str
     attacks: list[int] = field(default_factory=list)  # trophy gains, chronological
     defenses: list[int] = field(default_factory=list)  # trophy losses (negative), chronological
     cap: int | None = BATTLES_PER_DAY  # daily attack/defense cap; None for tiers without one
+    attack_hits: list[Hit] = field(default_factory=list)  # same battles as ``attacks``, with details
+    defense_hits: list[Hit] = field(default_factory=list)
+
+    def hits(self, kind: str) -> list[Hit]:
+        """Battles of ``kind`` with whatever details are known (trophies only when built from
+        bare trophy lists)."""
+        values, hits = (
+            (self.attacks, self.attack_hits) if kind == "attack" else (self.defenses, self.defense_hits)
+        )
+        if len(hits) == len(values):
+            return hits
+        return [Hit(kind, v) for v in values]
+
+    @property
+    def triples(self) -> int:
+        return sum(1 for h in self.hits("attack") if h.triple)
+
+    @property
+    def detailed(self) -> bool:
+        return has_details(self.hits("attack")) or has_details(self.hits("defense"))
 
     @property
     def offense(self) -> int:
@@ -51,7 +124,13 @@ def aggregate_day(rows: Iterable[Any]) -> dict[str, DayStats]:
     out: dict[str, DayStats] = {}
     for r in rows:
         s = out.setdefault(r["player_tag"], DayStats(r["player_tag"]))
-        (s.attacks if r["kind"] == "attack" else s.defenses).append(r["trophies"])
+        hit = Hit.from_row(r)
+        if hit.kind == "attack":
+            s.attacks.append(hit.trophies)
+            s.attack_hits.append(hit)
+        else:
+            s.defenses.append(hit.trophies)
+            s.defense_hits.append(hit)
     return out
 
 
@@ -86,10 +165,38 @@ class SeasonSummary:
         return sum(d) / len(d) if d else 0.0
 
     @property
+    def attack_hits(self) -> list[Hit]:
+        return [h for d in self.days for h in d.stats.hits("attack")]
+
+    @property
+    def defense_hits(self) -> list[Hit]:
+        return [h for d in self.days for h in d.stats.hits("defense")]
+
+    @property
     def triple_rate(self) -> float:
-        """Share of attacks worth the max trophies (a proxy for 3-stars)."""
-        a = self.all_attacks
-        return sum(1 for x in a if x >= MAX_HIT) / len(a) if a else 0.0
+        """Share of 3-star attacks. Attacks without star data (inferred from trophy changes) count
+        as triples when they gained the max trophies."""
+        a = self.attack_hits
+        return sum(1 for h in a if h.triple) / len(a) if a else 0.0
+
+    @property
+    def estimated_triples(self) -> int:
+        """Attacks in ``triple_rate`` judged by trophies because star data is missing."""
+        return sum(1 for h in self.attack_hits if not h.detailed)
+
+    @staticmethod
+    def _avg_stars(hits: list[Hit]) -> float | None:
+        known = [h.stars for h in hits if h.stars is not None]
+        return sum(known) / len(known) if known else None
+
+    @property
+    def avg_attack_stars(self) -> float | None:
+        return self._avg_stars(self.attack_hits)
+
+    @property
+    def avg_defense_stars(self) -> float | None:
+        """Average stars opponents took on defense (battle-log data only)."""
+        return self._avg_stars(self.defense_hits)
 
     @property
     def avg_defense_per_day(self) -> float:
@@ -249,6 +356,15 @@ async def day_events(db: Database, legend_day: str, tags: Sequence[str] | None =
         sql += f" AND player_tag IN ({','.join('?' * len(tags))})"
         params.extend(tags)
     return await db.fetchall(sql + " ORDER BY occurred_at, id", params)
+
+
+async def get_battle(db: Database, event_id: int) -> Row | None:
+    """A legend_events row with the tracked player's name (``player_name``), or None."""
+    return await db.fetchone(
+        "SELECT e.*, p.name AS player_name FROM legend_events e "
+        "LEFT JOIN players p ON p.player_tag = e.player_tag WHERE e.id = ?",
+        (event_id,),
+    )
 
 
 async def player_league(db: Database, player_tag: str) -> str | None:
@@ -426,6 +542,7 @@ async def clan_day_rows(db: Database, clan_tag: str, legend_day: str) -> list[di
                 net=s.net,
                 attacks=len(s.attacks),
                 defenses=len(s.defenses),
+                triples=s.triples if has_details(s.hits("attack")) else None,
             )
         )
     out.sort(key=lambda x: -(x["end"] or 0))

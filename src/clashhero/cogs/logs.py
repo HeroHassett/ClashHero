@@ -1,13 +1,16 @@
 """Log feeds: configuration commands plus listeners that render collector events into the
 channels subscribed via ``clan_logs`` / ``server_logs``.
 
-Legend feeds (legend_battles, legend_daily) are rendered by the legends cog.
+Donations, Clan Games progress, unit upgrades and super troop boosts are batched per clan and
+flushed every minute. Legend feeds (legend_battles, legend_daily) are rendered by the legends cog.
 """
 
 from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
 
 import discord
 from discord import app_commands
@@ -25,6 +28,9 @@ from clashhero.utils.seasons import game_season
 
 log = logging.getLogger(__name__)
 
+# How long after a leave we keep polling the player (through the collector) to see where they went.
+MOVE_WINDOW = timedelta(minutes=15)
+
 CLAN_LOG_CHOICES = [app_commands.Choice(name=label[:100], value=key) for key, label in CLAN_LOG_TYPES.items()]
 SERVER_LOG_CHOICES = [
     app_commands.Choice(name=label[:100], value=key) for key, label in SERVER_LOG_TYPES.items()
@@ -40,6 +46,16 @@ def parse_color(raw: str | None) -> int | None:
         raise ResolveError(f"`{raw}` isn't a hex color like `#00ff88`.") from e
 
 
+def merge_unit_changes(
+    acc: dict[tuple[str, str], list], changes: Iterable[tuple[str, str, int | None, int]]
+) -> None:
+    """Fold unit changes into ``acc`` ((kind, unit) -> [first old level, latest new level]) so
+    several polls inside one batch window show up as a single "90 → 92"."""
+    for kind, unit, old, new in changes:
+        prev = acc.get((kind, unit))
+        acc[(kind, unit)] = [prev[0] if prev else old, new]
+
+
 class Logs(BaseCog):
     logs = app_commands.Group(name="logs", description="Configure log feeds", guild_only=True)
 
@@ -49,9 +65,18 @@ class Logs(BaseCog):
         self._donations: dict[str, dict[str, list]] = defaultdict(dict)
         # clan_tag -> player_tag -> [name, gained, total]
         self._games: dict[str, dict[str, list]] = defaultdict(dict)
+        # clan_tag -> player_tag -> [name, town_hall, {(kind, unit): [old, new]}]
+        self._upgrades: dict[str, dict[str, list]] = defaultdict(dict)
+        # clan_tag -> player_tag -> [name, [super troops]]
+        self._boosts: dict[str, dict[str, list]] = defaultdict(dict)
+        # player_tag -> (clan_tag, left_at) for recent leavers of clans with a join/leave log
+        self._left: dict[str, tuple[str, datetime]] = {}
         self._clan_names: dict[str, str] = {}
 
     async def cog_load(self) -> None:
+        # Leavers drop out of the collector's player set; keep them polled for a while so a
+        # PlayerClanChanged tells us where they went.
+        self.collector.register_player_source(self._recent_leavers)
         self.flush_batches.start()
 
     async def cog_unload(self) -> None:
@@ -150,8 +175,13 @@ class Logs(BaseCog):
 
     @tasks.loop(seconds=60)
     async def flush_batches(self) -> None:
+        await self.flush_now()
+
+    async def flush_now(self) -> None:
         donations, self._donations = self._donations, defaultdict(dict)
         games, self._games = self._games, defaultdict(dict)
+        upgrades, self._upgrades = self._upgrades, defaultdict(dict)
+        boosts, self._boosts = self._boosts, defaultdict(dict)
         for clan_tag, by_player in donations.items():
             entries = [tuple(v) for v in by_player.values()]
             if entries:
@@ -170,6 +200,17 @@ class Logs(BaseCog):
                     "clan_games",
                     E.clan_games_progress_embed(self._clan_names.get(clan_tag, clan_tag), entries),
                 )
+        for clan_tag, by_player in upgrades.items():
+            entries = [
+                (name, tag, th, [(kind, unit, old, new) for (kind, unit), (old, new) in changes.items()])
+                for tag, (name, th, changes) in by_player.items()
+            ]
+            for embed in E.upgrades_embeds(self._clan_names.get(clan_tag, clan_tag), entries):
+                await send_clan_log(self.bot, clan_tag, "upgrades", embed)
+        for clan_tag, by_player in boosts.items():
+            entries = [(name, tag, troops) for tag, (name, troops) in by_player.items()]
+            for embed in E.super_troops_embeds(self._clan_names.get(clan_tag, clan_tag), entries):
+                await send_clan_log(self.bot, clan_tag, "super_troops", embed)
 
     @flush_batches.error
     async def _flush_error(self, error: BaseException) -> None:
@@ -192,6 +233,17 @@ class Logs(BaseCog):
             "clan_achievements",
             E.clan_attribute_embed(e.clan_name, e.clan_tag, e.attribute, e.old, e.new),
         )
+
+    @commands.Cog.listener()
+    async def on_clash_clan_settings(self, e: ev.ClanSettingsChanged) -> None:
+        self._clan_names[e.clan_tag] = e.clan_name
+        if e.changes:
+            await send_clan_log(
+                self.bot,
+                e.clan_tag,
+                "clan_settings",
+                E.clan_settings_embed(e.clan_name, e.clan_tag, e.changes),
+            )
 
     @commands.Cog.listener()
     async def on_clash_donations(self, e: ev.DonationsChanged) -> None:
@@ -219,6 +271,7 @@ class Logs(BaseCog):
             e.clan_tag,
             "join_leave",
             E.member_join_embed(e.clan_name, e.member, e.member_count, row),
+            view=E.profile_view(e.member.tag),
         )
 
     @commands.Cog.listener()
@@ -233,7 +286,52 @@ class Logs(BaseCog):
             e.clan_tag,
             "join_leave",
             E.member_leave_embed(e.clan_name, e.member, e.member_count, donated),
+            view=E.profile_view(e.member.tag),
         )
+        if await self.db.clan_log_targets(e.clan_tag, "join_leave"):
+            # If a player poll already stored their new clan, the move was reported already.
+            row = await self.db.get_player_row(e.member.tag)
+            if row is None or row["clan_tag"] in (None, e.clan_tag):
+                self._left[e.member.tag] = (e.clan_tag, datetime.now(UTC))
+
+    async def _recent_leavers(self) -> set[str]:
+        """Player source for the collector: recent leavers of clans with a join/leave log."""
+        cutoff = datetime.now(UTC) - MOVE_WINDOW
+        self._left = {tag: v for tag, v in self._left.items() if v[1] >= cutoff}
+        return set(self._left)
+
+    @commands.Cog.listener()
+    async def on_clash_player_clan_changed(self, e: ev.PlayerClanChanged) -> None:
+        """Follow up a leave with where the player went. Posts to the old clan's join/leave log;
+        if the player was clanless for a poll in between, the recorded leave is used instead."""
+        if not e.new_clan_tag:
+            return
+        recent = self._left.pop(e.player_tag, None)
+        from_clan = e.old_clan_tag
+        if from_clan is None and recent and recent[1] >= datetime.now(UTC) - MOVE_WINDOW:
+            from_clan = recent[0]
+        if not from_clan or from_clan == e.new_clan_tag:
+            return
+        targets = await self.db.clan_log_targets(from_clan, "join_leave")
+        if not targets:
+            return
+        old_name = await self._clan_name(from_clan)
+        own_guilds = set(await self.db.guilds_for_clan(e.new_clan_tag))
+        view = E.profile_view(e.player_tag)
+        for target in targets:
+            embed = E.clan_move_embed(
+                e.name,
+                e.player_tag,
+                old_name,
+                e.new_clan_name,
+                e.new_clan_tag,
+                own_clan=target["guild_id"] in own_guilds,
+            )
+            # Same color/ping handling as outbox.send_clan_log, but the embed differs per guild.
+            if target["color"] is not None:
+                embed.color = discord.Color(target["color"])
+            ping = f"<@&{target['ping_role_id']}>" if target["ping_role_id"] else None
+            await send_to_channel(self.bot, target["channel_id"], content=ping, embed=embed, view=view)
 
     @commands.Cog.listener()
     async def on_clash_role_change(self, e: ev.RoleChanged) -> None:
@@ -260,6 +358,24 @@ class Logs(BaseCog):
                 "town_hall",
                 E.town_hall_embed(e.name, e.player_tag, e.old_level, e.new_level),
             )
+
+    @commands.Cog.listener()
+    async def on_clash_units_upgraded(self, e: ev.UnitsUpgraded) -> None:
+        if not e.clan_tag or not e.changes:
+            return
+        await self._clan_name(e.clan_tag)
+        entry = self._upgrades[e.clan_tag].setdefault(e.player_tag, [e.name, e.town_hall, {}])
+        entry[0], entry[1] = e.name, e.town_hall
+        merge_unit_changes(entry[2], e.changes)
+
+    @commands.Cog.listener()
+    async def on_clash_super_troops_boosted(self, e: ev.SuperTroopsBoosted) -> None:
+        if not e.clan_tag or not e.troops:
+            return
+        await self._clan_name(e.clan_tag)
+        entry = self._boosts[e.clan_tag].setdefault(e.player_tag, [e.name, []])
+        entry[0] = e.name
+        entry[1].extend(t for t in e.troops if t not in entry[1])
 
     @commands.Cog.listener()
     async def on_clash_war_preference(self, e: ev.WarPreferenceChanged) -> None:

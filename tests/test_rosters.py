@@ -1,4 +1,5 @@
 import discord
+import pytest
 
 from clashhero.cogs._roster_views import render_roster_embed
 from clashhero.repos import rosters as repo
@@ -197,3 +198,267 @@ def test_dynamic_item_custom_ids():
     assert OptOutButton(5).custom_id == "roster:optout:5"
     assert RefreshButton(5).custom_id == "roster:refresh:5"
     assert SignupButton.__discord_ui_compiled_template__.fullmatch("roster:signup:42")["id"] == "42"
+
+
+# ------------------------------------------------------------------ suggestions
+
+
+def fake_bot(db, channels=None):
+    from types import SimpleNamespace as NS
+
+    channels = channels or {}
+    return NS(db=db, coc=None, get_channel=lambda cid: channels.get(cid))
+
+
+def fake_guild():
+    from types import SimpleNamespace as NS
+
+    return NS(id=1, get_role=lambda _id: None, get_member=lambda _id: None)
+
+
+async def add_player(db, tag, th=16, heroes=300, clan="#C", last_seen=None, link=None):
+    await db.execute(
+        "INSERT INTO players (player_tag, name, town_hall, heroes_total, clan_tag, last_seen, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'x')",
+        (tag, tag[1:], th, heroes, clan, last_seen),
+    )
+    if link:
+        await db.link_player(tag, link)
+
+
+async def test_suggestion_candidates_and_other_rosters(db):
+    await add_player(db, "#IN", link=1)
+    await add_player(db, "#SIGNED", clan="#ELSE", link=2)
+    await add_player(db, "#AWAY", clan="#ELSE")
+    rid = await make(db, "Main")
+    other = await make(db, "Other")
+    await make(db, "Trophy", category="trophy")
+    gid = await repo.default_group_id(db, rid)
+    await repo.add_member(
+        db, rid, "#SIGNED", user_id=None, group_id=gid, name=None, town_hall=None, heroes_total=None
+    )
+    await repo.add_member(
+        db, rid, "#GHOST", user_id=9, group_id=None, name="Ghost", town_hall=14, heroes_total=200
+    )
+    await repo.add_member(
+        db, other, "#IN", user_id=1, group_id=None, name="In", town_hall=16, heroes_total=300
+    )
+    rows = {
+        r["player_tag"]: r for r in await repo.suggestion_candidate_rows(db, await repo.get_roster(db, rid))
+    }
+    assert set(rows) == {"#IN", "#SIGNED", "#GHOST"}
+    assert not rows["#IN"]["signed_up"] and rows["#IN"]["user_id"] == 1
+    assert rows["#SIGNED"]["signed_up"] and rows["#SIGNED"]["group_name"] == "Confirmed"
+    assert (rows["#GHOST"]["name"], rows["#GHOST"]["town_hall"], rows["#GHOST"]["user_id"]) == (
+        "Ghost",
+        14,
+        9,
+    )
+    assert await repo.tags_on_other_rosters(db, 1, "cwl", rid) == {"#IN": "Other"}
+    assert await repo.tags_on_other_rosters(db, 1, "trophy", rid) == {}
+
+
+async def test_suggestion_groups_fall_back_and_create(db):
+    rid = await make(db)
+    groups = await repo.list_groups(db, rid)
+    assert await repo.suggestion_groups(db, rid) == (groups[0]["id"], groups[1]["id"])
+    await repo.rename_group(db, groups[0]["id"], "Main")
+    await repo.delete_group(db, groups[1]["id"])
+    conf, sub = await repo.suggestion_groups(db, rid)
+    assert conf == groups[0]["id"]
+    assert [g["name"] for g in await repo.list_groups(db, rid)] == ["Main", "Substitute"]
+    assert sub == (await repo.get_group_by_name(db, rid, "Substitute"))["id"]
+
+
+async def test_apply_suggestion_end_to_end(db):
+    from types import SimpleNamespace as NS
+
+    from clashhero.cogs import _roster_views as views
+
+    for i, tag in enumerate(("#A", "#B", "#C1", "#D", "#OLD")):
+        await add_player(db, tag, th=16, link=10 + i)
+    rid = await make(db, max_members=10)
+    conf, sub = await repo.suggestion_groups(db, rid)
+    await repo.add_member(
+        db, rid, "#OLD", user_id=14, group_id=conf, name="OLD", town_hall=16, heroes_total=1
+    )
+    await repo.add_member(db, rid, "#B", user_id=11, group_id=sub, name="B", town_hall=16, heroes_total=1)
+    await repo.add_member(db, rid, "#A", user_id=10, group_id=conf, name="A", town_hall=16, heroes_total=1)
+    roster = await repo.get_roster(db, rid)
+    actor = NS(id=1, mention="<@1>")
+
+    text = await views.apply_suggestion(
+        fake_bot(db), fake_guild(), roster, ["#A", "#B", "#C1"], ["#D"], actor=actor
+    )
+    groups = {m["player_tag"]: m["group_name"] for m in await repo.list_members(db, rid)}
+    assert groups == {
+        "#A": "Confirmed",  # already there: untouched
+        "#B": "Confirmed",  # promoted
+        "#C1": "Confirmed",  # signed up
+        "#D": "Substitute",
+        "#OLD": "Substitute",  # demoted, not removed
+    }
+    assert "Moved out of Confirmed**: OLD" in text and "Signed up: C1" in text
+    again = await views.apply_suggestion(
+        fake_bot(db), fake_guild(), roster, ["#A", "#B", "#C1"], ["#D"], actor=actor
+    )
+    assert again == "Roster already matches the suggestion."
+
+
+def test_render_suggestion_embeds():
+    from datetime import UTC, datetime
+
+    from clashhero.cogs._roster_views import render_suggestion_embeds
+    from clashhero.repos import roster_scoring as S
+
+    now = datetime(2026, 11, 7, tzinfo=UTC)
+    cands = [S.Candidate(f"#P{i}", f"Player`{i}", 17 - i % 3, 400, now.isoformat()) for i in range(8)]
+    cands[0].signed_up = True
+    hist = {"#P0": S.History(cwl_hits=4, cwl_triples=3, attacks=4, stars=11, used=4, available=4)}
+    ranked = S.score_candidates(cands, hist, now)
+    roster = {"name": "CWL", "clan_tag": "#C"}
+    excluded = [(S.Candidate("#LOW", "Low", 12), "needs TH14+ (is TH12)")]
+    embeds = render_suggestion_embeds(
+        roster, ranked, excluded, size=5, substitutes=2, seasons=["2026-10"], color=discord.Color.blue()
+    )
+    assert len(embeds) == 1
+    e = embeds[0]
+    assert e.title == "Suggested lineup · CWL"
+    assert "-- Confirmed (top 5)" in e.description and "-- Substitutes" in e.description
+    assert "-- Not picked" in e.description and "3/4" in e.description and "Player'0*" in e.description
+    assert "`" not in e.description.split("```")[1]  # names can't break the code block
+    assert [f.name for f in e.fields] == ["How the score works", "Not eligible (1)"]
+    assert "2026-10" in e.fields[0].value and "Low `#LOW`: needs TH14+" in e.fields[1].value
+    empty = render_suggestion_embeds(
+        roster, [], [], size=5, substitutes=0, seasons=[], color=discord.Color.blue()
+    )
+    assert "Nobody eligible" in empty[0].description
+
+
+# ------------------------------------------------------------------ auto-ping
+
+
+def test_autoping_due_windows():
+    from datetime import UTC, datetime
+
+    now = datetime(2026, 11, 7, 12, tzinfo=UTC)
+    r = {
+        "closed": 0,
+        "start_time": "2026-11-08T08:00:00+00:00",
+        "end_time": "2026-11-07T15:00:00+00:00",
+        "autoping_start_hours": 24,
+        "autoping_end_hours": 2,
+        "autoping_start_sent": None,
+        "autoping_end_sent": None,
+    }
+    assert repo.autoping_due(r, now) == [("start", r["start_time"])]  # end window opens at 13:00
+    later = now.replace(hour=13, minute=30)
+    assert repo.autoping_due(r, later) == [("start", r["start_time"]), ("end", r["end_time"])]
+    sent = {**r, "autoping_start_sent": r["start_time"], "autoping_end_sent": r["end_time"]}
+    assert repo.autoping_due(sent, later) == []
+    moved = {**sent, "end_time": "2026-11-07T14:00:00+00:00"}  # editing the time re-arms it
+    assert repo.autoping_due(moved, later) == [("end", "2026-11-07T14:00:00+00:00")]
+    assert repo.autoping_due(r, now.replace(hour=16)) == [("start", r["start_time"])]  # end passed
+    assert repo.autoping_due({**r, "closed": 1}, later) == []
+    assert repo.autoping_due({"closed": 0, "start_time": None, "end_time": None}, now) == []
+
+
+def test_describe_autoping_and_format_hours():
+    assert repo.format_hours(1.5) == "1h30m"
+    assert repo.format_hours(0.25) == "15m"
+    assert repo.format_hours(24) == "24h"
+    assert repo.describe_autoping({"autoping_end_hours": None, "autoping_start_hours": None}) is None
+    assert repo.describe_autoping({}) is None
+    text = repo.describe_autoping({"autoping_end_hours": 6, "autoping_start_hours": 0.5})
+    assert text == "Auto-ping unregistered members 6h before signups close and 30m before start"
+
+
+async def test_autoping_columns_and_clone(db):
+    rid = await make(db, end_time="2026-11-08T00:00:00+00:00")
+    await repo.set_autoping(db, rid, start_hours=None, end_hours=3, message="go", channel_id=55)
+    await repo.mark_autoping_sent(db, rid, "end", "2026-11-08T00:00:00+00:00")
+    row = await repo.get_roster(db, rid)
+    assert (row["autoping_end_hours"], row["autoping_message"], row["autoping_channel_id"]) == (3, "go", 55)
+    assert [r["id"] for r in await repo.autoping_rosters(db)] == [rid]
+    clone = await repo.get_roster(db, await repo.clone_roster(db, rid, "Next"))
+    assert clone["autoping_end_hours"] == 3 and clone["autoping_end_sent"] is None
+    await repo.set_autoping(db, rid, start_hours=None, end_hours=None, message=None, channel_id=None)
+    row = await repo.get_roster(db, rid)
+    assert row["autoping_end_hours"] is None and row["autoping_end_sent"] == "2026-11-08T00:00:00+00:00"
+    assert [r["id"] for r in await repo.autoping_rosters(db)] == [clone["id"]]
+    with pytest.raises(ValueError):
+        await repo.mark_autoping_sent(db, rid, "middle", "x")
+
+
+def test_ping_chunks_and_embed_line():
+    from clashhero.cogs._roster_views import ping_chunks
+
+    chunks = ping_chunks("Header", range(1000, 1400), limit=200)
+    assert chunks[0].startswith("Header\n<@1000>")
+    assert all(len(c) <= 200 for c in chunks)
+    assert sum(c.count("<@") for c in chunks) == 400
+    assert ping_chunks("Only", []) == ["Only"]
+
+    roster = {
+        "id": 1,
+        "name": "CWL",
+        "clan_tag": "#C",
+        "category": "cwl",
+        "max_members": 15,
+        "min_th": None,
+        "max_th": None,
+        "min_heroes": None,
+        "start_time": None,
+        "end_time": "2026-11-08T00:00:00+00:00",
+        "closed": 0,
+        "color": None,
+        "sort_by": "th",
+        "autoping_end_hours": 6,
+        "autoping_start_hours": None,
+    }
+    e = render_roster_embed(roster, [], [], None, discord.Color.blue())
+    assert "🔔 Auto-ping unregistered members 6h before signups close" in e.description
+
+
+async def test_run_autopings_pings_unregistered_once(db):
+    from datetime import UTC, datetime
+    from types import SimpleNamespace as NS
+
+    from clashhero.cogs.rosters import Rosters
+
+    sent = []
+
+    async def send(**kw):
+        sent.append(kw["content"])
+
+    channel = NS(send=send)
+    await add_player(db, "#SIGNED", link=1)
+    await add_player(db, "#LAZY", link=2)
+    await add_player(db, "#LAZY2", link=2)  # same user, one ping
+    await add_player(db, "#SMALL", th=10, link=3)  # below the roster's minimum TH
+    await add_player(db, "#NOLINK")
+    await add_player(db, "#ELSEWHERE", clan="#X", link=4)
+    rid = await make(db, min_th=14, end_time="2026-11-07T15:00:00+00:00")
+    await repo.update_roster(db, rid, channel_id=77, message_id=88)
+    await repo.add_member(
+        db, rid, "#SIGNED", user_id=1, group_id=None, name="S", town_hall=16, heroes_total=300
+    )
+    await repo.set_autoping(db, rid, start_hours=None, end_hours=6, message=None, channel_id=None)
+
+    cog = Rosters(fake_bot(db, {77: channel}))
+    now = datetime(2026, 11, 7, 12, tzinfo=UTC)
+    assert await cog.run_autopings(now) == 1
+    assert len(sent) == 1
+    assert "Signups for **CWL** close" in sent[0] and "<@2>" in sent[0]
+    assert "<@1>" not in sent[0] and "<@3>" not in sent[0] and "<@4>" not in sent[0]
+    assert "https://discord.com/channels/1/77/88" in sent[0]
+    assert await cog.run_autopings(now) == 0 and len(sent) == 1  # once per window
+
+    # a new end time is a new window; a custom message is used
+    await repo.update_roster(db, rid, end_time="2026-11-07T16:00:00+00:00", autoping_message="Last call!")
+    assert await cog.run_autopings(now) == 1
+    assert "Last call!" in sent[-1]
+
+    # closed rosters stay quiet
+    await repo.update_roster(db, rid, end_time="2026-11-07T17:00:00+00:00", closed=1)
+    assert await cog.run_autopings(now) == 0 and len(sent) == 2

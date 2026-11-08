@@ -8,15 +8,61 @@ from typing import Any
 
 import discord
 
-from clashhero.repos.legends import BoardEntry, DayStats, SeasonSummary, WeekDay
-from clashhero.utils.fmt import player_link, signed, table, ts
+from clashhero.repos.legends import BoardEntry, DayStats, Hit, SeasonSummary, WeekDay, has_details
+from clashhero.utils.fmt import chunk_lines, player_link, signed, stars, table, ts
 
 ATTACK_COLOR = discord.Color.green()
 DEFENSE_COLOR = discord.Color.red()
+KIND_EMOJI = {"attack": "⚔️", "defense": "🛡️"}
+LATEST_BATTLES = 8
 
 
 def _hits(values: Sequence[int]) -> str:
     return " ".join(signed(v) for v in values) or "—"
+
+
+def _esc(text: str | None, limit: int = 15) -> str:
+    return discord.utils.escape_markdown((text or "?")[:limit])
+
+
+def _stars(n: int) -> str:
+    return stars(max(0, min(3, n)))
+
+
+def opponent_text(name: str | None, th: int | None, limit: int = 15) -> str:
+    return _esc(name, limit) + (f" TH{th}" if th else "")
+
+
+def hit_line(h: Hit) -> str:
+    """One battle: trophies, then stars, destruction and opponent when read from the battle log
+    (`` `+40` ★★★ 100% · vs Name TH17``); inferred battles show only the trophies."""
+    base = f"`{signed(h.trophies):>4}`"
+    if not h.detailed:
+        return base
+    word = "vs" if h.kind == "attack" else "by"
+    opp = opponent_text(h.opponent_name, h.opponent_th)
+    return f"{base} {_stars(h.stars or 0)} {h.destruction or 0}% · {word} {opp}"
+
+
+def hit_chunks(hits: Sequence[Hit], limit: int = 1024) -> list[str]:
+    """Field values listing ``hits``: one line per battle when any has battle-log details,
+    otherwise the compact trophy list."""
+    if not has_details(hits):
+        return [_hits([h.trophies for h in hits])]
+    return [c.rstrip() for c in chunk_lines([hit_line(h) for h in hits], limit)]
+
+
+def source_note(hits: Sequence[Hit]) -> str:
+    detailed = sum(1 for h in hits if h.detailed)
+    if hits and detailed == len(hits):
+        return "from the battle log"
+    if detailed:
+        return "some battles inferred from trophy changes"
+    return "battles are inferred from trophy changes"
+
+
+def _day_hits(stats: DayStats) -> list[Hit]:
+    return stats.hits("attack") + stats.hits("defense")
 
 
 def count(hits: Sequence[int], cap: int | None) -> str:
@@ -58,7 +104,8 @@ def week_embed(
     e.add_field(name="Net", value=signed(net))
     if league:
         e.add_field(name="League", value=league)
-    e.set_footer(text=f"{tag} · battles are inferred from trophy changes · days reset 05:00 UTC")
+    hits = [h for d in days for h in _day_hits(d.stats)]
+    e.set_footer(text=f"{tag} · {source_note(hits)} · days reset 05:00 UTC")
     return e
 
 
@@ -71,20 +118,59 @@ def alert_embed(
     trophies_after: int,
     stats: DayStats,
     occurred_at: datetime | None = None,
+    opponent_tag: str | None = None,
+    opponent_name: str | None = None,
+    opponent_th: int | None = None,
+    stars: int | None = None,
+    destruction: int | None = None,
+    battle_type: str | None = None,
 ) -> discord.Embed:
+    """A battle alert. The opponent/stars/destruction arguments are given for battles read from
+    the battle log; inferred battles only show the trophy change."""
     is_attack = kind == "attack"
+    lines = [f"**{signed(trophies)}** trophies → **{trophies_after}**"]
+    if opponent_tag is not None:
+        result = f"{_stars(stars or 0)} **{destruction or 0}%**"
+        who = f"[{_esc(opponent_name, 32)}]({player_link(opponent_tag)})"
+        th = f" · TH{opponent_th}" if opponent_th else ""
+        lines.append(f"{result} {'vs' if is_attack else 'by'} {who}{th} · `{opponent_tag}`")
     e = discord.Embed(
         title=f"{'⚔️ Attack' if is_attack else '🛡️ Defense'} · {name}",
         url=player_link(tag),
         color=ATTACK_COLOR if is_attack else DEFENSE_COLOR,
-        description=f"**{signed(trophies)}** trophies → **{trophies_after}**",
+        description="\n".join(lines),
     )
     e.add_field(name="Attacks", value=f"{count(stats.attacks, stats.cap)} ({signed(stats.offense)})")
     e.add_field(name="Defenses", value=f"{count(stats.defenses, stats.cap)} ({signed(stats.defense)})")
     e.add_field(name="Net today", value=signed(stats.net))
-    e.set_footer(text=tag)
+    kind_label = {"legend": "Legend I battle", "ranked": "Ranked battle"}.get(battle_type or "")
+    e.set_footer(text=f"{tag} · {kind_label}" if kind_label else tag)
     if occurred_at:
         e.timestamp = occurred_at
+    return e
+
+
+def army_embed(
+    *, battle: Any, fields: Sequence[tuple[str, str]], color: discord.Color | None = None
+) -> discord.Embed:
+    """Army used in a battle-log battle (a legend_events row with ``player_name``). On attacks the
+    army is the tracked player's; on defenses it's the attacker's."""
+    player = battle["player_name"] or battle["player_tag"]
+    opponent = battle["opponent_name"] or battle["opponent_tag"] or "?"
+    is_attack = battle["kind"] == "attack"
+    attacker, target = (player, opponent) if is_attack else (opponent, player)
+    e = discord.Embed(title=f"{attacker}'s army", color=color)
+    if battle["stars"] is not None:
+        e.description = (
+            f"{_stars(battle['stars'])} **{battle['destruction'] or 0}%** vs {_esc(target, 32)} · "
+            f"{signed(battle['trophies'])} trophies"
+        )
+    for title, value in fields:
+        for i, chunk in enumerate(chunk_lines(value.split("\n"), 1000)):
+            e.add_field(name=title if i == 0 else f"{title} (cont.)", value=chunk.rstrip(), inline=True)
+    e.set_footer(text=f"{battle['player_tag']} · {'attack' if is_attack else 'defense'}")
+    if battle["occurred_at"]:
+        e.timestamp = datetime.fromisoformat(battle["occurred_at"])
     return e
 
 
@@ -101,20 +187,18 @@ def day_embed(
     e = discord.Embed(title=f"{name} · Legend day {day}", url=player_link(tag), color=color)
     if start is not None:
         e.description = f"Trophies **{start}** → **{end if end is not None else start}**"
-    e.add_field(
-        name=f"Attacks {count(stats.attacks, stats.cap)} ({signed(stats.offense)})",
-        value=_hits(stats.attacks),
-        inline=False,
-    )
-    e.add_field(
-        name=f"Defenses {count(stats.defenses, stats.cap)} ({signed(stats.defense)})",
-        value=_hits(stats.defenses),
-        inline=False,
-    )
+    for kind, title in (
+        ("attack", f"Attacks {count(stats.attacks, stats.cap)} ({signed(stats.offense)})"),
+        ("defense", f"Defenses {count(stats.defenses, stats.cap)} ({signed(stats.defense)})"),
+    ):
+        for i, value in enumerate(hit_chunks(stats.hits(kind))):
+            e.add_field(name=title if i == 0 else f"{title} (cont.)", value=value, inline=False)
     e.add_field(name="Net", value=signed(stats.net))
     if stats.attacks_left is not None:
         e.add_field(name="Attacks left", value=str(stats.attacks_left))
-    e.set_footer(text=f"{tag} · battles are inferred from trophy changes")
+    if has_details(stats.hits("attack")):
+        e.add_field(name="3★", value=f"{stats.triples}/{len(stats.attacks)}")
+    e.set_footer(text=f"{tag} · {source_note(_day_hits(stats))}")
     return e
 
 
@@ -146,8 +230,21 @@ def season_embed(
     a, d = summary.all_attacks, summary.all_defenses
     e.add_field(name="Attacks", value=f"{len(a)} · avg {summary.avg_offense:+.1f}")
     e.add_field(name="Defenses", value=f"{len(d)} · avg {summary.avg_defense:+.1f}")
-    e.add_field(name="Max-trophy hits", value=f"{summary.triple_rate:.0%}")
+    if summary.avg_attack_stars is not None:
+        est = summary.estimated_triples
+        e.add_field(
+            name="3★ rate", value=f"{summary.triple_rate:.0%}" + (f" ({est} by trophies)" if est else "")
+        )
+    else:
+        e.add_field(name="Max-trophy hits", value=f"{summary.triple_rate:.0%}")
     e.add_field(name="Avg lost on defense / day", value=f"{summary.avg_defense_per_day:+.1f}")
+    star_avgs = [
+        f"{label} {v:.2f}★"
+        for label, v in (("atk", summary.avg_attack_stars), ("def", summary.avg_defense_stars))
+        if v is not None
+    ]
+    if star_avgs:
+        e.add_field(name="Avg stars", value=" · ".join(star_avgs))
     e.set_footer(text=tag)
     return e
 
@@ -178,9 +275,16 @@ def history_embed(
     return e
 
 
+def _board_has_stars(entries: Sequence[BoardEntry]) -> bool:
+    return any(has_details(e.stats.hits("attack")) for e in entries)
+
+
 def board_lines(entries: Sequence[BoardEntry]) -> list[list[Any]]:
-    return [
-        [
+    """Table rows; a 3★ column (today's triples) is added when any player has battle-log data."""
+    with_stars = _board_has_stars(entries)
+    rows = []
+    for i, e in enumerate(entries, 1):
+        row: list[Any] = [
             i,
             e.name[:15],
             e.town_hall or "?",
@@ -189,8 +293,25 @@ def board_lines(entries: Sequence[BoardEntry]) -> list[list[Any]]:
             count(e.stats.attacks, e.stats.cap),
             count(e.stats.defenses, e.stats.cap),
         ]
-        for i, e in enumerate(entries, 1)
-    ]
+        if with_stars:
+            row.append(e.stats.triples if has_details(e.stats.hits("attack")) else "-")
+        rows.append(row)
+    return rows
+
+
+def latest_battles(entries: Sequence[BoardEntry], limit: int = LATEST_BATTLES) -> list[tuple[str, Hit]]:
+    """The most recent battles across ``entries``, newest first, as (player name, hit)."""
+    out = [(e.name, h) for e in entries for h in _day_hits(e.stats) if h.occurred_at]
+    out.sort(key=lambda x: x[1].occurred_at or "", reverse=True)
+    return out[:limit]
+
+
+def latest_battles_value(battles: Sequence[tuple[str, Hit]]) -> str:
+    lines = []
+    for name, h in battles:
+        when = ts(h.occurred_at, "t") + " " if h.occurred_at else ""
+        lines.append(f"{when}{KIND_EMOJI.get(h.kind, '')} **{_esc(name)}** {hit_line(h)}")
+    return chunk_lines(lines, 1024)[0].rstrip()
 
 
 def board_embed(
@@ -199,12 +320,21 @@ def board_embed(
     entries: Sequence[BoardEntry],
     updated: datetime | None = None,
     color: discord.Color | None = None,
+    latest: int = 0,
 ) -> discord.Embed:
+    """Leaderboard table; with ``latest`` > 0 also a "Latest battles" field listing that many of
+    today's most recent battles (opponent, stars and % when known)."""
     e = discord.Embed(title=title, color=color)
     if entries:
-        e.description = table(board_lines(entries), ["#", "Name", "TH", "Cups", "Today", "Atk", "Def"])[:4000]
+        headers = ["#", "Name", "TH", "Cups", "Today", "Atk", "Def"]
+        if _board_has_stars(entries):
+            headers.append("3★")
+        e.description = table(board_lines(entries), headers)[:4000]
     else:
         e.description = "No players yet."
+    battles = latest_battles(entries, latest) if latest > 0 else []
+    if battles:
+        e.add_field(name="Latest battles", value=latest_battles_value(battles), inline=False)
     if updated:
         e.add_field(name="Updated", value=ts(updated))
     return e
@@ -217,8 +347,10 @@ def clan_day_embed(
     if not rows:
         e.description = "No legend activity recorded."
         return e
-    lines = [
-        [
+    with_stars = any(r.get("triples") is not None for r in rows)
+    lines = []
+    for i, r in enumerate(rows, 1):
+        line = [
             i,
             r["name"][:15],
             r["start"],
@@ -227,9 +359,11 @@ def clan_day_embed(
             signed(r["defense"]),
             signed(r["net"]),
         ]
-        for i, r in enumerate(rows, 1)
-    ]
-    e.description = table(lines, ["#", "Name", "Start", "End", "Off", "Def", "Net"])[:4000]
+        if with_stars:
+            line.append("-" if r.get("triples") is None else r["triples"])
+        lines.append(line)
+    headers = ["#", "Name", "Start", "End", "Off", "Def", "Net"] + (["3★"] if with_stars else [])
+    e.description = table(lines, headers)[:4000]
     tot_off = sum(r["offense"] for r in rows)
     tot_def = sum(r["defense"] for r in rows)
     e.add_field(name="Clan offense", value=signed(tot_off))

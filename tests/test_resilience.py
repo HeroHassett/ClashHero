@@ -108,3 +108,20 @@ def test_unit_levels_survive_stale_game_data():
     assert (units["Brand New Troop"].max_for_th, units["Brand New Troop"].approximate) == (5, True)
     assert (units["Rage Spell"].max_for_th, units["Rage Spell"].max_for_prev_th) == (11, 10)
     assert not units["Rage Spell"].approximate
+
+
+async def test_reregistering_a_player_source_replaces_it(setup):  # noqa: F811
+    bot, coc, col = setup
+
+    class Cog:
+        def __init__(self, tags):
+            self.tags = tags
+
+        async def tracked(self):
+            return self.tags
+
+    col.register_player_source(Cog({"#OLD"}).tracked)
+    col.register_player_source(Cog({"#NEW"}).tracked)  # e.g. the cog was reloaded
+    assert len(col._player_sources) == 1
+    tags = await col.player_tags_to_poll()
+    assert "#NEW" in tags and "#OLD" not in tags

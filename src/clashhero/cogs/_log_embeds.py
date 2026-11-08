@@ -9,7 +9,7 @@ from typing import Any
 
 import discord
 
-from clashhero.utils.fmt import player_link, role_name, stars, table, ts
+from clashhero.utils.fmt import chunk_lines, clan_link, player_link, role_name, stars, table, ts
 
 GREEN = discord.Color.green()
 RED = discord.Color.red()
@@ -25,6 +25,35 @@ ATTRIBUTE_LABELS = {
 }
 
 
+SETTING_LABELS = {
+    "description": "Description",
+    "type": "Clan type",
+    "required_town_hall": "Required Town Hall",
+    "required_trophies": "Required trophies",
+    "required_builder_trophies": "Required Builder Base trophies",
+    "war_frequency": "War frequency",
+    "public_war_log": "Public war log",
+    "family_friendly": "Family friendly",
+    "location": "Location",
+    "chat_language": "Chat language",
+    "labels": "Labels",
+}
+CLAN_TYPE_LABELS = {"open": "Anyone can join", "inviteOnly": "Invite only", "closed": "Closed"}
+WAR_FREQUENCY_LABELS = {
+    "always": "Always",
+    "moreThanOncePerWeek": "Twice a week",
+    "oncePerWeek": "Once a week",
+    "lessThanOncePerWeek": "Rarely",
+    "never": "Never",
+    "unknown": "Not set",
+}
+# Display order for unit kinds inside a player's upgrade list.
+UNIT_KIND_ORDER = {"Hero": 0, "Equipment": 1, "Pet": 2, "Troop": 3, "Siege": 4, "Spell": 5}
+
+# (kind, unit name, old level or None if newly unlocked, new level)
+UnitChange = tuple[str, str, int | None, int]
+
+
 def _get(row: Mapping[str, Any] | None, key: str, default: Any = None) -> Any:
     if row is None:
         return default
@@ -33,6 +62,18 @@ def _get(row: Mapping[str, Any] | None, key: str, default: Any = None) -> Any:
     except (KeyError, IndexError):
         return default
     return default if value is None else value
+
+
+def _truncate(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def profile_view(tag: str) -> discord.ui.View:
+    """Link-only view with a "Profile" button that opens the player in game. Link buttons need
+    no persistence, so this can be attached to any log post."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label="Profile", style=discord.ButtonStyle.link, url=player_link(tag)))
+    return view
 
 
 # ------------------------------------------------------------------ clan / members
@@ -85,6 +126,24 @@ def member_leave_embed(
         color=RED,
     )
     e.set_footer(text=f"{member.tag} · {member_count}/50 members")
+    return e
+
+
+def clan_move_embed(
+    name: str,
+    tag: str,
+    old_clan_name: str,
+    new_clan_name: str | None,
+    new_clan_tag: str,
+    own_clan: bool = False,
+) -> discord.Embed:
+    """Follow-up to a leave: where the player went. ``own_clan`` marks one of the server's clans."""
+    new = f"[{new_clan_name or new_clan_tag}]({clan_link(new_clan_tag)})"
+    desc = f"**{name}** (left {old_clan_name}) is now in **{new}** ({new_clan_tag})"
+    if own_clan:
+        desc += "\nThat's one of this server's clans."
+    e = discord.Embed(description=desc, color=GREEN if own_clan else GREY)
+    e.set_footer(text=tag)
     return e
 
 
@@ -159,6 +218,135 @@ def clan_games_progress_embed(clan_name: str, entries: Sequence[tuple[str, int, 
     return discord.Embed(
         title=f"{clan_name} Clan Games progress", description="\n".join(lines)[:4000], color=GOLD
     )
+
+
+# ------------------------------------------------------------------ upgrades / boosts / settings
+
+
+def unit_change_text(unit: str, old: int | None, new: int) -> str:
+    if old is None:
+        return f"{unit} unlocked" if new <= 1 else f"{unit} unlocked (level {new})"
+    return f"{unit} {old} → **{new}**"
+
+
+def _pack(blocks: Sequence[Sequence[str]], limit: int, gap: str = "\n\n") -> list[str]:
+    """Join blocks of lines into strings under ``limit`` chars, keeping each block together
+    when it fits (``gap`` between blocks) and splitting oversized blocks by line."""
+    out: list[str] = []
+    cur = ""
+    for block in blocks:
+        text = "\n".join(block)
+        pieces = [text] if len(text) <= limit else [p.rstrip("\n") for p in chunk_lines(block, limit)]
+        for piece in pieces:
+            if not piece:
+                continue
+            sep = gap if cur else ""
+            if cur and len(cur) + len(sep) + len(piece) > limit:
+                out.append(cur)
+                cur, sep = "", ""
+            cur += sep + piece
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _titled(title: str, pages: Sequence[str], color: discord.Color, footer: str) -> list[discord.Embed]:
+    embeds = []
+    for i, page in enumerate(pages, 1):
+        suffix = f" ({i}/{len(pages)})" if len(pages) > 1 else ""
+        e = discord.Embed(title=f"{title}{suffix}", description=page, color=color)
+        e.set_footer(text=footer)
+        embeds.append(e)
+    return embeds
+
+
+def upgrades_embeds(
+    clan_name: str,
+    entries: Sequence[tuple[str, str, int, Sequence[UnitChange]]],
+    limit: int = 4000,
+) -> list[discord.Embed]:
+    """entries: (player name, tag, town hall, unit changes) aggregated over the batch window.
+    One block per player; split across several embeds when long."""
+    entries = [x for x in entries if x[3]]
+    if not entries:
+        return []
+    blocks = []
+    for name, tag, th, changes in sorted(entries, key=lambda x: (-len(x[3]), x[0].lower())):
+        ordered = sorted(changes, key=lambda c: (UNIT_KIND_ORDER.get(c[0], 9), c[1]))
+        head = f"**[{name}]({player_link(tag)})** · TH{th}"
+        blocks.append([head, *(f"• {unit_change_text(u, old, new)}" for _, u, old, new in ordered)])
+    total = sum(len(x[3]) for x in entries)
+    footer = f"{total} upgrade{'s' * (total != 1)} by {len(entries)} player{'s' * (len(entries) != 1)}"
+    return _titled(f"{clan_name} upgrades", _pack(blocks, limit), GOLD, footer)
+
+
+def super_troops_embeds(
+    clan_name: str, entries: Sequence[tuple[str, str, Sequence[str]]], limit: int = 4000
+) -> list[discord.Embed]:
+    """entries: (player name, tag, super troops newly boosted in the batch window)."""
+    entries = [x for x in entries if x[2]]
+    if not entries:
+        return []
+    lines = [
+        f"**{name}** boosted {', '.join(f'**{t}**' for t in troops)}"
+        for name, _, troops in sorted(entries, key=lambda x: x[0].lower())
+    ]
+    total = sum(len(x[2]) for x in entries)
+    footer = f"{total} boost{'s' * (total != 1)}"
+    return _titled(
+        f"{clan_name} super troop boosts", _pack([[ln] for ln in lines], limit, "\n"), BLUE, footer
+    )
+
+
+def setting_value(setting: str, value: Any) -> str:
+    if value is None or value == "" or value == []:
+        return "None"
+    if setting == "type":
+        return CLAN_TYPE_LABELS.get(value, str(value))
+    if setting == "war_frequency":
+        return WAR_FREQUENCY_LABELS.get(value, str(value))
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if setting == "required_town_hall":
+        return f"TH{value}"
+    if isinstance(value, int):
+        return f"{value:,}"
+    if isinstance(value, list | tuple):
+        return ", ".join(map(str, value))
+    return str(value)
+
+
+def _quoted_description(text: Any, limit: int = 400) -> str:
+    if not text:
+        return "*(empty)*"
+    return discord.utils.escape_markdown(_truncate(str(text).strip(), limit)) or "*(empty)*"
+
+
+def clan_settings_embed(
+    clan_name: str, clan_tag: str, changes: Sequence[tuple[str, Any, Any]]
+) -> discord.Embed:
+    """changes: (setting, old, new); setting keys come from services.snapshots.clan_settings."""
+    e = discord.Embed(title=f"{clan_name} settings changed", url=clan_link(clan_tag), color=BLUE)
+    lines = []
+    for setting, old, new in changes:
+        label = SETTING_LABELS.get(setting, setting.replace("_", " ").capitalize())
+        if setting == "description":
+            e.add_field(name="Old description", value=_quoted_description(old), inline=False)
+            e.add_field(name="New description", value=_quoted_description(new), inline=False)
+        elif setting == "labels":
+            before, after = set(old or ()), set(new or ())
+            parts = []
+            if added := sorted(after - before):
+                parts.append("added " + ", ".join(f"**{x}**" for x in added))
+            if removed := sorted(before - after):
+                parts.append("removed " + ", ".join(f"**{x}**" for x in removed))
+            lines.append(f"**{label}**: {'; '.join(parts) or 'reordered'}")
+        else:
+            lines.append(f"**{label}**: {setting_value(setting, old)} → **{setting_value(setting, new)}**")
+    if lines:
+        e.description = "\n".join(lines)[:4000]
+    e.set_footer(text=clan_tag)
+    return e
 
 
 # ------------------------------------------------------------------ war

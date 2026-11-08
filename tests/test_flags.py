@@ -1,5 +1,12 @@
+import sqlite3
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace as NS
 
+import discord
+import pytest
+
+from clashhero.cogs import flags as cog
+from clashhero.db import Database
 from clashhero.repos import flags as repo
 
 NOW = datetime(2026, 11, 7, tzinfo=UTC)
@@ -29,3 +36,198 @@ async def test_list_by_clan(db):
     rows = await repo.list_flags(db, 1, NOW, clan_tags=["#C"])
     assert [r["player_tag"] for r in rows] == ["#P1"]
     assert await repo.list_flags(db, 1, NOW, clan_tags=[]) == []
+
+
+# ------------------------------------------------------------------ weighted strikes
+
+
+async def test_weight_defaults_and_validation(db):
+    s = await repo.create_flag(db, 1, "#P1", "strike", None, 9, NOW, weight=4)
+    d = await repo.create_flag(db, 1, "#P1", "strike", None, 9, NOW)
+    b = await repo.create_flag(db, 1, "#P1", "ban", None, 9, NOW, weight=7)  # bans don't carry weight
+    weights = {r["id"]: r["weight"] for r in await repo.list_flags(db, 1, NOW)}
+    assert weights == {s: 4, d: 1, b: 1}
+    for bad in (0, 11):
+        with pytest.raises(ValueError):
+            await repo.create_flag(db, 1, "#P1", "strike", None, 9, NOW, weight=bad)
+
+
+async def test_list_min_strike_weight(db):
+    await repo.create_flag(db, 1, "#P1", "strike", None, 9, NOW, weight=2)
+    await repo.create_flag(db, 1, "#P1", "strike", None, 9, NOW, weight=3)
+    await repo.create_flag(db, 1, "#P1", "ban", "x", 9, NOW)
+    await repo.create_flag(db, 1, "#P2", "strike", None, 9, NOW, expiry_days=1, weight=5)
+    await repo.create_flag(db, 1, "#P3", "strike", None, 9, NOW, weight=1)
+    await repo.create_flag(db, 2, "#P3", "strike", None, 9, NOW, weight=10)  # other server
+
+    def tags(rows):
+        return sorted({r["player_tag"] for r in rows})
+
+    assert tags(await repo.list_flags(db, 1, NOW, min_strike_weight=5)) == ["#P1", "#P2"]
+    # P1's ban is listed too: the filter is on the player's strike total, not the flag type.
+    assert len(await repo.list_flags(db, 1, NOW, min_strike_weight=5, player_tag="#P1")) == 3
+    assert tags(await repo.list_flags(db, 1, NOW, min_strike_weight=6)) == []
+    later = NOW + timedelta(days=2)
+    assert tags(await repo.list_flags(db, 1, later, min_strike_weight=5)) == ["#P1"]
+    assert tags(await repo.list_flags(db, 1, later, min_strike_weight=5, include_expired=True)) == [
+        "#P1",
+        "#P2",
+    ]
+    rows = await repo.list_flags(db, 1, NOW, min_strike_weight=2, flag_type="strike")
+    assert {r["player_tag"] for r in rows} == {"#P1", "#P2"}
+
+
+async def test_strike_totals(db):
+    await db.execute(
+        "INSERT INTO players (player_tag, name, clan_tag, updated_at) VALUES "
+        "('#P1','One','#C','x'), ('#P2','Two','#C','x'), ('#P3','Three','#D','x')"
+    )
+    await repo.create_flag(db, 1, "#P1", "strike", None, 9, NOW, weight=2)
+    await repo.create_flag(db, 1, "#P1", "strike", None, 9, NOW + timedelta(hours=1), weight=1)
+    await repo.create_flag(db, 1, "#P2", "strike", None, 9, NOW, weight=6)
+    await repo.create_flag(db, 1, "#P2", "ban", None, 9, NOW)
+    await repo.create_flag(db, 1, "#P3", "strike", None, 9, NOW, expiry_days=1, weight=9)
+    await repo.create_flag(db, 1, "#P4", "ban", None, 9, NOW)  # bans alone don't appear
+
+    rows = await repo.strike_totals(db, 1, NOW)
+    assert [(r["player_tag"], r["total"], r["strikes"]) for r in rows] == [
+        ("#P3", 9, 1),
+        ("#P2", 6, 1),
+        ("#P1", 3, 2),
+    ]
+    assert [bool(r["banned"]) for r in rows] == [False, True, False]
+    assert rows[2]["name"] == "One"
+    later = NOW + timedelta(days=2)
+    assert [r["player_tag"] for r in await repo.strike_totals(db, 1, later)] == ["#P2", "#P1"]
+    assert [r["player_tag"] for r in await repo.strike_totals(db, 1, NOW, clan_tags=["#C"])] == ["#P2", "#P1"]
+    assert [r["player_tag"] for r in await repo.strike_totals(db, 1, NOW, min_weight=4)] == ["#P3", "#P2"]
+    assert await repo.strike_totals(db, 2, NOW) == []
+    assert await repo.strike_total(db, 1, "#P1", NOW) == 3
+    assert await repo.strike_total(db, 1, "#P3", later) == 0
+
+
+async def test_weight_column_added_to_existing_table(tmp_path):
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE TABLE flags (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, "
+        "player_tag TEXT NOT NULL, flag_type TEXT NOT NULL, reason TEXT, created_by INTEGER NOT NULL, "
+        "created_at TEXT NOT NULL, expires_at TEXT)"
+    )
+    con.execute(
+        "INSERT INTO flags (guild_id, player_tag, flag_type, created_by, created_at) "
+        "VALUES (1, '#P1', 'strike', 9, ?)",
+        (NOW.isoformat(),),
+    )
+    con.commit()
+    con.close()
+    d = Database(path)
+    await d.connect()
+    try:
+        assert await d.fetchval("SELECT weight FROM flags") == 1
+        assert await repo.strike_total(d, 1, "#P1", NOW) == 1
+    finally:
+        await d.close()
+
+
+def test_flag_line_shows_weight():
+    base = {
+        "id": 3,
+        "flag_type": "strike",
+        "weight": 3,
+        "expires_at": None,
+        "reason": "missed war",
+        "name": "A",
+        "player_tag": "#P1",
+        "created_by": 9,
+        "created_at": NOW.isoformat(),
+    }
+    assert "⚠️ ×3" in cog.flag_line(base)
+    assert "×" not in cog.flag_line({**base, "weight": 1})
+    assert "⛔" in cog.flag_line({**base, "flag_type": "ban", "weight": 1})
+
+
+def test_dm_embed():
+    e = cog.dm_embed(
+        guild_name="Family",
+        player_name="A",
+        player_tag="#P1",
+        flag_type="strike",
+        reason=None,
+        weight=2,
+        expires_at=None,
+        total=5,
+    )
+    fields = {f.name: f.value for f in e.fields}
+    assert "strike" in e.title and fields["Weight"] == "2" and fields["Active strike total"] == "5"
+    assert fields["Expires"] == "Never" and fields["Reason"] == "No reason given."
+    ban = cog.dm_embed(
+        guild_name="Family",
+        player_name="A",
+        player_tag="#P1",
+        flag_type="ban",
+        reason="cheating",
+        weight=1,
+        expires_at=None,
+    )
+    assert "banned" in ban.title and "Weight" not in {f.name for f in ban.fields}
+
+
+class _User:
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+        self.sent = []
+
+    async def send(self, **kw):
+        if self.fail:
+            raise discord.Forbidden(NS(status=403, reason="Forbidden"), "Cannot send messages to this user")
+        self.sent.append(kw)
+
+
+class _DMBot:
+    def __init__(self, users):
+        self.users = users
+
+    def get_user(self, uid):
+        return self.users.get(uid)
+
+    async def fetch_user(self, uid):
+        raise discord.NotFound(NS(status=404, reason="Not Found"), "Unknown User")
+
+
+async def test_dm_users_reports_failures():
+    ok, closed = _User(), _User(fail=True)
+    bot = _DMBot({1: ok, 2: closed})
+    sent, failed = await cog.dm_users(bot, [1, 2, 3], discord.Embed(title="x"))
+    assert sent == [1] and failed == [2, 3]
+    assert len(ok.sent) == 1
+
+
+class _Channel:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, **kw):
+        self.sent.append(kw)
+
+
+async def test_join_alert_still_fires_with_strike_total(db):
+    await db.add_guild_clan(1, "#C")
+    await db.set_server_log(1, "flag_alert", 50)
+    await repo.create_flag(db, 1, "#P1", "strike", "late", 9, datetime.now(UTC), weight=4)
+    await repo.create_flag(db, 1, "#P1", "ban", None, 9, datetime.now(UTC))
+    channel = _Channel()
+    bot = NS(db=db, get_channel=lambda cid: channel if cid == 50 else None)
+    flags = cog.Flags(bot)
+    member = NS(tag="#P1", name="A", town_hall=16)
+    await flags.on_clash_member_join(NS(clan_tag="#C", clan_name="Clan", member=member, member_count=10))
+    assert len(channel.sent) == 1
+    embed = channel.sent[0]["embed"]
+    fields = {f.name: f.value for f in embed.fields}
+    assert "⚠️ ×4" in fields["Flags"] and "⛔" in fields["Flags"]
+    assert fields["Active strike total"] == "4"
+    # Not flagged: no alert.
+    await flags.on_clash_member_join(
+        NS(clan_tag="#C", clan_name="Clan", member=NS(tag="#P2", name="B", town_hall=15), member_count=11)
+    )
+    assert len(channel.sent) == 1

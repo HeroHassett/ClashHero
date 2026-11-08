@@ -1,4 +1,5 @@
-"""Roster queries and pure roster logic (eligibility, tag parsing, ping targets, sorting)."""
+"""Roster queries and pure roster logic (eligibility, tag parsing, ping targets, sorting,
+auto-ping windows)."""
 
 from __future__ import annotations
 
@@ -6,6 +7,7 @@ import csv
 import io
 import re
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from clashhero.db.database import Database, Row
@@ -44,9 +46,18 @@ _EDITABLE = frozenset(
         "closed",
         "channel_id",
         "message_id",
+        "autoping_start_hours",
+        "autoping_end_hours",
+        "autoping_message",
+        "autoping_channel_id",
+        "autoping_start_sent",
+        "autoping_end_sent",
     }
 )
-_CLONE_COLUMNS = sorted(_EDITABLE - {"name", "channel_id", "message_id", "closed"})
+_CLONE_COLUMNS = sorted(
+    _EDITABLE - {"name", "channel_id", "message_id", "closed", "autoping_start_sent", "autoping_end_sent"}
+)
+AUTOPING_KINDS = ("start", "end")
 
 
 # ------------------------------------------------------------------ pure helpers
@@ -149,6 +160,49 @@ def members_csv(members: Sequence[Mapping[str, Any]]) -> str:
             ]
         )
     return buf.getvalue()
+
+
+def _as_dt(value: str | datetime | None) -> datetime | None:
+    if not value:
+        return None
+    dt = value if isinstance(value, datetime) else datetime.fromisoformat(value)
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+def format_hours(hours: float) -> str:
+    """1.5 -> '1h30m', 0.25 -> '15m', 24 -> '24h'."""
+    minutes = round(hours * 60)
+    h, m = divmod(minutes, 60)
+    return (f"{h}h" if h else "") + (f"{m}m" if m else "") or "0m"
+
+
+def autoping_due(roster: Mapping[str, Any], now: datetime) -> list[tuple[str, str]]:
+    """(kind, time) pairs whose auto-ping window is open: ``now`` is within the configured hours
+    before the roster's start/end time and that exact time hasn't been pinged for yet. Closed
+    rosters never ping."""
+    if _get(roster, "closed"):
+        return []
+    due = []
+    for kind in AUTOPING_KINDS:
+        hours, when = _get(roster, f"autoping_{kind}_hours"), _get(roster, f"{kind}_time")
+        at = _as_dt(when)
+        if not hours or at is None or _get(roster, f"autoping_{kind}_sent") == when:
+            continue
+        if at - timedelta(hours=hours) <= now < at:
+            due.append((kind, when))
+    return due
+
+
+def describe_autoping(roster: Mapping[str, Any]) -> str | None:
+    """Human summary of the auto-ping setting, or None when it's off."""
+    parts = []
+    if _get(roster, "autoping_end_hours"):
+        parts.append(f"{format_hours(roster['autoping_end_hours'])} before signups close")
+    if _get(roster, "autoping_start_hours"):
+        parts.append(f"{format_hours(roster['autoping_start_hours'])} before start")
+    if not parts:
+        return None
+    return "Auto-ping unregistered members " + " and ".join(parts)
 
 
 # ------------------------------------------------------------------ rosters
@@ -382,3 +436,95 @@ async def other_roster_in_category(
 
 async def member_count(db: Database, roster_id: int) -> int:
     return await db.fetchval("SELECT COUNT(*) FROM roster_members WHERE roster_id = ?", (roster_id,), 0)
+
+
+# ------------------------------------------------------------------ suggestions
+
+
+async def suggestion_candidate_rows(db: Database, roster: Mapping[str, Any]) -> list[Row]:
+    """Everyone a roster suggestion considers: the roster clan's current members plus anyone
+    already signed up, with live player data (falling back to the signup snapshot), last_seen,
+    the Discord link and the current group."""
+    return await db.fetchall(
+        "SELECT t.player_tag, COALESCE(p.name, m.name, t.player_tag) AS name, "
+        "COALESCE(p.town_hall, m.town_hall) AS town_hall, "
+        "COALESCE(p.heroes_total, m.heroes_total) AS heroes_total, p.last_seen, p.clan_tag, "
+        "m.group_id, g.name AS group_name, m.player_tag IS NOT NULL AS signed_up, "
+        "COALESCE(m.user_id, l.discord_user_id) AS user_id "
+        "FROM (SELECT player_tag FROM players WHERE clan_tag = ? "
+        "      UNION SELECT player_tag FROM roster_members WHERE roster_id = ?) t "
+        "LEFT JOIN players p ON p.player_tag = t.player_tag "
+        "LEFT JOIN roster_members m ON m.roster_id = ? AND m.player_tag = t.player_tag "
+        "LEFT JOIN roster_groups g ON g.id = m.group_id "
+        "LEFT JOIN player_links l ON l.player_tag = t.player_tag",
+        (roster["clan_tag"], roster["id"], roster["id"]),
+    )
+
+
+async def tags_on_other_rosters(
+    db: Database, guild_id: int, category: str, exclude_roster_id: int
+) -> dict[str, str]:
+    """player_tag -> roster name for signups on other rosters of the same category."""
+    rows = await db.fetchall(
+        "SELECT m.player_tag, r.name FROM roster_members m JOIN rosters r ON r.id = m.roster_id "
+        "WHERE r.guild_id = ? AND r.category = ? AND r.id != ? ORDER BY r.created_at",
+        (guild_id, category, exclude_roster_id),
+    )
+    out: dict[str, str] = {}
+    for r in rows:
+        out.setdefault(r["player_tag"], r["name"])
+    return out
+
+
+async def suggestion_groups(db: Database, roster_id: int) -> tuple[int, int]:
+    """(confirmed, substitute) group ids: the groups with those names, else the first and second
+    groups by position; creates whichever is missing."""
+    groups = await list_groups(db, roster_id)
+    by_name = {g["name"].lower(): g["id"] for g in groups}
+    confirmed = by_name.get("confirmed") or (groups[0]["id"] if groups else None)
+    if confirmed is None:
+        confirmed = await create_group(db, roster_id, DEFAULT_GROUPS[0])
+    sub = by_name.get("substitute")
+    if sub is None:
+        rest = [g["id"] for g in groups if g["id"] != confirmed]
+        sub = rest[0] if rest else await create_group(db, roster_id, DEFAULT_GROUPS[1])
+    return confirmed, sub
+
+
+# ------------------------------------------------------------------ auto-ping
+
+
+async def set_autoping(
+    db: Database,
+    roster_id: int,
+    *,
+    start_hours: float | None,
+    end_hours: float | None,
+    message: str | None,
+    channel_id: int | None,
+) -> None:
+    """Configure (or with all None, turn off) the auto-ping. Sent markers are kept, so turning it
+    off and on again inside a window that already pinged doesn't ping twice."""
+    await update_roster(
+        db,
+        roster_id,
+        autoping_start_hours=start_hours,
+        autoping_end_hours=end_hours,
+        autoping_message=message,
+        autoping_channel_id=channel_id,
+    )
+
+
+async def autoping_rosters(db: Database) -> list[Row]:
+    """Open rosters with an auto-ping configured for a time they actually have."""
+    return await db.fetchall(
+        "SELECT * FROM rosters WHERE closed = 0 AND ("
+        "(autoping_start_hours IS NOT NULL AND start_time IS NOT NULL) OR "
+        "(autoping_end_hours IS NOT NULL AND end_time IS NOT NULL))"
+    )
+
+
+async def mark_autoping_sent(db: Database, roster_id: int, kind: str, when: str) -> None:
+    if kind not in AUTOPING_KINDS:
+        raise ValueError(f"Unknown auto-ping kind {kind!r}")
+    await update_roster(db, roster_id, **{f"autoping_{kind}_sent": when})

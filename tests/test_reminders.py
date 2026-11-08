@@ -87,3 +87,138 @@ async def test_pending_queries(db):
         "VALUES ('2026-11', '#A', '#C', 4000, 'x')"
     )
     assert [p.player_tag for p in await R.games_pending(db, "#C", "2026-11")] == ["#B"]
+
+
+def test_parse_roles():
+    assert R.parse_roles("elder, co-leader") == ["admin", "coLeader"]
+    assert R.parse_roles("Leader Co Leader member") == ["member", "coLeader", "leader"]
+    assert R.parse_roles("coLeader,admin") == ["admin", "coLeader"]
+    assert R.parse_roles("any") is None and R.parse_roles("  ") is None
+    with pytest.raises(ValueError):
+        R.parse_roles("elder, boss")
+
+
+def _p(tag, th, role, done, total):
+    return R.Pending(tag, tag, f"{done}/{total}", th, role, done, total)
+
+
+def test_filters_apply():
+    people = [
+        _p("#A", 16, "leader", 0, 5),
+        _p("#B", 12, "member", 3, 5),
+        _p("#C", None, None, 1200, 4000),
+        _p("#D", 14, "admin", 4, 6),
+    ]
+    # no filters: everyone (existing behaviour)
+    assert R.Filters().apply(people, "war") == people
+    assert R.Filters().describe() == ""
+
+    def tags(f, type_="war"):
+        return [p.player_tag for p in f.apply(people, type_)]
+
+    assert tags(R.Filters(min_th=13)) == ["#A", "#D"]  # unknown TH never passes a TH filter
+    assert tags(R.Filters(max_th=14)) == ["#B", "#D"]
+    assert tags(R.Filters(min_th=12, max_th=14)) == ["#B", "#D"]
+    assert tags(R.Filters(clan_roles=frozenset({"admin", "member"}))) == ["#B", "#D"]
+    # games_below only applies to Clan Games, raid_min_left only to raids
+    assert tags(R.Filters(games_below=1000), "games") == ["#A", "#B", "#D"]
+    assert tags(R.Filters(games_below=1000), "war") == ["#A", "#B", "#C", "#D"]
+    assert tags(R.Filters(raid_min_left=3), "raid") == ["#A", "#C"]
+    assert tags(R.Filters(raid_min_left=3), "games") == ["#A", "#B", "#C", "#D"]
+    desc = R.Filters(
+        min_th=12, max_th=15, clan_roles=frozenset({"coLeader", "admin"}), war_type="cwl", games_below=1000
+    ).describe()
+    assert desc == "TH12-15 · Elder, Co-Leader · CWL wars · below 1,000 pts"
+    assert R.Filters(min_th=13).describe() == "TH13+"
+    assert R.Filters(raid_min_left=2).describe() == "2+ raid attacks left"
+
+
+async def test_filter_storage(db):
+    f = R.Filters(min_th=12, clan_roles=frozenset({"coLeader", "admin"}), war_type="random")
+    rid = await R.create_reminder(db, 1, "war", ["#C"], 3600, "go", 5, False, 9, f)
+    rem = await R.get_reminder(db, 1, rid)
+    assert rem["clan_roles"] == "admin coLeader"
+    assert R.Filters.from_row(rem) == f
+    # None leaves a column alone, CLEAR resets it
+    assert await R.update_reminder(db, 1, rid, min_th=R.CLEAR, max_th=15, war_type=None)
+    assert R.Filters.from_row(await R.get_reminder(db, 1, rid)) == R.Filters(
+        max_th=15, clan_roles=frozenset({"admin", "coLeader"}), war_type="random"
+    )
+    assert not await R.update_reminder(db, 1, rid, min_th=None)
+    # reminders created without filters have none
+    plain = await R.create_reminder(db, 1, "raid", ["#C"], 3600, "go", 5, False, 9)
+    assert R.Filters.from_row(await R.get_reminder(db, 1, plain)) == R.Filters()
+
+
+def test_check_filters():
+    from clashhero.cogs.reminders import Reminders
+    from clashhero.utils.resolve import ResolveError
+
+    Reminders._check_filters("war", R.Filters(war_type="friendly", min_th=10, max_th=10))
+    Reminders._check_filters("games", R.Filters(games_below=500))
+    for type_, f in [
+        ("cwl", R.Filters(war_type="random")),
+        ("war", R.Filters(games_below=500)),
+        ("games", R.Filters(raid_min_left=2)),
+        ("raid", R.Filters(min_th=15, max_th=12)),
+    ]:
+        with pytest.raises(ResolveError):
+            Reminders._check_filters(type_, f)
+
+
+async def test_roles_autocomplete():
+    from clashhero.cogs.reminders import Reminders
+
+    async def values(current):
+        return [c.value for c in await Reminders._roles_autocomplete(None, None, current)]
+
+    assert await values("") == ["any", "member", "elder", "co-leader", "leader"]
+    assert await values("el") == ["elder"]
+    assert await values("member, ") == ["member, elder", "member, co-leader", "member, leader"]
+    assert await values("member, elder, l") == ["member, elder, leader"]
+
+
+async def test_war_type_and_pending_details(db):
+    await db.execute(
+        "INSERT INTO players (player_tag, name, town_hall, clan_tag, clan_role, updated_at) VALUES "
+        "('#A', 'Alice', 16, '#C', 'coLeader', 'x'), ('#B', 'Bob', 13, '#OTHER', 'leader', 'x'), "
+        "('#M', 'Mia', 11, '#C', 'member', 'x')"
+    )
+    war_id = await db.execute(
+        "INSERT INTO wars (clan_tag, war_type, state, preparation_start, attacks_per_member, end_time) "
+        "VALUES ('#C', 'friendly', 'inWar', '2026-11-06', 2, '2026-11-08T00:00:00+00:00')"
+    )
+    await db.executemany(
+        "INSERT INTO war_members (war_id, player_tag, name, town_hall, map_position, is_opponent) "
+        "VALUES (?, ?, ?, ?, ?, 0)",
+        [(war_id, "#A", "Alice", 15, 1), (war_id, "#B", "Bob", None, 2)],
+    )
+    assert (await R.active_war(db, "#C", cwl=False))["id"] == war_id
+    assert await R.active_war(db, "#C", cwl=False, war_type="random") is None
+    assert await R.active_war(db, "#C", cwl=False, war_type="cwl") is None
+    war = await R.active_war(db, "#C", cwl=False, war_type="friendly")
+    pending = await R.war_pending(db, war)
+    # TH from the war lineup (else the player row); role only when they're in the war's clan
+    assert [(p.player_tag, p.town_hall, p.role, p.left) for p in pending] == [
+        ("#A", 15, "coLeader", 2),
+        ("#B", 13, None, 2),
+    ]
+    assert [p.player_tag for p in R.Filters(clan_roles=frozenset({"coLeader"})).apply(pending, "war")] == [
+        "#A"
+    ]
+
+    await db.execute(
+        "INSERT INTO raid_members (clan_tag, start_time, player_tag, name, attacks, attack_limit, loot) "
+        "VALUES ('#C', 's', '#A', 'Alice', 4, 6, 100)"
+    )
+    raid = await R.raid_pending(db, "#C", "s")
+    assert [(p.player_tag, p.town_hall, p.role, p.left) for p in raid] == [
+        ("#A", 16, "coLeader", 2),
+        ("#M", 11, "member", 5),
+    ]
+    assert [p.player_tag for p in R.Filters(raid_min_left=3).apply(raid, "raid")] == ["#M"]
+    games = await R.games_pending(db, "#C", "2026-11")
+    assert [(p.player_tag, p.town_hall, p.role, p.done) for p in games] == [
+        ("#A", 16, "coLeader", 0),
+        ("#M", 11, "member", 0),
+    ]

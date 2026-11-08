@@ -1,20 +1,29 @@
 """Rosters: CWL / war / esports / trophy sign-up lists with persistent
-Signup / Opt-out / Refresh buttons, groups, eligibility rules, pings and CSV export."""
+Signup / Opt-out / Refresh buttons, groups, eligibility rules, pings, CSV export, lineup
+suggestions from war history and automatic pings before a roster starts or closes."""
 
 from __future__ import annotations
 
 import io
+import logging
 from datetime import UTC, datetime
 
 import discord
 from discord import app_commands
+from discord.ext import tasks
 
 from clashhero.cogs import _roster_views as views
-from clashhero.cogs._base import BaseCog
+from clashhero.cogs._base import BaseCog, send_error
+from clashhero.repos import roster_scoring as scoring
 from clashhero.repos import rosters as repo
-from clashhero.utils.checks import manager
+from clashhero.utils.checks import manager, require
 from clashhero.utils.fmt import make_embed
 from clashhero.utils.resolve import ResolveError, clan_autocomplete, player_autocomplete, resolve_clan
+
+log = logging.getLogger(__name__)
+
+AUTOPING_INTERVAL_MINUTES = 5
+DEFAULT_SUGGEST_SIZE = 15
 
 CATEGORY_CHOICES = [
     app_commands.Choice(name=c.upper() if c != "esports" else "E-Sports", value=c) for c in repo.CATEGORIES
@@ -118,12 +127,45 @@ class Rosters(BaseCog):
     groups = app_commands.Group(
         name="groups", description="Roster groups (e.g. Confirmed, Substitute)", parent=roster
     )
+    autoping = app_commands.Group(
+        name="autoping",
+        description="Automatically ping unregistered clan members before a roster starts or closes",
+        parent=roster,
+    )
 
     async def cog_load(self) -> None:
         self.bot.add_dynamic_items(*views.DYNAMIC_ITEMS)
+        self.autoping_loop.start()
 
     async def cog_unload(self) -> None:
+        self.autoping_loop.cancel()
         self.bot.remove_dynamic_items(*views.DYNAMIC_ITEMS)
+
+    # ------------------------------------------------------------------ auto-ping loop
+
+    @tasks.loop(minutes=AUTOPING_INTERVAL_MINUTES)
+    async def autoping_loop(self) -> None:
+        try:
+            await self.run_autopings(datetime.now(UTC))
+        except Exception:
+            log.exception("Roster auto-ping cycle failed")
+
+    @autoping_loop.before_loop
+    async def _wait_ready(self) -> None:
+        await self.bot.wait_until_ready()
+
+    async def run_autopings(self, now: datetime) -> int:
+        """Send every auto-ping whose window is open (DB only). Each window is marked before
+        sending so it fires once even if sending fails. Returns users pinged."""
+        pinged = 0
+        for roster in await repo.autoping_rosters(self.db):
+            for kind, when in repo.autoping_due(roster, now):
+                try:
+                    await repo.mark_autoping_sent(self.db, roster["id"], kind, when)
+                    pinged += await views.send_autoping(self.bot, roster, kind, when)
+                except Exception:
+                    log.exception("Auto-ping (%s) failed for roster %s", kind, roster["id"])
+        return pinged
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -341,7 +383,9 @@ class Rosters(BaseCog):
         )
         lines = [
             f"**{r['name']}** · {r['category'].upper()} · {r['clan_name'] or r['clan_tag']} · "
-            f"{r['member_count']}/{r['max_members']}" + (" · 🔒" if r["closed"] else "")
+            f"{r['member_count']}/{r['max_members']}"
+            + (" · 🔔" if repo.describe_autoping(r) else "")
+            + (" · 🔒" if r["closed"] else "")
             for r in rows
         ]
         embed = await make_embed(
@@ -461,6 +505,132 @@ class Rosters(BaseCog):
         await interaction.response.send_message(
             f"Ping {len(users)} user(s) ({label}) for **{row['name']}**?", view=view, ephemeral=True
         )
+
+    # ------------------------------------------------------------------ suggestions
+
+    @roster.command(
+        name="suggest", description="Rank eligible players by war history, activity and TH/heroes"
+    )
+    @app_commands.autocomplete(roster=roster_autocomplete)
+    @app_commands.describe(
+        size=f"How many to confirm (default {DEFAULT_SUGGEST_SIZE}, capped at the roster size)",
+        substitutes="How many substitutes after the top picks (default 5)",
+        cwl_seasons="How many recent CWL seasons of history to use (default 3)",
+        apply="Put the picks into Confirmed / Substitute (roster managers; asks first)",
+    )
+    async def suggest(
+        self,
+        interaction: discord.Interaction,
+        roster: str,
+        size: app_commands.Range[int, 1, 65] | None = None,
+        substitutes: app_commands.Range[int, 0, 20] = 5,
+        cwl_seasons: app_commands.Range[int, 1, 12] = scoring.DEFAULT_CWL_SEASONS,
+        apply: bool = False,
+    ) -> None:
+        row = await get_roster_or_fail(interaction, roster)
+        if apply:
+            await require(interaction, "roster")
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        now = datetime.now(UTC)
+        rows = await repo.suggestion_candidate_rows(self.db, row)
+        candidates = [scoring.Candidate.from_row(r) for r in rows]
+        links = await self.db.links_for_tags([c.tag for c in candidates])
+        others = (
+            {}
+            if row["allow_multi_signup"]
+            else await repo.tags_on_other_rosters(self.db, row["guild_id"], row["category"], row["id"])
+        )
+        eligible, excluded = scoring.split_eligible(row, candidates, linked=links, other_rosters=others)
+        histories, seasons = await scoring.load_histories(
+            self.db, [c.tag for c in eligible], cwl_seasons=cwl_seasons, now=now
+        )
+        ranked = scoring.score_candidates(eligible, histories, now)
+        size = min(size or DEFAULT_SUGGEST_SIZE, row["max_members"])
+        substitutes = max(0, min(substitutes, row["max_members"] - size))
+        color = (await make_embed(self.bot, interaction.guild_id)).color
+        embeds = views.render_suggestion_embeds(
+            row, ranked, excluded, size=size, substitutes=substitutes, seasons=seasons, color=color
+        )
+        if not apply or not ranked:
+            await interaction.followup.send(embeds=embeds, ephemeral=True)
+            return
+        confirmed, subs = scoring.pick(ranked, size, substitutes)
+        new = sum(not s.candidate.signed_up for s in confirmed + subs)
+        free = row["max_members"] - await repo.member_count(self.db, row["id"])
+        text = (
+            f"Apply this lineup to **{row['name']}**? {len(confirmed)} → Confirmed, "
+            f"{len(subs)} → Substitute; other signups in Confirmed move to Substitute (nobody is removed)."
+        )
+        if new > free:
+            text += (
+                f"\n⚠️ {new} pick(s) aren't signed up but only {max(free, 0)} slot(s) are free; the rest "
+                "will fail as full. Remove signups or raise max_members first."
+            )
+        view = _ConfirmSuggest(
+            row["id"], [s.candidate.tag for s in confirmed], [s.candidate.tag for s in subs]
+        )
+        await interaction.followup.send(text, embeds=embeds, view=view, ephemeral=True)
+
+    # ------------------------------------------------------------------ auto-ping
+
+    @autoping.command(
+        name="set", description="Ping unregistered clan members before a roster starts or closes"
+    )
+    @app_commands.autocomplete(roster=roster_autocomplete)
+    @app_commands.describe(
+        hours_before_end="Ping this many hours before signups close (the roster's end time)",
+        hours_before_start="Ping this many hours before the roster's start time",
+        message="Text to send with the ping",
+        channel="Where to ping (default: where the roster is posted, else here)",
+    )
+    @manager("roster")
+    async def autoping_set(
+        self,
+        interaction: discord.Interaction,
+        roster: str,
+        hours_before_end: app_commands.Range[float, 0.25, 336.0] | None = None,
+        hours_before_start: app_commands.Range[float, 0.25, 336.0] | None = None,
+        message: app_commands.Range[str, 1, 300] | None = None,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        row = await get_roster_or_fail(interaction, roster)
+        if hours_before_end is None and hours_before_start is None:
+            raise ResolveError("Give `hours_before_end` and/or `hours_before_start`.")
+        channel_id = channel.id if channel else (row["channel_id"] or interaction.channel_id)
+        await repo.set_autoping(
+            self.db,
+            row["id"],
+            start_hours=hours_before_start,
+            end_hours=hours_before_end,
+            message=message,
+            channel_id=channel_id,
+        )
+        await views.refresh_post(self.bot, row["id"])
+        updated = await repo.get_roster(self.db, row["id"])
+        lines = [f"**{row['name']}**: {repo.describe_autoping(updated)}, in <#{channel_id}>."]
+        if hours_before_end and not row["end_time"]:
+            lines.append("This roster has no end time yet; set one with `/roster edit end_time`.")
+        if hours_before_start and not row["start_time"]:
+            lines.append("This roster has no start time yet; set one with `/roster edit start_time`.")
+        if row["closed"]:
+            lines.append("The roster is closed, so nothing is sent until it's opened again.")
+        elif repo.autoping_due(updated, datetime.now(UTC)):
+            lines.append(
+                f"That window is already open: the first ping goes out within "
+                f"{AUTOPING_INTERVAL_MINUTES} minutes."
+            )
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @autoping.command(name="off", description="Stop automatic pings for a roster")
+    @app_commands.autocomplete(roster=roster_autocomplete)
+    @manager("roster")
+    async def autoping_off(self, interaction: discord.Interaction, roster: str) -> None:
+        row = await get_roster_or_fail(interaction, roster)
+        await repo.set_autoping(
+            self.db, row["id"], start_hours=None, end_hours=None, message=None, channel_id=None
+        )
+        await views.refresh_post(self.bot, row["id"])
+        await interaction.response.send_message(f"Auto-ping is off for **{row['name']}**.", ephemeral=True)
 
     @manage.command(
         name="add", description="Add players to a roster (tags in any format, or a user's accounts)"
@@ -614,18 +784,48 @@ class _ConfirmPing(discord.ui.View):
     @discord.ui.button(label="Send ping", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         header = f"**{self.roster_name}**" + (f": {self.message}" if self.message else "")
-        chunks, cur = [], header + "\n"
-        for uid in self.users:
-            mention = f"<@{uid}> "
-            if len(cur) + len(mention) > 1900:
-                chunks.append(cur)
-                cur = ""
-            cur += mention
-        chunks.append(cur)
+        chunks = views.ping_chunks(header, self.users)
         await interaction.response.edit_message(content=f"Pinging {len(self.users)} user(s)…", view=None)
         for chunk in chunks:
             await interaction.channel.send(chunk, allowed_mentions=discord.AllowedMentions(users=True))
         self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+        self.stop()
+
+
+class _ConfirmSuggest(discord.ui.View):
+    """Apply / Cancel for ``/roster suggest apply:True`` (ephemeral, so only the invoker sees it)."""
+
+    def __init__(self, roster_id: int, confirmed: list[str], substitutes: list[str]) -> None:
+        super().__init__(timeout=300)
+        self.roster_id = roster_id
+        self.confirmed = confirmed
+        self.substitutes = substitutes
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        await send_error(interaction, error)
+
+    @discord.ui.button(label="Apply lineup", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await require(interaction, "roster")
+        roster = await repo.get_roster(interaction.client.db, self.roster_id)
+        if roster is None:
+            await interaction.response.edit_message(content="That roster no longer exists.", view=None)
+            return
+        await interaction.response.edit_message(content=f"Applying to **{roster['name']}**…", view=None)
+        self.stop()
+        summary = await views.apply_suggestion(
+            interaction.client,
+            interaction.guild,
+            roster,
+            self.confirmed,
+            self.substitutes,
+            actor=interaction.user,
+        )
+        await interaction.followup.send(summary[:2000], ephemeral=True)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:

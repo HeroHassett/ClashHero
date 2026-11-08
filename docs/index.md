@@ -8,6 +8,7 @@ ClashHero is a Discord bot that takes the busywork out of running Clash of Clans
 legend league tracking, Clan War League rosters and base tracking, war and capital stats, live logs,
 reminders, autoroles and more.
 
+- [Commands](commands.md)
 - [Terms of Service](terms-of-service.md)
 - [Privacy Policy](privacy-policy.md)
 - Contact: [clashherobot@gmail.com](mailto:clashherobot@gmail.com)

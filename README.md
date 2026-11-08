@@ -154,6 +154,7 @@ Supercell shifts it.
 
 ```bash
 uv run pytest
+uv run python -m clashhero.commands_doc   # regenerate docs/commands.md after changing commands
 uv run ruff check . && uv run ruff format .
 ```
 

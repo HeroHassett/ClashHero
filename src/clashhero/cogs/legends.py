@@ -1,9 +1,10 @@
 """Legend / ranked tracking: battle alerts, day & season logs, leaderboards, global tops.
 
 Per-battle alerts, a live leaderboard, day/week/season logs, history, clan boards and
-global/local rankings. Battles are inferred by the collector from trophy deltas (see
-services/snapshots.infer_battles); the API has no battle log, so opponent and army details are
-not available.
+global/local rankings. The collector reads ranked battles from each player's battle log
+(opponent, stars, destruction, army share code; see services/battlelog.py) and falls back to
+inferring them from trophy changes (services/snapshots.infer_battles), in which case only the
+trophies are known. Everything here handles both.
 """
 
 from __future__ import annotations
@@ -21,8 +22,11 @@ from discord.ext import commands, tasks
 
 from clashhero.cogs import _legend_embeds as E
 from clashhero.cogs._base import BaseCog, send_error
+from clashhero.cogs._info_embeds import summarize_army
+from clashhero.cogs.army import army_embed_fields
 from clashhero.events import LegendBattle
 from clashhero.repos import legends as repo
+from clashhero.services.battlelog import army_link
 from clashhero.services.outbox import send_clan_log, send_to_channel, update_live_message
 from clashhero.utils.checks import has_permission, manager
 from clashhero.utils.fmt import guild_color, signed, table
@@ -43,6 +47,7 @@ log = logging.getLogger(__name__)
 SUBS_PER_GUILD = 100
 BOARD_KIND = "legend_board"
 PAGE_SIZE = 25
+MAX_BUTTON_URL = 512  # Discord's limit for a link button URL
 
 
 def _now() -> datetime:
@@ -111,6 +116,80 @@ class MuteAttacksButton(discord.ui.DynamicItem[discord.ui.Button], template=r"lg
         await interaction.response.send_message(
             f"Attack alerts {'unmuted' if new else 'muted'} for `{sub['player_tag']}`.", ephemeral=True
         )
+
+
+def _copy_army_url(share_code: str | None) -> str | None:
+    link = army_link(share_code)
+    return link if link and len(link) <= MAX_BUTTON_URL else None
+
+
+def battle_army_embed(client, battle, color: discord.Color | None = None) -> discord.Embed | None:
+    """Army breakdown for a legend_events row from the battle log, or None if it can't be read."""
+    link = army_link(battle["army_share_code"])
+    if not link:
+        return None
+    coc_client = client.coc
+    if not getattr(coc_client, "_static_data", None):
+        coc_client._load_static()  # static game data is normally loaded at login
+    try:
+        summary = summarize_army(coc_client.parse_army_link(link))
+    except Exception:
+        log.info("Could not parse army for legend event %s", battle["id"], exc_info=True)
+        return None
+    fields = army_embed_fields(summary)
+    if not fields:
+        return None
+    return E.army_embed(battle=battle, fields=fields, color=color)
+
+
+class ViewArmyButton(discord.ui.DynamicItem[discord.ui.Button], template=r"lg:army:(?P<event>\d+)"):
+    """Shows the army used in a battle-log battle (the player's on attacks, the attacker's on
+    defenses), looked up by legend_events id."""
+
+    def __init__(self, event_id: int) -> None:
+        super().__init__(
+            discord.ui.Button(
+                label="View army",
+                style=discord.ButtonStyle.secondary,
+                emoji="🪖",
+                custom_id=f"lg:army:{event_id}",
+            )
+        )
+        self.event_id = event_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match: re.Match[str]):
+        return cls(int(match["event"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        client = interaction.client
+        battle = await repo.get_battle(client.db, self.event_id)
+        if battle is None or not battle["army_share_code"]:
+            await interaction.response.send_message("No army is recorded for this battle.", ephemeral=True)
+            return
+        embed = battle_army_embed(client, battle, await guild_color(client, interaction.guild_id))
+        if embed is None:
+            await interaction.response.send_message("Couldn't read this battle's army.", ephemeral=True)
+            return
+        view = discord.ui.View()
+        url = _copy_army_url(battle["army_share_code"])
+        if url:
+            view.add_item(discord.ui.Button(label="Copy army", style=discord.ButtonStyle.link, url=url))
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+def alert_view(event: LegendBattle, sub_id: int | None = None) -> discord.ui.View | None:
+    """Buttons under a battle alert: View army and Copy army (battle-log battles with an army) and
+    Mute attacks (subscription alerts)."""
+    view = discord.ui.View(timeout=None)
+    if event.event_id and event.army_share_code:
+        view.add_item(ViewArmyButton(event.event_id))
+    url = _copy_army_url(event.army_share_code)
+    if url:
+        view.add_item(discord.ui.Button(label="Copy army", style=discord.ButtonStyle.link, url=url))
+    if sub_id is not None:
+        view.add_item(MuteAttacksButton(sub_id))
+    return view if view.children else None
 
 
 class BoardSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"lg:board:(?P<guild>\d+)"):
@@ -229,7 +308,7 @@ class Legends(BaseCog):
 
     async def cog_load(self) -> None:
         self.collector.register_player_source(self._tracked_tags)
-        self.bot.add_dynamic_items(MuteAttacksButton, BoardSelect)
+        self.bot.add_dynamic_items(MuteAttacksButton, ViewArmyButton, BoardSelect)
         self.board_loop.start()
         self.daily_loop.start()
 
@@ -253,17 +332,23 @@ class Legends(BaseCog):
             trophies_after=event.trophies_after,
             stats=stats,
             occurred_at=event.occurred_at,
+            opponent_tag=event.opponent_tag,
+            opponent_name=event.opponent_name,
+            opponent_th=event.opponent_th,
+            stars=event.stars,
+            destruction=event.destruction,
+            battle_type=event.battle_type,
         )
         if event.clan_tag:
-            await send_clan_log(self.bot, event.clan_tag, "legend_battles", embed)
+            await send_clan_log(self.bot, event.clan_tag, "legend_battles", embed, view=alert_view(event))
         for sub in await repo.subscriptions_for_player(self.db, event.player_tag):
             if not (sub["attacks"] if event.kind == "attack" else sub["defenses"]):
                 continue
-            await self._deliver(sub, embed, event.kind)
+            await self._deliver(sub, embed, event)
 
-    async def _deliver(self, sub, embed: discord.Embed, kind: str) -> None:
-        view = discord.ui.View(timeout=None)
-        view.add_item(MuteAttacksButton(sub["id"]))
+    async def _deliver(self, sub, embed: discord.Embed, event: LegendBattle) -> None:
+        kind = event.kind
+        view = alert_view(event, sub["id"])
         if sub["channel_id"] == 0:
             try:
                 user = self.bot.get_user(sub["user_id"]) or await self.bot.fetch_user(sub["user_id"])
@@ -293,6 +378,7 @@ class Legends(BaseCog):
             entries=entries,
             updated=_now(),
             color=await guild_color(self.bot, gid),
+            latest=E.LATEST_BATTLES,
         )
         await update_live_message(self.bot, row, embeds=[embed], view=board_view(gid, entries))
 
@@ -606,6 +692,7 @@ class Legends(BaseCog):
             title=f"{row['name'] if row else tag} · Legends today",
             entries=entries,
             color=await guild_color(self.bot, interaction.guild_id),
+            latest=E.LATEST_BATTLES,
         )
         await interaction.response.send_message(embed=embed)
 
@@ -620,6 +707,7 @@ class Legends(BaseCog):
             title="Family legend leaderboard",
             entries=entries,
             color=await guild_color(self.bot, interaction.guild_id),
+            latest=E.LATEST_BATTLES,
         )
         embed.set_footer(text=f"Season ends {game_season().end:%Y-%m-%d}")
         await interaction.response.send_message(embed=embed)

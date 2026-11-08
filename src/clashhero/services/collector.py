@@ -88,7 +88,7 @@ class Collector:
         self._cwl_lineups: dict[str, set[str]] = {}
         self._battle_cursors: dict[str, Cursor] = {}
         self._battlelog_fetched: dict[str, datetime] = {}
-        self._player_sources: list[PlayerSource] = []
+        self._player_sources: dict[str, PlayerSource] = {}
         self.in_maintenance = False
         self._sem = asyncio.Semaphore(10)
 
@@ -102,9 +102,15 @@ class Collector:
 
     # ------------------------------------------------------------------ public API
 
-    def register_player_source(self, source: PlayerSource) -> None:
-        """Ask the collector to also poll the tags returned by ``source`` each player cycle."""
-        self._player_sources.append(source)
+    def register_player_source(self, source: PlayerSource, key: str | None = None) -> None:
+        """Ask the collector to also poll the tags returned by ``source`` each player cycle.
+
+        Registering again under the same key (by default the owning class and function name)
+        replaces the old source, so reloading a cog doesn't leave a stale copy behind.
+        """
+        owner = getattr(source, "__self__", None)
+        key = key or f"{type(owner).__name__ if owner else ''}.{getattr(source, '__name__', repr(source))}"
+        self._player_sources[key] = source
 
     async def start(self) -> None:
         for key, data in (await self.db.load_snapshots("clan:")).items():
@@ -317,7 +323,7 @@ class Collector:
         )
         tags = {r["player_tag"] for r in rows}
         tags.update(await self.db.all_linked_tags())
-        for source in self._player_sources:
+        for source in self._player_sources.values():
             try:
                 tags.update(await source())
             except Exception:
