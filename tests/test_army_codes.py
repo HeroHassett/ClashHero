@@ -47,6 +47,14 @@ def test_newer_equipment_and_super_troops():
     assert "Troop Launcher" in d.names() and "Dragon Duke" in d.names()
 
 
+def test_ruin_witch():
+    from clashhero.services.army import housing_space
+
+    a = parse_army("u4x109-1x0")
+    assert [(u.name, u.count) for u in a.troops] == [("Ruin Witch", 4), ("Barbarian", 1)]
+    assert housing_space("troop", 109) == 26
+
+
 def test_full_link_and_bad_input():
     link = "https://link.clashofclans.com/en?action=CopyArmy&army=u10x0-2x3s1x9-3x2"
     a = parse_army(link)

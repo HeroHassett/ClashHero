@@ -36,6 +36,7 @@ BASE_IDS = {
 NEWER_IDS: dict[tuple[str, int], str] = {
     ("hero", 7): "Dragon Duke",
     ("pet", 17): "Greedy Raven",
+    ("troop", 109): "Ruin Witch",  # also matches its 26 housing space in full armies
     ("troop", 188): "Sky Wagon",
     ("equipment", 16): "Monolith Arrow",
     ("equipment", 52): "Fire Heart",
@@ -46,6 +47,8 @@ NEWER_IDS: dict[tuple[str, int], str] = {
     ("equipment", 60): "Revenge Deck",
     ("equipment", 61): "Portal Pendant",
 }
+
+NEWER_HOUSING: dict[tuple[str, int], int] = {("troop", 109): 26}
 
 _STATIC_KEYS = {
     "troops": "troop",
@@ -88,6 +91,7 @@ def _game_data() -> tuple[dict[tuple[str, int], str], dict[tuple[str, int], int]
     except Exception:
         log.warning("Couldn't read coc.py's game data; army codes will show IDs", exc_info=True)
     names.update(NEWER_IDS)
+    housing.update(NEWER_HOUSING)
     return names, housing
 
 
