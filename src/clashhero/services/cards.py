@@ -2812,7 +2812,11 @@ def _render_activity(card: ActivityCard) -> Image.Image:
     start = busiest_window(buckets)
     tile_w = (WIDTH - 2 * PAD - 2 * STAT_GAP) / 3
     tiles = [
-        ("ACTIONS", f"{total:,}", f"about {round(total / card.days):,} a day" if total else None),
+        (
+            "ACTIONS",
+            f"{total:,}",
+            f"about {round(total / card.days):,} a day" if total and card.days > 1 else None,
+        ),
         ("BUSIEST HOUR", f"{peak:02d}:00" if total else "—", f"{buckets[peak]:,} actions" if total else None),
         (
             "BUSIEST 3 HOURS",
@@ -2858,7 +2862,8 @@ def _activity_header(canvas: Image.Image, draw: ImageDraw.ImageDraw, card: Activ
     else:
         runs = fit_runs(name, (_cinzel(24), *_fallback_fonts(24)), max_w)
     _gradient_runs(canvas, x, _px(HEADER_TOP + 58), runs)
-    sub = f"{card.tags} · last {card.days} days"
+    span = "last 24 hours" if card.days == 1 else f"last {card.days} days"
+    sub = f"{card.tags} · {span}"
     _draw_runs(draw, x, _px(HEADER_TOP + 88), fit_runs(sub, _text_fonts(17, 500), max_w), MUTED)
 
 
