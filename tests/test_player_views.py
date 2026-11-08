@@ -294,3 +294,48 @@ def test_profile_career_stats_from_achievements():
     assert by_name["🎯 Events"] == "`166,260` Clan Games points\n`320,040` challenge points"
     assert by_name["🗡️ Wins · all time"] == "`11,137` attacks\n`746` defenses"
     assert compact(999_999) == "999,999" and compact(1_000_000) == "1M"
+
+
+def test_profile_uses_game_symbols_once_uploaded(monkeypatch):
+    from clashhero.services.emojis import EMOJIS
+
+    icons = (
+        "ui_castle ui_spell_donation wall_wrecker ui_sword ui_shield ui_war_star ui_cwl_star"
+        " res_capital_gold ui_xp ui_clan_games res_trophy res_gold"
+    ).split()
+    monkeypatch.setattr(EMOJIS, "_by_name", {n: f"<:{n}:1>" for n in icons})
+    raw = {
+        "achievements": [
+            {"name": n, "value": v}
+            for n, v in {
+                "Friend in Need": 10,
+                "Sharing is caring": 5,
+                "Siege Sharer": 2,
+                "War League Legend": 7,
+                "Games Champion": 9,
+                "Conqueror": 3,
+                "Unbreakable": 1,
+            }.items()
+        ]
+    }
+    p = NS(
+        name="Alex", tag="#2PP", town_hall=18, town_hall_weapon=None, exp_level=300, trophies=5000,
+        best_trophies=6203, war_stars=40, war_opted_in=True, clan=None, role=None,
+        attack_wins=0, defense_wins=0, clan_capital_contributions=12, _raw_data=raw,
+    )  # fmt: skip
+    desc, fields = profile_parts(p, season=(4, 0))
+    by_name = dict((n, v) for n, v, _ in fields)
+    assert "<:ui_xp:1> level `300`" in desc
+    assert by_name["<:ui_castle:1> Donations"] == "<:ui_castle:1> `4` given\n<:ui_castle:1> `0` received"
+    assert by_name["<:ui_castle:1> Donated · all time"] == (
+        "<:ui_castle:1> `10` troop space\n"
+        "<:ui_spell_donation:1> `5` spell space\n"
+        "<:wall_wrecker:1> `2` sieges"
+    )
+    assert by_name["<:ui_war_star:1> War"] == "<:ui_war_star:1> `40` wars\n<:ui_cwl_star:1> `7` CWL\nOpted in"
+    assert (
+        by_name["<:ui_sword:1> Wins · all time"] == "<:ui_sword:1> `3` attacks\n<:ui_shield:1> `1` defenses"
+    )
+    assert by_name["<:res_capital_gold:1> Capital gold"] == "<:res_capital_gold:1> `12` contributed"
+    assert by_name["<:ui_clan_games:1> Events"] == "<:ui_clan_games:1> `9` Clan Games points"
+    assert by_name["<:res_trophy:1> Trophies"].startswith("<:res_trophy:1> `5,000` best `6,203`")

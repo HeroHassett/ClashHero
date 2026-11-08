@@ -53,6 +53,26 @@ EXTRAS = {
     "res_gems": ["Gem.png"],
     "res_raid_medal": ["Raid Medal.png"],
     "res_trophy": ["Trophy.png"],
+    "res_capital_gold": ["GoldC.png"],
+    # game UI symbols for profiles and stats
+    "ui_xp": ["XP.png"],
+    "ui_shield": ["Shield.png"],
+    "ui_spell_donation": ["Donate Spells.png"],
+    "ui_clan_games": ["Points.png"],
+    "ui_challenge_points": ["Challenge Points.png"],
+    "ui_stopwatch": ["Stopwatch.png"],
+    "ui_heroes": ["Icon HeroHall.png"],
+    "ui_equipment": ["Icon Equipment.png"],
+    "ui_pets": ["Icon Pets.png"],
+}
+# In-game buttons with a text label under the symbol: keep just the symbol (fractions of the image).
+CROPS = {name: (0.20, 0.10, 0.80, 0.66) for name in ("ui_heroes", "ui_equipment", "ui_pets")}
+# emoji name -> exact Fan Kit title, for symbols the wiki doesn't have
+FANKIT_EXTRAS = {
+    "ui_castle": "request reinforcements clan",
+    "ui_sword": "win a battle sword 1",
+    "ui_war_star": "star bonus star 1",
+    "ui_cwl_star": "Icon_BB_Star",
 }
 CWL_LEAGUES = ["Bronze", "Silver", "Gold", "Crystal", "Master", "Champion"]
 ROMAN = {1: "i", 2: "ii", 3: "iii"}
@@ -268,8 +288,11 @@ def plan(live: bool) -> tuple[list[Pick], list[str]]:
         key = slug(n)
         if (key not in picks or n in PREFER_FANKIT) and (a := fankit_pick(assets, n)):
             picks[key] = Pick(key, "fankit", a["title"], fankit_url(a), a.get("width"))
-    for a in assets:  # Town Halls the wiki lacked, and CWL league badges
+    for a in assets:  # Town Halls the wiki lacked, CWL league badges, UI symbols
         t = a["title"].strip()
+        for key, title in FANKIT_EXTRAS.items():
+            if t == title:
+                picks.setdefault(key, Pick(key, "fankit", t, fankit_url(a), a.get("width")))
         if m := re.fullmatch(r"(?i)building_hv_town_hall_level_(\d+)", t):
             key = f"th{int(m.group(1))}"
             if key not in picks:
@@ -285,14 +308,18 @@ def plan(live: bool) -> tuple[list[Pick], list[str]]:
 
 def download(picks: list[Pick], out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
-    manifest, failed = {}, []
+    try:  # keep entries for icons this run doesn't touch (e.g. ones added by hand)
+        manifest = json.loads((out / "sources.json").read_text())
+    except (OSError, ValueError):
+        manifest = {}
+    failed = []
     for p in picks:
         try:
             with urllib.request.urlopen(urllib.request.Request(p.url, headers=UA), timeout=30) as r:
                 data = r.read()
             if not data.startswith((b"\x89PNG", b"\xff\xd8", b"RIFF")):
                 raise ValueError("not an image")
-            (out / f"{p.name}.png").write_bytes(_as_png(data))
+            (out / f"{p.name}.png").write_bytes(_as_png(data, CROPS.get(p.name)))
             manifest[p.name] = {"source": p.source, "title": p.title, "url": p.url}
         except Exception as e:  # noqa: BLE001
             failed.append(f"{p.name} ({e})")
@@ -304,13 +331,23 @@ def download(picks: list[Pick], out: Path) -> None:
         print(f"Failed: {', '.join(failed)}")
 
 
-def _as_png(data: bytes) -> bytes:
+def _as_png(data: bytes, crop: tuple[float, float, float, float] | None = None) -> bytes:
     import io
 
     from PIL import Image
 
     with Image.open(io.BytesIO(data)) as im:
         im = im.convert("RGBA")
+        if crop:
+            w, h = im.size
+            im = im.crop((round(w * crop[0]), round(h * crop[1]), round(w * crop[2]), round(h * crop[3])))
+        # trim transparent padding (some Fan Kit icons sit small in a large canvas)
+        bbox = im.getchannel("A").point(lambda a: 255 if a > 8 else 0).getbbox()
+        if bbox and (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) < im.width * im.height * 0.8:
+            im = im.crop(bbox)
+        if im.width < SIZE and im.height < SIZE:  # small icons: scale up so emojis stay sharp-ish
+            scale = SIZE / max(im.size)
+            im = im.resize((round(im.width * scale), round(im.height * scale)), Image.LANCZOS)
         im.thumbnail((SIZE, SIZE), Image.LANCZOS)
         buf = io.BytesIO()
         im.save(buf, "PNG", optimize=True)
@@ -324,9 +361,12 @@ def main() -> None:
         "--offline", action="store_true", help="don't ask the Clash API for the newest unit names"
     )
     ap.add_argument("--out", type=Path, default=ROOT / "game-assets" / "icons")
+    ap.add_argument("--only", nargs="+", metavar="NAME", help="only these emoji names (e.g. ui_sword th18)")
     args = ap.parse_args()
 
     picks, missing = plan(live=not args.offline)
+    if args.only:
+        picks = [p for p in picks if p.name in set(args.only)]
     by_src = {s: sum(1 for p in picks if p.source == s) for s in ("wiki", "fankit")}
     est = sum(min(p.bytes_hint or 60_000, 60_000) for p in picks)
     print(f"Found {len(picks)} icons: {by_src['wiki']} from the wiki, {by_src['fankit']} from the Fan Kit "
