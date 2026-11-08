@@ -1729,6 +1729,7 @@ class SeasonCard:
     today: int | None = None
     trophies: int | None = None
     start: int | None = None
+    start_label: str = "this season"  # "since Nov 5" when tracking began after the season started
     offense_per_day: float | None = None
     defense_per_day: float | None = None
     net_per_day: float | None = None
@@ -1890,7 +1891,7 @@ def _season_figures(canvas: Image.Image, draw: ImageDraw.ImageDraw, card: Season
             "up" if change > 0 else "down" if change < 0 else "same",
         )
         sub = _inter(13, 500)
-        draw.text((right, _px(y0 + 80)), "this season", font=sub, fill=MUTED, anchor="rs")
+        draw.text((right, _px(y0 + 80)), card.start_label, font=sub, fill=MUTED, anchor="rs")
         draw.text((right, _px(y0 + 98)), f"from {card.start:,}", font=sub, fill=DIM, anchor="rs")
 
     tiles = (

@@ -154,7 +154,11 @@ def season_card(
     trophies = ends[-1] if ends else None
     if today is not None and trophies_now is not None:
         trophies = trophies_now
-    start = next((d.start for d in summary.days if d.start is not None), None)
+    first_tracked = next((d for d in summary.days if d.start is not None), None)
+    start = first_tracked.start if first_tracked else None
+    start_label = "this season"
+    if first_tracked and (since := date.fromisoformat(first_tracked.day)) > first:
+        start_label = f"since {since:%b} {since.day}"  # tracking began mid-season
 
     def avg(values: list[int]) -> float | None:
         return sum(values) / len(values) if values else None
@@ -168,6 +172,7 @@ def season_card(
         today=today,
         trophies=trophies,
         start=start,
+        start_label=start_label,
         offense_per_day=avg([d.stats.offense for d in days if d.stats.attacks]),
         defense_per_day=avg([d.stats.defense for d in days if d.stats.defenses]),
         net_per_day=avg([d.stats.net for d in days if d.stats.attacks or d.stats.defenses]),

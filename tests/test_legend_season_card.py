@@ -116,6 +116,7 @@ def test_early_season():
     assert all(p.end is None and p.net is None for p in card.days[6:])  # the rest of the season
     assert card.season == "Nov 2 – Nov 30, 2026"
     assert (card.start, card.trophies) == (5000, trophies)
+    assert card.start_label == "this season"
     assert card.offense_per_day == 272 and card.defense_per_day == -220 and card.net_per_day == 52
     assert card.attack_stars.counts == (0, 0, 18, 30) and card.attack_stars.triple_rate == 30 / 48
     assert card.defense_stars.counts == (0, 0, 30, 18)
@@ -136,6 +137,13 @@ def test_untracked_days_are_gaps():
     assert [i for i, p in enumerate(card.days[:22]) if p.end is None] == [4, 5, 6, 15]
     assert card.played_days == 18
     assert card.attack_stars.missing == 8 and card.defense_stars.missing == 8
+
+
+def test_tracking_started_mid_season():
+    summary, _ = build(8)
+    late = repo.SeasonSummary(summary.days[3:])  # first tracked day: Nov 5
+    card = card_for(late, now=datetime(2026, 11, 9, 18, tzinfo=UTC))
+    assert card.start == late.days[0].start and card.start_label == "since Nov 5"
 
 
 def test_lower_tier_defenses_gain():
