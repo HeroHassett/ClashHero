@@ -34,7 +34,6 @@ from clashhero.services.battlelog import (
     Battle,
     Cursor,
     battle_trophies,
-    legend_trophies,
     note_unknown_types,
     parse_battles,
     take_new,
@@ -426,11 +425,14 @@ class Collector:
         logged: tuple[list[Battle], set[str]] | None = (
             None  # (ranked battles in log, keys new since last read)
         )
+        first_look = False  # no earlier read of this player's battle log: everything is backfill
         if self._wants_battlelog(tag, old, new, now):
             battles = await self._fetch_battlelog(tag)
             if battles is not None:
                 self._battlelog_fetched[tag] = now
-                fresh, cursor = take_new(battles, self._battle_cursors.get(tag))
+                prev = self._battle_cursors.get(tag)
+                first_look = prev is None or prev.timestamp is None
+                fresh, cursor = take_new(battles, prev)
                 self._battle_cursors[tag] = cursor
                 note_unknown_types(fresh)
                 logged = ([b for b in battles if b.ranked], {b.key for b in fresh})
@@ -438,7 +440,7 @@ class Collector:
         async with self.db.batch():
             await self._store_player(new, now)
             if logged is not None:
-                await self._sync_battles(old, new, *logged, now, crossing)
+                await self._sync_battles(old, new, *logged, now, crossing, first_look=first_look)
             if old is not None:
                 await self._apply_player_diff(
                     old, new, now, battle_log_read=logged is not None, crossing=crossing
@@ -613,6 +615,8 @@ class Collector:
         fresh_keys: set[str],
         now: datetime,
         crossing: Crossing = NO_CROSSING,
+        *,
+        first_look: bool = False,
     ) -> None:
         """Make legend_events match the player's battle log for the current season.
 
@@ -622,6 +626,10 @@ class Collector:
         change for other tiers. Trophy changes no battle explains are, depending on timing:
         carried until their battle shows up; the game's autofilled defenses (at a daily reset);
         or a reset adjustment such as the weekly floor or season reset to 5000 (ignored).
+
+        Defenses can reach the log late, after newer battles (so they aren't "fresh"). Such a late
+        battle explains the trophy change carried for it, or replaces the guess recorded from that
+        change; either way it's counted once. On ``first_look`` everything is backfill instead.
         """
         cursor = self._battle_cursors[new.tag]
         season_start = game_season(now).start
@@ -649,25 +657,27 @@ class Collector:
         else:
             total = cursor.pending_delta + (delta if plausible else 0)
         values = battle_trophies(missing, fresh_keys, total, defenses_gain=defenses_gain(new.league))
+        late_keys: set[str] = set()
+        if not first_look and old is not None:
+            # Only today's: a change carried over the reset was settled there (auto defenses).
+            day_start = legend_day_bounds(now)[0]
+            late_keys = {b.key for b in missing if b.occurred_at >= day_start} - fresh_keys
         explained = sum(
             v
             for b, v in zip(missing, values, strict=True)
-            if b.key in fresh_keys and b.battle_type != "ranked"  # see below
+            if (b.key in fresh_keys or b.key in late_keys) and b.battle_type != "ranked"  # see below
         )
-        residual = total - explained
-        fresh_rule = [
-            i
-            for i, b in enumerate(missing)
-            if b.key in fresh_keys and b.battle_type == "legend" and legend_trophies(b) is not None
-        ]
-        if residual and fresh_rule and abs(residual) <= len(fresh_rule):
-            # The API reports destruction as a whole number (95.6% shows as 95), so the rule can be
-            # a trophy off per battle: give the difference to this poll's battles, newest first,
-            # instead of leaving a phantom 1-trophy battle behind.
-            step = 1 if residual > 0 else -1
-            for i in reversed(fresh_rule[-abs(residual) :]):
-                values[i] += step
-            residual = 0
+        # Trophy-change guesses covering the same window are superseded by the real battles; their
+        # trophies were already taken out of the carried change, so they count back in here.
+        guesses = []
+        if missing:
+            guesses = await self.db.fetchall(
+                "SELECT id, trophies FROM legend_events WHERE player_tag = ? AND battle_time IS NULL "
+                "AND (battle_type IS NULL OR battle_type != 'autofill') AND occurred_at >= ?",
+                (new.tag, _iso(missing[0].occurred_at - timedelta(minutes=15))),
+            )
+        replaced = sum(g["trophies"] for g in guesses) if late_keys or fresh_keys else 0
+        residual = total - explained + replaced
         if defenses_gain(new.league):
             # Below Legend I the API's trophy count doesn't follow tournament battles (it stays put
             # all week), so trophy changes can't be matched to battles: the battle log, scored by
@@ -704,12 +714,8 @@ class Collector:
             if b.battle_type != "ranked":  # lower-tier battles don't move the API's count
                 running -= trophies.get(b.key, 0)
 
-        # Trophy-change guesses covering the same window are superseded by the real battles.
-        await self.db.execute(
-            "DELETE FROM legend_events WHERE player_tag = ? AND battle_time IS NULL "
-            "AND (battle_type IS NULL OR battle_type != 'autofill') AND occurred_at >= ?",
-            (new.tag, _iso(missing[0].occurred_at - timedelta(minutes=15))),
-        )
+        for g in guesses:
+            await self.db.execute("DELETE FROM legend_events WHERE id = ?", (g["id"],))
         for b, t in zip(missing, values, strict=True):
             at = b.occurred_at
             day = legend_day_id(at)
@@ -905,11 +911,22 @@ class Collector:
             (p.tag, day),
             0,
         )
+        # In Legend I, once every trophy change is matched to a battle, the day began at the
+        # current count minus today's battles. That beats the first battle's recorded count, which
+        # can be taken while the API's count still lags the battle log.
+        cursor = self._battle_cursors.get(p.tag)
+        settled = (
+            is_legend_one(p.league)
+            and cursor is not None
+            and cursor.timestamp is not None
+            and not cursor.pending_delta
+        )
         await self.db.execute(
             "INSERT INTO legend_days (player_tag, legend_day, season_id, start_trophies, "
             "end_trophies) VALUES (?, ?, ?, ?, ?) ON CONFLICT (player_tag, legend_day) DO "
-            "UPDATE SET end_trophies = excluded.end_trophies",
-            (p.tag, day, game_season(now).id, p.trophies - net_today, p.trophies),
+            "UPDATE SET end_trophies = excluded.end_trophies, start_trophies = CASE WHEN ? "
+            "THEN excluded.start_trophies ELSE legend_days.start_trophies END",
+            (p.tag, day, game_season(now).id, p.trophies - net_today, p.trophies, settled),
         )
 
     # ------------------------------------------------------------------ wars

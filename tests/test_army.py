@@ -24,3 +24,25 @@ async def test_summarize_army_from_static_data():
     assert s.spell_space == 1 + 6
     titles = [t for t, _ in army_embed_fields(s)]
     assert titles == ["Troops (20 space)", "Spells (7 space)"]
+
+
+def test_army_fields_use_unit_icons(monkeypatch):
+    from clashhero.cogs._info_embeds import ArmySummary
+    from clashhero.services.emojis import EMOJIS
+
+    monkeypatch.setattr(
+        EMOJIS,
+        "_by_name",
+        {"thrower": "<:thrower:1>", "dragon_duke": "<:dragon_duke:2>", "phoenix": "<:phoenix:3>"},
+    )
+    s = ArmySummary(
+        troops=[("Thrower", 9, 16), ("Mystery", 1, 1)],
+        spells=[],
+        cc_troops=[("Thrower", 1)],
+        cc_spells=[],
+        heroes=[("Dragon Duke", "Phoenix", ["Fire Heart"])],
+    )
+    fields = dict(army_embed_fields(s))
+    assert fields["Heroes"] == "<:dragon_duke:2> **Dragon Duke** · <:phoenix:3> Fire Heart"
+    assert fields["Troops (145 space)"].split("\n") == ["<:thrower:1> ` 9x` Thrower", "`  1x` Mystery"]
+    assert fields["Clan Castle"] == "<:thrower:1> ` 1x` Thrower"

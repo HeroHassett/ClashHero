@@ -7,34 +7,46 @@ from discord import app_commands
 from discord.ext import commands
 
 from clashhero.cogs._base import BaseCog
-from clashhero.cogs._info_embeds import ArmySummary, army_link, army_param, summarize_army
+from clashhero.cogs._info_embeds import ArmySummary, army_link, army_param, summarize_army, unit_icon
 from clashhero.constants import SUPERCELL_DISCLAIMER
 from clashhero.utils.fmt import chunk_lines, make_embed
 
 
+def _unit(name: str) -> str:
+    """A unit's emoji, or its name until the emoji is uploaded."""
+    return unit_icon(name) or name
+
+
+def _count_line(name: str, n: int) -> str:
+    icon = unit_icon(name)
+    return f"{icon} `{n:>2}x` {name}" if icon else f"`{n:>3}x` {name}"
+
+
 def army_embed_fields(summary: ArmySummary) -> list[tuple[str, str]]:
+    """Heroes (with their pet and equipment as icons), troops, spells and Clan Castle, one unit per
+    line with its game icon."""
     fields = []
     if summary.heroes:
         lines = []
         for hero, pet, eq in summary.heroes:
-            extra = [x for x in [pet, *eq] if x]
-            lines.append(f"**{hero}**" + (f" · {', '.join(extra)}" if extra else ""))
+            gear = " ".join(_unit(x) for x in [pet, *eq] if x)
+            lines.append(f"{unit_icon(hero)} **{hero}**".strip() + (f" · {gear}" if gear else ""))
         fields.append(("Heroes", "\n".join(lines)))
     if summary.troops:
         fields.append(
             (
                 f"Troops ({summary.troop_space} space)",
-                "\n".join(f"`{n:>3}x` {name}" for name, n, _ in summary.troops),
+                "\n".join(_count_line(name, n) for name, n, _ in summary.troops),
             )
         )
     if summary.spells:
         fields.append(
             (
                 f"Spells ({summary.spell_space} space)",
-                "\n".join(f"`{n:>3}x` {name}" for name, n, _ in summary.spells),
+                "\n".join(_count_line(name, n) for name, n, _ in summary.spells),
             )
         )
-    cc = [f"`{n:>3}x` {name}" for name, n in summary.cc_troops + summary.cc_spells]
+    cc = [_count_line(name, n) for name, n in summary.cc_troops + summary.cc_spells]
     if cc:
         fields.append(("Clan Castle", "\n".join(cc)))
     return fields

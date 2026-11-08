@@ -114,7 +114,7 @@ async def test_season_reset_without_battle_log_is_not_inferred(setup):  # noqa: 
 
 async def test_lower_tier_battles_score_by_rule(setup):  # noqa: F811
     """Below Legend I the API's trophy count stays put, so battles are scored by stars and
-    destruction (attacker: rate x destruction; defender: what's left of 40) and trophy changes are
+    destruction (attacker: the stepped curve; defender: what's left of 40) and trophy changes are
     never carried, inferred or autofilled."""
     bot, coc, col = setup
     coc.http = FakeHttp()
@@ -123,7 +123,7 @@ async def test_lower_tier_battles_score_by_rule(setup):  # noqa: F811
     await col._poll_player("#A", at(6, 23))
     coc.http.items = [
         battle("20261107T060000.000Z", opp="#E", kind="ranked", stars=2, pct=81),  # +26
-        battle("20261107T061000.000Z", attack=False, opp="#F", kind="ranked", stars=1, pct=60),  # +28
+        battle("20261107T061000.000Z", attack=False, opp="#F", kind="ranked", stars=1, pct=60),  # +29
         battle("20261107T062000.000Z", opp="#G", kind="ranked", stars=0, pct=18),  # +1
         *coc.http.items,
     ]
@@ -135,7 +135,7 @@ async def test_lower_tier_battles_score_by_rule(setup):  # noqa: F811
     assert [(r["opponent_tag"], r["trophies"]) for r in rows] == [
         ("#D", 0),
         ("#E", 26),
-        ("#F", 28),
+        ("#F", 29),
         ("#G", 1),
     ]
     assert all(r["battle_type"] == "ranked" for r in rows)  # no autofill or inferred rows
@@ -260,3 +260,46 @@ async def test_promotion_day_begins_in_legend_one(setup):  # noqa: F811
     coc.player = ranked_player(5000, "Legend I")  # promoted
     await col._poll_player("#A", at(9, 5, 20))
     assert await _start(bot, "2026-11-09") == 5000
+
+
+# A defense that reaches the battle log after a newer attack (the game's log can lag for defenses).
+FIRST = battle("20261107T060000.000Z", opp="#A1")  # 3★ +40
+ATTACK = battle("20261107T063300.000Z", opp="#A2", stars=2, pct=97)  # +31
+LATE = battle("20261107T063200.000Z", attack=False, opp="#D", stars=1, pct=88)  # -14
+
+
+async def _late_defense_setup(setup):  # noqa: F811
+    bot, coc, col = setup
+    coc.http = FakeHttp()
+    coc.http.items = [FIRST]
+    coc.player = ranked_player(5040)
+    await col._poll_player("#A", at(7, 6, 1))  # first look: backfill
+    coc.http.items = [ATTACK, FIRST]  # the defense already moved the count, but isn't listed yet
+    coc.player = ranked_player(5040 + 31 - 14)
+    await col._poll_player("#A", at(7, 6, 35))
+    return bot, coc, col
+
+
+async def stored(bot):
+    rows = await bot.db.fetchall("SELECT opponent_tag, trophies FROM legend_events ORDER BY occurred_at, id")
+    return [(r["opponent_tag"], r["trophies"]) for r in rows]
+
+
+async def test_late_defense_explains_the_carried_change(setup):  # noqa: F811
+    bot, coc, col = await _late_defense_setup(setup)
+    coc.http.items = [ATTACK, LATE, FIRST]
+    await col._poll_player("#A", at(7, 6, 45))
+    await col._poll_player("#A", at(7, 7, 30))  # well past the timeout: nothing left to infer
+    assert await stored(bot) == [("#A1", 40), ("#D", -14), ("#A2", 31)]
+    start = await bot.db.fetchval("SELECT start_trophies FROM legend_days WHERE legend_day = '2026-11-07'")
+    assert start == 5000  # the count minus the day's battles
+
+
+async def test_late_defense_replaces_the_guess(setup):  # noqa: F811
+    bot, coc, col = await _late_defense_setup(setup)
+    await col._poll_player("#A", at(7, 7, 10))  # 30+ minutes on: the change is recorded as a guess
+    assert await stored(bot) == [("#A1", 40), ("#A2", 31), (None, -14)]
+    coc.http.items = [ATTACK, LATE, FIRST]
+    await col._poll_player("#A", at(7, 7, 25))
+    await col._poll_player("#A", at(7, 8, 30))
+    assert await stored(bot) == [("#A1", 40), ("#D", -14), ("#A2", 31)]  # counted once

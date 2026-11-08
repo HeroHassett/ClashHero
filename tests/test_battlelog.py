@@ -86,10 +86,10 @@ def test_battle_is_hashable():
 RANKED_CASES = [
     (True, 3, 100, 40),
     (True, 2, 81, 26),
-    (True, 1, 75, 15),
+    (True, 1, 75, 13),  # 5 + 74 // 9
     (True, 0, 18, 1),
     (False, 3, 100, 0),
-    (False, 1, 60, 28),
+    (False, 1, 60, 29),  # 40 - (5 + 59 // 9)
     (False, 2, 91, 11),
     (False, 0, 49, 36),
 ]
@@ -119,3 +119,45 @@ async def test_fixes_sql_matches_the_ranked_rule(db):
     await db.conn.executescript(resources.files("clashhero.db").joinpath("fixes.sql").read_text())
     rows = await db.fetchall("SELECT trophies FROM legend_events ORDER BY occurred_at")
     assert [r["trophies"] for r in rows] == [c[3] for c in RANKED_CASES]
+
+
+# (attack, stars, %, trophies) from the game's Legend I battle log
+LEGEND_GAME_CASES = [
+    (True, 2, 83, 27),
+    (True, 2, 92, 30),
+    (True, 2, 69, 22),
+    (True, 2, 97, 31),
+    (True, 3, 100, 40),
+    (False, 1, 88, -14),
+    (False, 2, 86, -28),
+    (False, 2, 99, -32),
+    (False, 1, 56, -11),
+    (False, 3, 100, -40),
+]
+
+
+def test_legend_rule_matches_the_game():
+    from clashhero.services.battlelog import legend_trophies, parse_battles
+
+    for attack, stars, pct, expected in LEGEND_GAME_CASES:
+        (battle,) = parse_battles([item("20261108T120000.000Z", attack, "legend", stars=stars, pct=pct)])
+        assert legend_trophies(battle) == expected, (attack, stars, pct)
+
+
+async def test_fixes_sql_rescores_legend_battles(db):
+    from importlib import resources
+
+    for i, (attack, stars, pct, _) in enumerate(LEGEND_GAME_CASES):
+        await db.execute(
+            "INSERT INTO legend_events (player_tag, legend_day, season_id, kind, trophies, "
+            "trophies_after, occurred_at, battle_type, stars, destruction) "
+            "VALUES ('#A', 'd', 's', ?, 99, 0, ?, 'legend', ?, ?)",
+            ("attack" if attack else "defense", f"t{i:02d}", stars, pct),
+        )
+    await db.execute(  # inferred rows (no stars) are left alone
+        "INSERT INTO legend_events (player_tag, legend_day, season_id, kind, trophies, "
+        "trophies_after, occurred_at) VALUES ('#A', 'd', 's', 'defense', -13, 0, 'z')"
+    )
+    await db.conn.executescript(resources.files("clashhero.db").joinpath("fixes.sql").read_text())
+    rows = await db.fetchall("SELECT trophies FROM legend_events ORDER BY occurred_at")
+    assert [r["trophies"] for r in rows] == [c[3] for c in LEGEND_GAME_CASES] + [-13]

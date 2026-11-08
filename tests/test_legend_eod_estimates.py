@@ -53,17 +53,17 @@ def badge_png() -> bytes:
     [
         (40, (3, 100)),
         (-40, (3, 100)),
-        (39, None),  # 33-39: more than any 2-star can earn (0.32 x 99%), less than a triple
+        (39, None),  # 33-39: more than any 2-star can earn (99% = 32), less than a triple
         (33, None),
-        (32, (2, 99)),  # 32 / 0.32 = 100%: two stars stay under it
-        (29, (2, 91)),
-        (-29, (2, 91)),
+        (32, (2, 99)),  # 99%: two stars stay under 100
+        (29, (2, 90)),  # 89-91% earn 29: the middle
+        (-29, (2, 90)),
         (21, (2, 66)),
-        (20, None),  # 16-20: one or two stars
-        (16, None),
-        (15, (1, 75)),
-        (5, (1, 25)),
-        (4, None),  # 0-4: zero or one star
+        (20, (2, 63)),  # 16-20 is two stars only (one star tops out at 15)
+        (16, (2, 51)),
+        (15, (1, 95)),  # 91-99%
+        (5, (1, 5)),  # 1-9%
+        (4, None),  # 0-4: not from the rule
         (0, None),
         (41, None),
     ],
@@ -75,13 +75,13 @@ def test_estimate_legend_result(trophies, result):
 def test_army_battles_estimate_only_inferred_legend_battles():
     hits = [
         Hit("defense", -29),
-        Hit("defense", -18),  # ambiguous
+        Hit("defense", -3),  # not from the rule
         Hit("defense", -31, autofill=True),
         Hit("defense", -25, None, None, "#O", "Opp", 17, 2, 79),
     ]
     est = cog.army_battles(hits, armies=False, estimate=True)
     assert [(b.stars, b.destruction, b.estimated) for b in est] == [
-        (2, 91, True),
+        (2, 90, True),
         (None, None, False),
         (None, None, False),
         (2, 79, False),
@@ -91,10 +91,10 @@ def test_army_battles_estimate_only_inferred_legend_battles():
 
 
 def test_battle_lines_with_estimates():
-    hits = [Hit("defense", -29), Hit("defense", -18), Hit("defense", -25, autofill=True)]
+    hits = [Hit("defense", -29), Hit("defense", -3), Hit("defense", -25, autofill=True)]
     assert E.battle_lines(hits, estimate=True) == [
-        "-29  ★★☆  ~91%  inferred from trophies",
-        "-18  ···   —    inferred from trophies",
+        "-29  ★★☆  ~90%  inferred from trophies",
+        " -3  ···   —    inferred from trophies",
         "-25  ···   —    auto-filled (no defense received)",
     ]
     assert E.battle_lines(hits)[0] == "-29  ···   —    inferred from trophies"  # below Legend I
@@ -205,7 +205,7 @@ async def test_today_shows_the_previous_days_end(db, monkeypatch, spy):
     assert (kw["today"], kw["trophies"], kw["rank"]) == (True, 4931, 7418)
     assert (kw["eod"], kw["eod_rank"]) == (5062, 2451)  # yesterday's end and rank
     [inferred] = kw["defenses"]
-    assert (inferred.stars, inferred.destruction, inferred.estimated) == (2, 91, True)
+    assert (inferred.stars, inferred.destruction, inferred.estimated) == (2, 90, True)
 
 
 async def test_a_past_day_shows_its_own_end(db, monkeypatch, spy):
@@ -235,7 +235,7 @@ async def test_weekly_tiers_get_the_rank_and_no_estimates(db, monkeypatch, spy):
 async def test_logs_today_lines_estimate_in_legend_one(db, monkeypatch):
     await _setup(db, monkeypatch)
     embed = await cog._logs_day_view(NS(db=db), TAG, DAY, None)
-    assert "-29  ★★☆  ~91%  inferred from trophies" in embed.description
+    assert "-29  ★★☆  ~90%  inferred from trophies" in embed.description
 
 
 # ------------------------------------------------------------------ C. the season history view

@@ -186,36 +186,52 @@ def army_link(share_code: str | None) -> str | None:
 
 # ------------------------------------------------------------------ trophies per battle
 
-# Legend I trophies by stars, as a share of destruction %: matches the in-game numbers exactly
-# (e.g. 3★ = 40, 2★ 88% = 28, 1★ 56% = 11).
-LEGEND_TROPHY_RATE = {1: 0.20, 2: 0.32, 3: 0.40}
-
-# Tiers below Legend I (battle type "ranked"): the attacker earns the same share of destruction
-# (0★: 0-4 trophies), and the defender gains what's left of 40 (0 against a triple). Matches the
-# game's Legend II battle log. The API's trophy count doesn't follow these battles (it stays put
-# all week), so this rule is the only source of their trophies. db/fixes.sql applies it to rows
-# stored before it existed; keep the two in step.
-RANKED_TROPHY_RATE = {0: 0.08, **LEGEND_TROPHY_RATE}
+# Trophies an attack earns by stars and destruction %, in steps (the game's ranked curve):
+#   3★: 40
+#   2★: 16 at 50%, +1 for every full 3% above that (99% = 32)
+#   1★: 5 at 1%, +1 for every full 9% above that (88% = 14, 99% = 15)
+# Checked against the game's battle log: 2★ 69/83/86/92/97/99% = 22/27/28/30/31/32 and
+# 1★ 56/88% = 11/14. (A share of destruction such as 0.32 x 92% = 29 is a trophy off in places.)
+# In Legend I the defender loses what the attacker earns; 0★ is unknown there.
 RANKED_BATTLE_TROPHIES = 40
+
+
+def attack_trophies(stars: int, destruction: int) -> int | None:
+    """Trophies for 1-3 stars at ``destruction`` %, or None for other star counts."""
+    d = max(0, min(100, int(destruction or 0)))
+    if stars == 3:
+        return RANKED_BATTLE_TROPHIES
+    if stars == 2:
+        return 16 + max(0, d - 50) // 3
+    if stars == 1:
+        return 5 + max(0, d - 1) // 9
+    return None
+
+
+# Tiers below Legend I (battle type "ranked"): the attacker earns the same, 0★ earning 8% of the
+# destruction (0-4 trophies), and the defender gains what's left of 40 (0 against a triple). The
+# API's trophy count doesn't follow these battles (it stays put all week), so this rule is the
+# only source of their trophies. db/fixes.sql applies it to stored rows; keep the two in step.
+RANKED_ZERO_STAR_RATE = 0.08
 
 
 def legend_trophies(b: Battle) -> int | None:
     """Signed trophies for a Legend I battle (+ attack, - defense), or None when unknown
     (other battle types, or 0-star battles)."""
-    rate = LEGEND_TROPHY_RATE.get(b.stars) if b.battle_type == "legend" else None
-    if rate is None:
+    value = attack_trophies(b.stars, b.destruction) if b.battle_type == "legend" else None
+    if value is None:
         return None
-    value = math.floor(b.destruction * rate + 0.5)
     return value if b.attack else -value
 
 
 def ranked_trophies(b: Battle) -> int | None:
     """Trophies gained in a battle below Legend I (attack or defense; both gain), or None for
     other battle types."""
-    rate = RANKED_TROPHY_RATE.get(b.stars) if b.battle_type == "ranked" else None
-    if rate is None:
+    if b.battle_type != "ranked" or not 0 <= b.stars <= 3:
         return None
-    gain = math.floor(b.destruction * rate + 0.5)
+    gain = attack_trophies(b.stars, b.destruction)
+    if gain is None:  # 0 stars
+        gain = math.floor(max(0, b.destruction) * RANKED_ZERO_STAR_RATE + 0.5)
     return gain if b.attack else RANKED_BATTLE_TROPHIES - gain
 
 
@@ -256,14 +272,13 @@ def battle_trophies(
 def estimate_legend_result(trophies: int) -> tuple[int, int] | None:
     """(stars, destruction %) a Legend I battle most likely had, from its trophy change alone, for
     battles inferred from trophy changes (the battle log can lag behind for defenses). The amount
-    fixes the stars except at the edges: 40 is a triple; 21-32 two stars (0.32 x 99% is the most a
-    2-star can earn); 5-15 one star; 0-4, 16-20 and 33-39 are ambiguous or not from the rule (None).
-    The % is the trophies' share of the band, kept under 100 when it isn't a triple."""
+    fixes the stars (see attack_trophies): 40 is a triple, 16-32 two stars, 5-15 one star; 0-4
+    and 33-39 aren't from the rule (None). The % is the middle of the step's range."""
     t = abs(trophies)
     if t == 40:
         return 3, 100
-    if 21 <= t <= 32:
-        return 2, min(99, round(t / 0.32))
+    if 16 <= t <= 32:
+        return 2, min(99, 51 + 3 * (t - 16))
     if 5 <= t <= 15:
-        return 1, min(99, round(t / 0.2))
+        return 1, min(99, 5 + 9 * (t - 5))
     return None
