@@ -51,3 +51,15 @@ async def test_activity_command_image(monkeypatch):
     image = await info_mod.Info._activity_image(cog, ["#2J8VGUCV2"], list(AURORA), "UTC+00:00")
     assert image.filename == "clan-activity.png"
     assert open_png(image.fp.read()).size == (cards.WIDTH, cards.ACT_HEIGHT)
+
+
+def test_activity_days_counts_only_tracked_days():
+    from datetime import UTC, datetime
+
+    from clashhero.cogs._info_embeds import activity_days
+
+    now = datetime(2026, 11, 8, 22, tzinfo=UTC)
+    assert activity_days([("2026-11-06T22", 3), ("2026-11-08T19", 5)], now) == 2
+    assert activity_days([("2026-11-08T21", 1)], now) == 1
+    assert activity_days([("2026-10-01T00", 1)], now) == 7
+    assert activity_days([], now) == 7

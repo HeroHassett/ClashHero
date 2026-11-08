@@ -16,6 +16,7 @@ from clashhero.cogs._info_embeds import (
     PAGE_LABELS,
     PLAYER_PAGE_TEMPLATE,
     PLAYER_PAGES,
+    activity_days,
     activity_histogram,
     ago,
     pack_blocks,
@@ -307,7 +308,7 @@ class Info(BaseCog):
         buckets = activity_histogram(rows, offset)
         sign = "+" if offset >= 0 else "-"
         tz = f"UTC{sign}{abs(offset) // 60:02d}:{abs(offset) % 60:02d}"
-        image = await self._activity_image(tags, buckets, tz)
+        image = await self._activity_image(tags, buckets, tz, days=activity_days(rows, datetime.now(UTC)))
         if image is not None:
             await interaction.response.send_message(file=image)
             return
@@ -320,7 +321,9 @@ class Info(BaseCog):
         e.set_footer(text=f"Last 7 days, hours in {tz}")
         await interaction.response.send_message(embed=e)
 
-    async def _activity_image(self, tags: list[str], buckets: list[int], tz: str) -> discord.File | None:
+    async def _activity_image(
+        self, tags: list[str], buckets: list[int], tz: str, *, days: int = 7
+    ) -> discord.File | None:
         """The activity chart as an image, or None (logged) if it can't be drawn."""
         try:
             title, badge = f"{len(tags)} clans", None
@@ -329,7 +332,7 @@ class Info(BaseCog):
                 title = (row["name"] if row else None) or tags[0]
                 url = row["badge_url"] if row else None
                 badge = (await cards.fetch_badges([url])).get(url) if url else None
-            card = cards.ActivityCard(title, ", ".join(tags), tuple(buckets), tz, badge=badge)
+            card = cards.ActivityCard(title, ", ".join(tags), tuple(buckets), tz, days=days, badge=badge)
             png = await asyncio.to_thread(cards.render_activity, card)
         except Exception:
             log.exception("Couldn't draw the activity chart for %s", tags)

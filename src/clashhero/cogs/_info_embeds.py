@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 import re
 from collections import Counter
 from collections.abc import Iterable, Sequence
@@ -73,6 +74,16 @@ def activity_histogram(rows: Iterable[tuple[str, int]], offset_minutes: int = 0)
         dt = datetime.strptime(hour, "%Y-%m-%dT%H") + shift
         buckets[dt.hour] += count
     return buckets
+
+
+def activity_days(rows: Iterable[tuple[str, int]], now: datetime, window: int = 7) -> int:
+    """Days the activity covers, 1 to ``window``: from the first recorded hour to ``now`` (fewer
+    than ``window`` while tracking is new, so a daily average isn't diluted)."""
+    hours = [datetime.strptime(h, "%Y-%m-%dT%H").replace(tzinfo=UTC) for h, _ in rows]
+    if not hours:
+        return window
+    span = (now - min(hours)).total_seconds() / 86400
+    return max(1, min(window, math.ceil(span)))
 
 
 def render_histogram(buckets: Sequence[int], width: int = 20) -> str:
