@@ -75,6 +75,33 @@ async def guild_color(client, guild_id: int | None) -> discord.Color:
     return discord.Color(s["embed_color"] or DEFAULT_EMBED_COLOR)
 
 
+def maintenance_notice(client) -> str | None:
+    """One-line notice while the Clash API is down for maintenance, else None."""
+    collector = getattr(client, "collector", None)
+    if not getattr(collector, "in_maintenance", False):
+        return None
+    since = collector.maintenance_since
+    when = f" since {since:%H:%M} UTC" if since else ""
+    return f"🛠️ Clash of Clans API maintenance{when}: data is paused and may be out of date"
+
+
 async def make_embed(client, guild_id: int | None, **kwargs) -> discord.Embed:
     kwargs.setdefault("color", await guild_color(client, guild_id))
-    return discord.Embed(**kwargs)
+    embed = discord.Embed(**kwargs)
+    notice = maintenance_notice(client)
+    if notice:
+        embed.set_author(name=notice)
+    return embed
+
+
+def duration(seconds: float) -> str:
+    """'1h 12m', '45m', '3d 2h'."""
+    minutes = max(0, int(seconds // 60))
+    days, rem = divmod(minutes, 1440)
+    hours, mins = divmod(rem, 60)
+    parts = [f"{days}d"] if days else []
+    if hours:
+        parts.append(f"{hours}h")
+    if mins or not parts:
+        parts.append(f"{mins}m")
+    return " ".join(parts[:2])

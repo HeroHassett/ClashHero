@@ -286,6 +286,12 @@ settings need **Manage Server** or the matching manager role set with `/config r
 | `/privacy delete` | Delete all data linked to your Discord account |
 | `/privacy mydata` | See what ClashHero stores that is linked to you |
 
+## Bot status
+
+| Command | What it does |
+| --- | --- |
+| `/status` | Clash API status, data freshness and what's tracked |
+
 
 ---
 

@@ -90,6 +90,8 @@ class Collector:
         self._battlelog_fetched: dict[str, datetime] = {}
         self._player_sources: dict[str, PlayerSource] = {}
         self.in_maintenance = False
+        self.maintenance_since: datetime | None = None
+        self.last_success: dict[str, datetime] = {}  # loop name -> end of last successful cycle
         self._sem = asyncio.Semaphore(10)
 
         self.clan_loop = tasks.loop(seconds=cfg.clan_poll_seconds)(self._poll_clans)
@@ -131,6 +133,18 @@ class Collector:
         for loop in self._loops:
             loop.cancel()
 
+    def note_maintenance(self, now: datetime, *, announce: bool = True) -> None:
+        """Mark the Clash API as down for maintenance (idempotent)."""
+        if self.in_maintenance:
+            return
+        self.in_maintenance, self.maintenance_since = True, now
+        if announce:
+            self.dispatch(ev.MaintenanceChanged(started=True, at=now))
+
+    def _cycle_done(self, name: str, now: datetime) -> None:
+        if not self.in_maintenance:
+            self.last_success[name] = now
+
     def dispatch(self, event: ev.ClashEvent) -> None:
         self.bot.dispatch(event.event_name, event)
 
@@ -155,9 +169,7 @@ class Collector:
             try:
                 result = await coro
             except coc.Maintenance:
-                if not self.in_maintenance:
-                    self.in_maintenance = True
-                    self.dispatch(ev.MaintenanceChanged(started=True, at=datetime.now(UTC)))
+                self.note_maintenance(datetime.now(UTC))
                 return None
             except (coc.NotFound, coc.PrivateWarLog, coc.Forbidden):
                 return None
@@ -168,8 +180,8 @@ class Collector:
                 log.exception("Collector task failed")
                 return None
         if self.in_maintenance:
-            self.in_maintenance = False
-            self.dispatch(ev.MaintenanceChanged(started=False, at=datetime.now(UTC)))
+            since, self.in_maintenance, self.maintenance_since = self.maintenance_since, False, None
+            self.dispatch(ev.MaintenanceChanged(started=False, at=datetime.now(UTC), since=since))
         return result
 
     _failure_logged: set[tuple[str, str]] = set()
@@ -221,6 +233,7 @@ class Collector:
         now = datetime.now(UTC)
         tags = await self.db.all_clan_tags()
         await asyncio.gather(*(self._isolated(self._poll_clan(t, now), "clan", t) for t in tags))
+        self._cycle_done("clans", now)
 
     async def _poll_clan(self, tag: str, now: datetime) -> None:
         clan = await self._guarded(self.coc.get_clan(tag))
@@ -336,6 +349,7 @@ class Collector:
         if not tags:
             return
         await asyncio.gather(*(self._isolated(self._poll_player(t, now), "player", t) for t in tags))
+        self._cycle_done("players", now)
 
     async def _poll_player(self, tag: str, now: datetime) -> None:
         player = await self._guarded(self.coc.get_player(tag))
@@ -600,6 +614,7 @@ class Collector:
         now = datetime.now(UTC)
         tags = await self.db.all_clan_tags()
         await asyncio.gather(*(self._isolated(self._poll_war(t, now), "war", t) for t in tags))
+        self._cycle_done("wars", now)
 
     async def _poll_war(self, clan_tag: str, now: datetime) -> None:
         war = await self._guarded(self.coc.get_current_war(clan_tag))
@@ -766,6 +781,7 @@ class Collector:
     async def _poll_raids(self) -> None:
         tags = await self.db.all_clan_tags()
         await asyncio.gather(*(self._isolated(self._poll_raid(t), "raid", t) for t in tags))
+        self._cycle_done("raids", datetime.now(UTC))
 
     async def _poll_raid(self, clan_tag: str) -> None:
         log_ = await self._guarded(self.coc.get_raid_log(clan_tag, limit=1))

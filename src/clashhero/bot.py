@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import pkgutil
+from datetime import UTC, datetime
 
 import coc
 import discord
@@ -79,6 +80,7 @@ class ClashHeroBot(commands.Bot):
             await self.coc.search_locations(limit=1)  # one cheap request to validate access
         except coc.Maintenance:
             log.warning("Clash of Clans API is in maintenance; data collection resumes when it ends")
+            self.collector.note_maintenance(datetime.now(UTC), announce=False)
         except (coc.Forbidden, coc.InvalidCredentials) as e:
             raise ConfigError(
                 "The Clash of Clans API rejected the key. API keys only work from the IP "

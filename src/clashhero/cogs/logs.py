@@ -477,7 +477,7 @@ class Logs(BaseCog):
 
     @commands.Cog.listener()
     async def on_clash_maintenance(self, e: ev.MaintenanceChanged) -> None:
-        embed = E.maintenance_embed(e.started, e.at)
+        embed = E.maintenance_embed(e.started, e.at, e.since)
         for row in await self.db.server_log_targets("maintenance"):
             await send_to_channel(self.bot, row["channel_id"], embed=embed)
 

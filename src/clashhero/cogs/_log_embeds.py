@@ -9,7 +9,7 @@ from typing import Any
 
 import discord
 
-from clashhero.utils.fmt import chunk_lines, clan_link, player_link, role_name, stars, table, ts
+from clashhero.utils.fmt import chunk_lines, clan_link, duration, player_link, role_name, stars, table, ts
 
 GREEN = discord.Color.green()
 RED = discord.Color.red()
@@ -486,13 +486,17 @@ def raid_summary_embed(
     return e
 
 
-def maintenance_embed(started: bool, at: datetime) -> discord.Embed:
+def maintenance_embed(started: bool, at: datetime, since: datetime | None = None) -> discord.Embed:
     if started:
         return discord.Embed(
-            title="Clash of Clans maintenance started",
-            description=f"Started {ts(at)}. Logs pause until it ends.",
+            title="🛠️ Clash of Clans API maintenance started",
+            description=f"Started {ts(at)}. Logs, alerts and stats pause until it ends; "
+            "ClashHero resumes automatically.",
             color=RED,
         )
+    took = f" after {duration((at - since).total_seconds())}" if since else ""
     return discord.Embed(
-        title="Clash of Clans maintenance ended", description=f"Ended {ts(at)}.", color=GREEN
+        title="✅ Clash of Clans API is back",
+        description=f"Maintenance ended {ts(at)}{took}. Data collection has resumed.",
+        color=GREEN,
     )

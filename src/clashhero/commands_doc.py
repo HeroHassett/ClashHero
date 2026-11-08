@@ -36,6 +36,7 @@ SECTION_TITLES = {
     "Autoroles": "Autoroles and nicknames",
     "Export": "Exports",
     "Privacy": "Privacy and about",
+    "Status": "Bot status",
 }
 
 HEADER = """---

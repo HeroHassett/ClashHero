@@ -289,3 +289,4 @@ class MaintenanceChanged(ClashEvent):
     event_name: ClassVar[str] = "clash_maintenance"
     started: bool
     at: datetime
+    since: datetime | None = None  # on the "ended" event: when the outage started

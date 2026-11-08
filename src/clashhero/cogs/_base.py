@@ -52,7 +52,12 @@ def error_message(error: BaseException) -> str | None:
     if isinstance(original, coc.PrivateWarLog):
         return "That clan's war log is private."
     if isinstance(original, coc.Maintenance):
-        return "Clash of Clans is in maintenance right now. Try again later."
+        return (
+            "🛠️ The Clash of Clans API is down for maintenance (usually during a game update). "
+            "ClashHero picks up automatically when it's back; check `/status`."
+        )
+    if isinstance(original, coc.GatewayError):
+        return "The Clash of Clans API isn't responding right now. Try again in a minute."
     if isinstance(original, discord.Forbidden):
         return "I'm missing Discord permissions to do that here."
     if isinstance(error, app_commands.CheckFailure):
