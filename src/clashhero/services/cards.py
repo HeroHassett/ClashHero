@@ -2724,8 +2724,85 @@ MIN_DAY_COLS = 7  # a short strip keeps columns this narrow rather than stretchi
 HEROES_H = 216
 HEROES_EMPTY_H = 92
 HERO_GAP = 10
-ARMY_HEAD = 54  # panel top to the first icon line
+DETAILS_L = PAD + 22  # a detail panel's content, left edge and width
+DETAILS_W = WIDTH - 2 * DETAILS_L
+# The most-used army: troops, spells and clan castle side by side, each unit a tile with its name
+# under it. A full army (13 kinds of troops, 4 spells, 8 clan castle units) fits in two rows.
+ARMY_HEAD = 72  # panel top to the first row of tiles: the title, then the column labels
 ARMY_FOOT = 18
+ARMY_TILE = 48
+ARMY_CELL_W = 62  # the longest word in a unit's name fits at 10px
+ARMY_CELL_H = ARMY_TILE + 32  # the tile, then up to two lines of name
+ARMY_ROW_GAP = 8
+ARMY_DIVIDER = 28  # between two columns, with a hairline down the middle
+ARMY_NAME_LINE = 12
+
+
+@dataclass(frozen=True)
+class ArmyColumn:
+    """One column of the most-used army: its units fill ``cols`` cells a row, left to right;
+    ``width`` (1x) includes any blank space after them."""
+
+    label: str
+    units: tuple[Unit, ...]
+    cols: int
+    width: float
+
+
+def _column_label_width(label: str) -> float:
+    font = _inter(11, 700)
+    return (sum(font.getlength(c) for c in label) + _px(1.4) * (len(label) - 1)) / SCALE
+
+
+def army_columns(army: Army) -> tuple[list[ArmyColumn], int]:
+    """The troops, spells and clan castle as side-by-side columns, and how many rows of units
+    they need: as few as fit the panel. Cells left over widen a column where that saves it a
+    row (the one with most rows first); spare width is then shared out in proportion."""
+    groups = [
+        (label, tuple(units))
+        for label, units in (
+            ("TROOPS", army.troops),
+            ("SPELLS", army.spells),
+            ("CLAN CASTLE", [*army.cc_troops, *army.cc_spells]),
+        )
+        if units
+    ]
+    if not groups:
+        return [], 0
+    room = DETAILS_W - ARMY_DIVIDER * (len(groups) - 1)
+    inset = (ARMY_CELL_W - ARMY_TILE) / 2
+    sizes = [len(units) for _, units in groups]
+
+    def widths_for(cols: list[int]) -> list[float]:
+        return [
+            max(c * ARMY_CELL_W, inset + _column_label_width(label))
+            for c, (label, _) in zip(cols, groups, strict=True)
+        ]
+
+    rows, cols = 0, []
+    for rows in range(1, max(sizes) + 1):
+        cols = [math.ceil(n / rows) for n in sizes]
+        if sum(widths_for(cols)) <= room:
+            break
+    while True:
+        by_rows = sorted(range(len(cols)), key=lambda i: -math.ceil(sizes[i] / cols[i]))
+        for i in by_rows:
+            own = math.ceil(sizes[i] / cols[i])
+            if own == 1:
+                continue
+            wider = [*cols[:i], math.ceil(sizes[i] / (own - 1)), *cols[i + 1 :]]
+            if sum(widths_for(wider)) <= room:
+                cols = wider
+                break
+        else:
+            break
+    widths = widths_for(cols)
+    total = sum(widths)
+    columns = [
+        ArmyColumn(label, units, c, w + (room - total) * w / total)
+        for (label, units), c, w in zip(groups, cols, widths, strict=True)
+    ]
+    return columns, rows
 
 
 def _heroes_height(details: SeasonDetails) -> int:
@@ -2735,10 +2812,10 @@ def _heroes_height(details: SeasonDetails) -> int:
 def _army_height(details: SeasonDetails) -> int:
     if details.army is None:
         return 0
-    lines = army_lines(details.army.army)
-    if not lines:
+    columns, rows = army_columns(details.army.army)
+    if not columns:
         return 0
-    return ARMY_HEAD + len(lines) * LINE_H + (len(lines) - 1) * LINE_GAP + ARMY_FOOT
+    return ARMY_HEAD + rows * ARMY_CELL_H + (rows - 1) * ARMY_ROW_GAP + ARMY_FOOT
 
 
 def season_height(card: SeasonCard) -> int:
@@ -2892,22 +2969,77 @@ def _details_heroes(
         _draw_runs(draw, _px(cx0 + 12), _px(ey + SMALL_TILE + 20), runs, DIM)
 
 
+def _army_unit_name(unit: Unit) -> str:
+    """A unit's name under its tile; spells drop "Spell", as they sit under SPELLS (or the clan
+    castle) anyway."""
+    if unit.name is None:
+        return "Unknown"
+    return unit.name.removesuffix(" Spell") if unit.kind == "spell" else unit.name
+
+
+def _name_lines(text: str, fonts: Sequence[ImageFont.FreeTypeFont], max_width: float) -> list[list[Run]]:
+    """``text`` on one line, or split between words onto two (the second cut with an ellipsis if
+    it's still too long)."""
+    runs = _runs(text, fonts)
+    if _runs_width(runs) <= max_width:
+        return [runs]
+    words = text.split()
+    for n in range(len(words) - 1, 0, -1):
+        head = _runs(" ".join(words[:n]), fonts)
+        if _runs_width(head) <= max_width:
+            return [head, fit_runs(" ".join(words[n:]), fonts, max_width)]
+    return [fit_runs(text, fonts, max_width)]
+
+
 def _details_army(
     canvas: Image.Image, draw: ImageDraw.ImageDraw, details: SeasonDetails, top: float, images: _IconImages
 ) -> None:
     """The most-used troops and spells (exact counts), with the clan castle most often seen
-    alongside them, drawn like the armies card."""
+    alongside them: a column each, every unit a tile with its count and its name under it, and
+    how many attacks used that army in a pill by the title."""
     usage = details.army
     if usage is None:
         return
-    _card_panel(canvas, top, _army_height(details))
-    _panel_title(draw, top, "MOST-USED ARMY")
+    columns, _ = army_columns(usage.army)
+    height = _army_height(details)
+    _card_panel(canvas, top, height)
+    title = "MOST-USED ARMY"
+    _panel_title(draw, top, title)
+
+    title_font = _inter(12, 700)
+    title_w = sum(title_font.getlength(c) for c in title) + _px(1.6) * (len(title) - 1)
     share = usage.uses / details.attacks if details.attacks else 0.0
-    _panel_rate(draw, top, f"{share:.0%}", f"of attacks ({usage.uses}/{details.attacks})")
-    y = top + ARMY_HEAD
-    for line in army_lines(usage.army):
-        _draw_line(canvas, draw, line, y, images)
-        y += LINE_H + LINE_GAP
+    noun = "attack" if details.attacks == 1 else "attacks"
+    text = f"{usage.uses}/{details.attacks} {noun} ({share:.0%})"
+    pill_font = _inter(12, 700)
+    x0, cy, h = _px(DETAILS_L) + title_w + _px(12), _px(top + 25.5), _px(22)
+    x1 = x0 + pill_font.getlength(text) + _px(20)
+    draw.rounded_rectangle(
+        (x0, cy - h / 2, x1, cy + h / 2), radius=h / 2, fill=(*GOLD, 22), outline=(*GOLD, 110), width=_px(1)
+    )
+    draw.text(((x0 + x1) / 2, _baseline(pill_font, cy)), text, font=pill_font, fill=GOLD_LIGHT, anchor="ms")
+
+    label_font = _inter(11, 700)
+    name_fonts = _text_fonts(10, 500)
+    inset = (ARMY_CELL_W - ARMY_TILE) / 2
+    x = DETAILS_L
+    for i, column in enumerate(columns):
+        if i:
+            lx = _px(x - ARMY_DIVIDER / 2)
+            draw.line(((lx, _px(top + 48)), (lx, _px(top + height - ARMY_FOOT))), fill=BORDER, width=_px(1))
+        color = GOLD if column.label == "CLAN CASTLE" else DIM
+        _tracked(draw, _px(x + inset), _px(top + 60), column.label, label_font, color, _px(1.4), "left")
+        for j, unit in enumerate(column.units):
+            row, col = divmod(j, column.cols)
+            cx = x + (col + 0.5) * ARMY_CELL_W
+            ty = top + ARMY_HEAD + row * (ARMY_CELL_H + ARMY_ROW_GAP)
+            tile = _Tile(unit, ARMY_TILE, True)
+            _draw_tile(canvas, draw, _px(cx - ARMY_TILE / 2), _px(ty), tile, images)
+            lines = _name_lines(_army_unit_name(unit), name_fonts, _px(ARMY_CELL_W - 2))
+            for k, runs in enumerate(lines):
+                baseline = _px(ty + ARMY_TILE + 15 + k * ARMY_NAME_LINE)
+                _draw_runs(draw, _px(cx) - _runs_width(runs) / 2, baseline, runs, MUTED)
+        x += column.width + ARMY_DIVIDER
 
 
 # ------------------------------------------------------------------ badge downloads

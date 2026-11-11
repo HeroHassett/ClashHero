@@ -5,6 +5,7 @@ import io
 from datetime import UTC, date, datetime
 
 import discord
+import pytest
 from PIL import Image
 
 from clashhero.cogs import legends as cog
@@ -144,6 +145,62 @@ def test_details_without_armies_or_days():
     im = open_png(cards.render_legend_season(empty))
     expected = cards.SEASON_H + 2 * cards.DETAILS_GAP + cards.DAYS_H + cards.HEROES_EMPTY_H
     assert im.size == (cards.WIDTH, expected) == (cards.WIDTH, cards.season_height(empty))
+
+
+def code(troops=0, spells=0, cc_troops=0, cc_spells=0):
+    """An army code with that many kinds of each (ids from 0)."""
+    parts = []
+    for letter, n in (("u", troops), ("s", spells), ("i", cc_troops), ("d", cc_spells)):
+        if n:
+            parts.append(letter + "-".join(f"1x{i}" for i in range(n)))
+    return "".join(parts)
+
+
+def test_a_full_army_fits_two_rows():
+    columns, rows = cards.army_columns(parse_army(code(13, 4, 6, 2)))
+    assert rows == 2
+    assert [(c.label, len(c.units), c.cols) for c in columns] == [
+        ("TROOPS", 13, 7),
+        ("SPELLS", 4, 2),
+        ("CLAN CASTLE", 8, 4),
+    ]
+    dividers = cards.ARMY_DIVIDER * (len(columns) - 1)
+    assert sum(c.width for c in columns) + dividers == pytest.approx(cards.DETAILS_W)
+    assert all(c.width >= c.cols * cards.ARMY_CELL_W for c in columns)
+
+
+def test_spare_cells_widen_a_column_to_save_it_a_row():
+    columns, rows = cards.army_columns(parse_army(code(6, 5, 4)))
+    assert rows == 2  # the clan castle can't fit one row beside the others
+    assert [c.cols for c in columns] == [6, 5, 2]  # troops and spells each fill a single row
+
+
+def test_a_small_army_is_one_row_and_empty_columns_are_left_out():
+    columns, rows = cards.army_columns(parse_army(MAIN))
+    assert rows == 1 and [c.label for c in columns] == ["TROOPS", "SPELLS", "CLAN CASTLE"]
+    spells_only, rows = cards.army_columns(parse_army("s3x35"))
+    assert rows == 1 and [c.label for c in spells_only] == ["SPELLS"]
+    assert cards.army_columns(parse_army("h1p10e32_14")) == ([], 0)
+
+
+def test_unit_names_under_the_tiles():
+    totem, freeze = parse_army("s3x35-1x1").spells
+    assert cards._army_unit_name(totem) == totem.name.removesuffix(" Spell") != totem.name
+    fonts = cards._text_fonts(10, 500)
+    room = cards._px(cards.ARMY_CELL_W - 2)
+    text = lambda lines: [" ".join(s for s, _ in runs) for runs in lines]  # noqa: E731
+    assert text(cards._name_lines("Druid", fonts, room)) == ["Druid"]
+    assert text(cards._name_lines("Super Wall Breaker", fonts, room)) == ["Super Wall", "Breaker"]
+    assert text(cards._name_lines("Headhunter", fonts, room)) == ["Headhunter"]  # the longest word
+
+
+def test_the_army_row_grows_with_its_rows():
+    one = card(cards.SeasonDetails(army=common_army(armies(MAIN))))
+    two = card(cards.SeasonDetails(army=common_army(armies(code(13, 4, 6, 2)))))
+    step = cards.ARMY_CELL_H + cards.ARMY_ROW_GAP
+    assert cards.season_height(two) - cards.season_height(one) == step
+    for c in (one, two):
+        assert open_png(cards.render_legend_season(c)).size == (cards.WIDTH, cards.season_height(c))
 
 
 def test_unknown_units_and_long_names_still_draw():
