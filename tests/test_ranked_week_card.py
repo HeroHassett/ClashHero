@@ -264,7 +264,8 @@ async def test_day_grid_falls_back_to_the_day_text(db, monkeypatch):
     monkeypatch.setattr(cards, "render_ranked_week", broken)
     msg = await run(db, cog.Legends.legends_day, 1)
     assert "file" not in msg
-    assert msg["embed"].title == "Amy · Legend day 2026-11-02" and msg["embed"].fields
+    e = msg["embed"]
+    assert e.title == f"Amy ({TAG})" and e.description.startswith("**Legend day · Nov 2**") and e.fields
 
 
 async def test_day_grid_on_switching_accounts(db, monkeypatch, spy):

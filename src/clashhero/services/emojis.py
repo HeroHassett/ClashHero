@@ -15,7 +15,8 @@ Naming (2-32 chars, lowercase letters, digits, underscores):
 - units: slug of the in-game name (``barbarian_king``, ``rage_spell``, ``l_a_s_s_i``)
 - town halls: ``th1`` ... ``th20``
 - drawn by the bot itself: coloured arrows (``ui_arrow_up``, ``ui_arrow_down``,
-  ``ui_arrow_up_blue``), uploaded at startup, and coloured numbers for the donation log
+  ``ui_arrow_up_blue``) and war stars (``ui_star_new``, ``ui_star_old``, ``ui_star_empty``),
+  uploaded at startup, and coloured numbers for the donation log
   (``nd_119`` donated, ``nr_119`` received), uploaded the first time an amount comes up
 """
 
@@ -197,6 +198,13 @@ ARROWS = {
     "ui_arrow_down": ("down", LOSS_RED),
     "ui_arrow_up_blue": ("up", DONATED_BLUE),
 }
+# name -> (fill, outline): war stars, gold for a new star, silver for one an earlier attack
+# already took, and an empty slot for a star not won.
+STARS = {
+    "ui_star_new": ((255, 196, 54), (176, 104, 18)),
+    "ui_star_old": ((168, 176, 190), (96, 102, 116)),
+    "ui_star_empty": ((58, 60, 70), (112, 116, 128)),
+}
 NUMBER_COLORS = {"d": DONATED_BLUE, "r": LOSS_RED}  # donated, received
 MAX_NUMBER = 9999
 NUMBER_BUDGET = 1800  # number emojis stop once the app has this many, leaving room for the rest
@@ -223,6 +231,30 @@ def arrow_image(direction: str, color: tuple[int, int, int]) -> bytes:
     else:
         points = [(left, top), (right, top), (big / 2, bottom)]
     ImageDraw.Draw(im).polygon(points, fill=(*color, 255))
+    return _png(im.resize((EMOJI_SIZE, EMOJI_SIZE), Image.Resampling.LANCZOS))
+
+
+def star_image(fill: tuple[int, int, int], outline: tuple[int, int, int]) -> bytes:
+    """A five-point star with a darker rim, drawn 4x and scaled down."""
+    import math
+
+    from PIL import Image, ImageDraw
+
+    big = EMOJI_SIZE * 4
+    im = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+    cx, cy = big / 2, big * 0.53
+
+    def points(r: float) -> list[tuple[float, float]]:
+        out = []
+        for i in range(10):
+            angle = -math.pi / 2 + i * math.pi / 5
+            rr = r if i % 2 == 0 else r * 0.47
+            out.append((cx + rr * math.cos(angle), cy + rr * math.sin(angle)))
+        return out
+
+    draw = ImageDraw.Draw(im)
+    draw.polygon(points(big * 0.46), fill=(*outline, 255))
+    draw.polygon(points(big * 0.36), fill=(*fill, 255))
     return _png(im.resize((EMOJI_SIZE, EMOJI_SIZE), Image.Resampling.LANCZOS))
 
 
@@ -253,15 +285,17 @@ def number_image(n: int, color: tuple[int, int, int]) -> bytes:
 
 
 async def sync_drawn(client: discord.Client) -> int:
-    """Upload the drawn arrows that aren't there yet (after :func:`sync_official` loaded the
+    """Upload the drawn arrows and war stars that aren't there yet (after :func:`sync_official` loaded the
     app's emojis). Returns uploads."""
     if not EMOJIS.loaded:
         return 0
+    drawn = {name: lambda d=d, c=c: arrow_image(d, c) for name, (d, c) in ARROWS.items()}
+    drawn |= {name: lambda f=f, o=o: star_image(f, o) for name, (f, o) in STARS.items()}
     uploaded = 0
-    for name, (direction, color) in ARROWS.items():
+    for name, image in drawn.items():
         if name in EMOJIS:
             continue
-        emoji = await _upload(client, name, arrow_image(direction, color))
+        emoji = await _upload(client, name, image())
         if emoji is not None:
             EMOJIS.add(emoji)
             uploaded += 1

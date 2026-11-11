@@ -1,6 +1,7 @@
 from types import SimpleNamespace as NS
 
 from clashhero.cogs.boosts import Boosts, boosts_embeds, group_boosts
+from clashhero.services.emojis import EMOJIS
 from clashhero.services.snapshots import active_super_troops
 
 
@@ -31,12 +32,23 @@ def test_group_boosts_orders_troops_and_players():
 
 def test_boosts_embed():
     grouped = group_boosts([("Alice", 16, ("Super Archer",)), ("Bob", 15, ("Super Archer", "Super Wizard"))])
-    [embed] = boosts_embeds("Clan", "#C", grouped, 2, 48, 0x123456)
-    assert embed.title == "Clan super troop boosts"
+    [embed] = boosts_embeds("Clan", "#C", grouped, 2, 48, 0x123456, badge_url="https://badge/c.png")
+    assert embed.title == "Super troop boosts"
+    assert embed.author.name == "Clan" and embed.author.icon_url == "https://badge/c.png"
+    assert embed.author.url.endswith("tag=C")
     assert "**2** of 48 members" in embed.description
     assert [f.name for f in embed.fields] == ["Super Archer (2)", "Super Wizard (1)"]
-    assert embed.fields[0].value == "TH16 · Alice\nTH15 · Bob"
+    assert embed.fields[0].value == "TH16 Alice\nTH15 Bob"
     assert embed.color.value == 0x123456
+
+
+def test_boosts_embed_game_icons(monkeypatch):
+    monkeypatch.setattr(EMOJIS, "_by_name", {"super_archer": "<:super_archer:1>", "th16": "<:th16:2>"})
+    [embed] = boosts_embeds("Clan", "#C", group_boosts([("Alice", 16, ("Super Archer",))]), 1, 2)
+    assert (embed.fields[0].name, embed.fields[0].value) == (
+        "<:super_archer:1> Super Archer (1)",
+        "<:th16:2> Alice",
+    )
 
 
 def test_boosts_embed_empty():
@@ -104,4 +116,4 @@ async def test_boosts_command_reads_raw_payloads(db):
     [msg] = interaction.followup.sent
     embed = msg["embed"]
     assert "**1** of 2 members" in embed.description
-    assert [(f.name, f.value) for f in embed.fields] == [("Super Archer (1)", "TH16 · Alice")]
+    assert [(f.name, f.value) for f in embed.fields] == [("Super Archer (1)", "TH16 Alice")]

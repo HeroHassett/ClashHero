@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+from discord.utils import escape_markdown
 
 from clashhero.cogs._base import BaseCog
+from clashhero.cogs._log_embeds import clan_author, player_embed, player_ref
 from clashhero.events import MemberJoined
 from clashhero.repos import flags as repo
+from clashhero.services.emojis import EMOJIS
 from clashhero.services.outbox import send_dm, send_server_log
 from clashhero.utils.checks import manager
 from clashhero.utils.fmt import chunk_lines, make_embed, player_link, ts
@@ -27,42 +30,117 @@ TYPE_CHOICES = [
 ]
 
 
-def flag_line(r) -> str:
-    icon = "⛔" if r["flag_type"] == "ban" else "⚠️"
-    parts = [f"`#{r['id']}` {icon} **{r['name'] or '?'}** `{r['player_tag']}`"]
-    if r["flag_type"] == "strike" and r["weight"] != 1:
-        parts.append(chip(f"×{r['weight']}"))
+FLAG_ICONS = {"ban": "⛔", "strike": "⚠️"}
+# One message holds 6000 characters over all its embeds; lists stop a little short of that.
+MESSAGE_BUDGET = 5600
+
+
+def player_label(name: str | None, tag: str) -> str:
+    """The player's name linked to their in-game profile, then their tag (just the linked tag
+    when the bot doesn't know the name)."""
+    return f"{player_ref(name, tag)} `{tag}`" if name and name != tag else f"[{tag}]({player_link(tag)})"
+
+
+def flag_line(r, *, player: bool = True) -> str:
+    """One flag: its id, ban or strike (with the strike's weight) and, with ``player``, who it's
+    on; then the reason, and who added it, when, and when it expires."""
+    ban = r["flag_type"] == "ban"
+    kind = "Ban" if ban else "Strike" + (f" ×{r['weight']}" if r["weight"] != 1 else "")
+    head = f"`#{r['id']}` {FLAG_ICONS['ban' if ban else 'strike']} **{kind}**"
+    if player:
+        head += f" · {player_label(r['name'], r['player_tag'])}"
+    lines = [head]
     if r["reason"]:
-        parts.append(r["reason"])
-    parts.append(f"by <@{r['created_by']}> {ts(r['created_at'], 'd')}")
+        reason = r["reason"] if len(r["reason"]) <= 300 else r["reason"][:299].rstrip() + "…"
+        lines.append(f"> {reason}")
+    meta = f"by <@{r['created_by']}> {ts(r['created_at'], 'd')}"
     if r["expires_at"]:
-        parts.append(f"expires {ts(r['expires_at'], 'R')}")
-    return SEP.join(parts)
+        meta += f" · expires {ts(r['expires_at'], 'R')}"
+    lines.append(f"-# {meta}")
+    return "\n".join(lines)
 
 
 def flags_summary(rows) -> str:
-    """Count line above /flag list: ``⛔ `2` bans · ⚠️ `3` strikes``."""
+    """Count line above /flag list: ``⛔ **2** bans · ⚠️ **3** strikes``."""
     bans = sum(1 for r in rows if r["flag_type"] == "ban")
     strikes = len(rows) - bans
     return SEP.join(
         (
-            f"⛔ {chip(bans)} ban{'s' if bans != 1 else ''}",
-            f"⚠️ {chip(strikes)} strike{'s' if strikes != 1 else ''}",
+            f"{FLAG_ICONS['ban']} **{bans}** ban{'s' if bans != 1 else ''}",
+            f"{FLAG_ICONS['strike']} **{strikes}** strike{'s' if strikes != 1 else ''}",
         )
     )
 
 
 def summary_line(rank: int, r, width: int | None = None) -> str:
-    """One /flag summary row; ``width`` pads the strike-total chip so a page lines up."""
+    """One /flag summary row: rank, strike total (``width`` pads it so a page lines up), the
+    player linked to their profile, their strikes and the latest one."""
     plural = "s" if r["strikes"] != 1 else ""
     parts = [
-        f"`{rank:>2}.` {chip(r['total'], width)} **{r['name'] or '?'}** `{r['player_tag']}`",
-        f"{r['strikes']} strike{plural}",
-        f"last {ts(r['last_strike'], 'd')}",
+        f"`{rank:>2}.` {chip(r['total'], width)} {player_label(r['name'], r['player_tag'])}",
+        f"{r['strikes']} strike{plural}, latest {ts(r['last_strike'], 'd')}",
     ]
     if r["banned"]:
-        parts.append("⛔ banned")
+        parts.append(f"{FLAG_ICONS['ban']} banned")
     return SEP.join(parts)
+
+
+def fit_blocks(
+    blocks: Sequence[str],
+    budget: int = MESSAGE_BUDGET,
+    sep: str = "\n",
+    hint: str = "Narrow it down with the filters.",
+) -> list[str]:
+    """The blocks that fit in ``budget`` characters (joined with ``sep``), plus a note saying how
+    many were left out (and ``hint``)."""
+    used = 0
+    for i, block in enumerate(blocks):
+        used += len(block) + len(sep)
+        if used > budget - 80:
+            return [*blocks[:i], f"-# … {len(blocks) - i} more not shown. {hint}".strip()]
+    return list(blocks)
+
+
+def _profile(member) -> str:
+    """Town Hall and trophies with their game icons, as in the join and leave posts."""
+    th = getattr(member, "town_hall", None)
+    if not th:
+        return ""
+    th_emoji = EMOJIS.town_hall(th)
+    parts = [f"{th_emoji}**{th}**" if th_emoji else f"TH **{th}**"]
+    trophies = getattr(member, "trophies", None)
+    if trophies is not None:
+        icon = EMOJIS.league(getattr(member, "league", None)) or EMOJIS.get("res_trophy", "🏆")
+        parts.append(f"{icon}**{trophies:,}**")
+    return " ".join(parts)
+
+
+def flag_alert_embed(
+    member,
+    clan_name: str,
+    clan_tag: str,
+    flags: Sequence,
+    *,
+    badge_url: str | None = None,
+    at: datetime | None = None,
+) -> discord.Embed:
+    """A flagged player joined one of the server's clans: the player (linked to their profile) as
+    the title, the clan with its badge as the author, their Town Hall and trophies, then the flags
+    and their strike total."""
+    n = len(flags)
+    lines = [
+        f"🚩 Joined **{escape_markdown(clan_name)}** with **{n}** active flag{'s' if n != 1 else ''}",
+        _profile(member),
+    ]
+    e = player_embed(member.name, member.tag, lines, discord.Color.red())
+    clan_author(e, clan_name, clan_tag, badge_url)
+    blocks = fit_blocks([flag_line(r, player=False) for r in flags], 1024, hint="See `/flag list`.")
+    e.add_field(name="Flags", value="\n".join(blocks), inline=False)
+    total = sum(r["weight"] for r in flags if r["flag_type"] == "strike")
+    if total:
+        e.add_field(name="Active strike total", value=f"{FLAG_ICONS['strike']} **{total}**")
+    e.timestamp = at
+    return e
 
 
 def dm_embed(
@@ -83,14 +161,14 @@ def dm_embed(
         title = f"You received a strike in {guild_name}"
     e = discord.Embed(
         title=title[:256],
-        description=f"Account: **{player_name}** (`{player_tag}`)",
+        description=f"Account: {player_label(player_name, player_tag)}",
         color=discord.Color.red() if flag_type == "ban" else discord.Color.orange(),
     )
     e.add_field(name="Reason", value=(reason or "No reason given.")[:1024], inline=False)
     if flag_type == "strike":
-        e.add_field(name="Weight", value=str(weight))
+        e.add_field(name="Weight", value=f"**{weight}**")
         if total is not None:
-            e.add_field(name="Active strike total", value=str(total))
+            e.add_field(name="Active strike total", value=f"**{total}**")
     e.add_field(name="Expires", value=ts(expires_at, "R") if expires_at else "Never")
     return e
 
@@ -143,13 +221,13 @@ class Flags(BaseCog):
             weight,
         )
         player = await self.db.get_player_row(tag)
-        label = f"**{player['name']}** `{tag}`" if player and player["name"] else f"`{tag}`"
-        msg = f"Created {flag_type.name.lower()} flag `#{flag_id}` on {label}"
+        label = player_label(player["name"] if player else None, tag)
+        msg = f"Created {flag_type.name.lower()} flag `#{flag_id}` on {label}."
         total = None
         if flag_type.value == "strike":
             total = await repo.strike_total(self.db, interaction.guild_id, tag, now)
-            msg += f"{SEP}weight {chip(weight)}{SEP}active strike total {chip(total)}"
-        embed = ok_embed(msg + ".")
+            msg += f"\nWeight **{weight}**{SEP}active strike total {FLAG_ICONS['strike']} **{total}**"
+        embed = ok_embed(msg)
         if not dm:
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
@@ -222,14 +300,21 @@ class Flags(BaseCog):
             include_expired=include_expired,
             min_strike_weight=min_strike_weight,
         )
-        lines = [flags_summary(rows), "", *(flag_line(r) for r in rows)] if rows else ["No flags."]
-        chunks = chunk_lines(lines)
-        embeds = []
-        for i, c in enumerate(chunks[:10]):
-            e = await make_embed(self.bot, interaction.guild_id, title="Flags" if i == 0 else None)
-            e.description = c
-            embeds.append(e)
+        blocks = fit_blocks([flags_summary(rows), *(flag_line(r) for r in rows)], sep="\n\n")
+        embeds = await self._pages(interaction.guild_id, "Flags", blocks if rows else ["No flags."], "\n")
         await interaction.response.send_message(embeds=embeds, ephemeral=True)
+
+    async def _pages(
+        self, guild_id: int, title: str, lines: Sequence[str], gap: str = ""
+    ) -> list[discord.Embed]:
+        """``lines`` (already cut to fit one message) over as many embeds as they need, titled once.
+        ``gap`` is an extra line break between lines."""
+        embeds = []
+        for i, chunk in enumerate(chunk_lines([line + gap for line in lines])):
+            e = await make_embed(self.bot, guild_id, title=title if i == 0 else None)
+            e.description = chunk.strip()
+            embeds.append(e)
+        return embeds
 
     @flag.command(name="summary", description="Players' active strike totals, highest first")
     @app_commands.describe(
@@ -251,13 +336,8 @@ class Flags(BaseCog):
             min_weight=min_strike_weight,
         )
         width = chip_width(r["total"] for r in rows)
-        lines = [summary_line(i, r, width) for i, r in enumerate(rows, 1)] or ["No active strikes."]
-        chunks = chunk_lines(lines)
-        embeds = []
-        for i, c in enumerate(chunks[:10]):
-            e = await make_embed(self.bot, interaction.guild_id, title="Strike totals" if i == 0 else None)
-            e.description = c
-            embeds.append(e)
+        lines = fit_blocks([summary_line(i, r, width) for i, r in enumerate(rows, 1)])
+        embeds = await self._pages(interaction.guild_id, "Strike totals", lines or ["No active strikes."])
         await interaction.response.send_message(embeds=embeds, ephemeral=True)
 
     @commands.Cog.listener()
@@ -267,19 +347,15 @@ class Flags(BaseCog):
             active = await repo.active_flags(self.db, guild_id, event.member.tag, now)
             if not active:
                 continue
-            embed = await make_embed(
-                self.bot,
-                guild_id,
-                title="🚩 Flagged player joined",
-                url=player_link(event.member.tag),
-                description=f"**{event.member.name}** (`{event.member.tag}`, "
-                f"TH{event.member.town_hall}) joined **{event.clan_name}** (`{event.clan_tag}`)",
-                color=discord.Color.red(),
+            clan = await self.db.get_clan_row(event.clan_tag)
+            embed = flag_alert_embed(
+                event.member,
+                event.clan_name,
+                event.clan_tag,
+                active,
+                badge_url=clan["badge_url"] if clan else None,
+                at=now,
             )
-            embed.add_field(name="Flags", value="\n".join(flag_line(r) for r in active)[:1024], inline=False)
-            total = sum(r["weight"] for r in active if r["flag_type"] == "strike")
-            if total:
-                embed.add_field(name="Active strike total", value=str(total))
             await send_server_log(self.bot, guild_id, "flag_alert", embed)
 
 

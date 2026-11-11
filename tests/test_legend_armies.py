@@ -145,10 +145,13 @@ async def test_defenses_card_is_attached(day, spy):
     assert battles[0].army.heroes[3].hero.name == "Dragon Duke"
     assert {"Barbarian King", "Super Yeti", "Revive Spell", "Dragon Duke", "Sky Wagon"} <= spy["names"]
 
-    assert embed.title == "Amy · Defense armies"
-    assert "🏆 **5421**" in embed.description and "Defenses 4/8 (-119)" in embed.description
+    assert embed.title == f"Amy ({TAG})" and embed.url.endswith(TAG[1:])
+    assert embed.description.split("\n") == [
+        "🛡️ **Defense armies** · Legend day Nov 7",
+        "🏆 **5,421** · **4/8** defenses · ▼ **-119**",  # the day's total with a red down arrow
+    ]
     assert not embed.fields  # the battles are on the card
-    assert embed.footer.text == f"{TAG} · some battles inferred from trophy changes"
+    assert embed.footer.text == "some battles inferred from trophy changes"
 
 
 async def test_attacks_side(day, spy):
@@ -157,7 +160,9 @@ async def test_attacks_side(day, spy):
     assert (kw["kind"], kw["total"], kw["count"]) == ("attack", 40, "1/8")
     assert [b.opponent for b in kw["battles"]] == ["Zed"]
     assert spy["names"] == kw["battles"][0].army.names()
-    assert msg["embed"].title == "Amy · Attack armies"
+    assert msg["embed"].title == f"Amy ({TAG})"
+    assert msg["embed"].description.startswith("⚔️ **Attack armies** · Legend day Nov 7")
+    assert msg["embed"].description.endswith("**1/8** attacks · ▲ **+40**")
     assert msg["file"].filename == "armies.png"
 
 
@@ -180,7 +185,7 @@ async def test_falls_back_to_text_when_the_card_fails(day, monkeypatch, caplog):
     assert field.name == "Defenses"
     lines = field.value.split("\n")
     assert len(lines) == 4
-    assert "★★★ 100% · by ドラゴン使い TH17" in lines[0]
+    assert "★★★ 100% by ドラゴン使い TH17" in lines[0]
     assert "auto-filled" in lines[3]
     assert any("armies card" in r.getMessage() for r in caplog.records)
 
@@ -199,7 +204,7 @@ async def test_a_day_without_battles(db, monkeypatch, spy):
     msg = await run(db, player="#2YYLQ")
     kw = spy["render"]
     assert (kw["battles"], kw["trophies"], kw["total"]) == ([], None, 0)
-    assert msg["embed"].title == "#2YYLQ · Defense armies"
+    assert msg["embed"].title == "#2YYLQ"  # no stored name: just the tag
     assert msg["file"].filename == "armies.png"
 
 
@@ -222,5 +227,5 @@ def test_army_battles_and_text_embed():
     assert battles[0].opponent == "#OPP"  # no name recorded: the tag
     assert battles[0].army.troops[0].name == "Archer" and battles[1].army is None
     e = E.armies_embed(name="Amy", tag=TAG, day=DAY, kind="defense", hits=[], cap=8, trophies=None)
-    assert e.description == f"Legend day {DAY} · Defenses 0/8 (+0)"
-    assert e.fields[0].value == "None recorded for this day." and e.footer.text == TAG
+    assert e.description == "🛡️ **Defense armies** · Legend day Nov 7\n**0/8** defenses · **0**"
+    assert e.fields[0].value == "None recorded for this day." and e.footer.text is None

@@ -1,30 +1,37 @@
 """Shared helpers for the war / CWL / capital / clan games cogs: periods, choices and pure
 embed builders (they accept coc.py objects or anything with the same attributes).
 
-Builders follow the house style in ``utils.style``: chips for numbers, bold block headers,
-summary lines, and ranking tables in code blocks with the names last."""
+Builders follow the style of the log posts (``_log_embeds``): the game's icons (Town Halls, war
+stars, sword and shield, green and red arrows) in short labelled lines with bold numbers; clans
+with their badges and both clans named in every score; players linked to their profiles. Custom
+emojis don't render in code, so ranking tables stay plain text in code blocks, names last."""
 
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import discord
 from discord import app_commands
 
+from clashhero.cogs._log_embeds import arrow, clan_author, star_icon, th_icon, war_label, war_stars
 from clashhero.repos.war import (
     AttackSummary,
     CWLMemberStats,
     DefenseSummary,
     PlayerWarHistory,
     Standing,
+    th_spread,
+    war_result,
 )
-from clashhero.utils.fmt import display_width, pad, table, ts
+from clashhero.services.emojis import EMOJIS
+from clashhero.utils.fmt import clan_link, display_width, pad, player_link, table, ts
 from clashhero.utils.resolve import resolve_player
 from clashhero.utils.seasons import game_season, previous_game_season
-from clashhero.utils.style import ICONS, SEP, chip, chip_width, header, stars, summary
+from clashhero.utils.style import ICONS, SEP, chip, chip_width
+from clashhero.utils.style import stars as text_stars
 
 PERIOD_CHOICES = [
     app_commands.Choice(name="Last 7 days", value="7d"),
@@ -43,12 +50,8 @@ WAR_TYPE_CHOICES = [
     app_commands.Choice(name="Friendly wars", value="friendly"),
 ]
 
-STATE_LABEL = {
-    "preparation": "Preparation",
-    "inWar": "Battle day",
-    "warEnded": "War ended",
-    "notInWar": "Not in war",
-}
+RESULT_WORDS = {"win": "Victory", "lose": "Defeat", "tie": "Tie"}
+LIVE_WORDS = {"win": "Winning", "lose": "Losing", "tie": "Tied"}  # on battle day
 
 # Discord limits.
 FIELD_LIMIT = 1024
@@ -84,12 +87,49 @@ def plural(n: int, word: str) -> str:
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
+def bold_count(n: int, word: str) -> str:
+    """``**12** attacks`` (``**1** attack``)."""
+    return f"**{n:,}** {word}" if n == 1 else f"**{n:,}** {word}s"
+
+
+def ordinal(n: int) -> str:
+    """1st, 2nd, 3rd, 4th, 11th, 21st."""
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
 def escape(text: str | None) -> str:
     return discord.utils.escape_markdown(text or "?")
 
 
+def _cut(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _join(*parts: str) -> str:
+    """The parts joined by spaces, empty ones left out (an icon that isn't uploaded drops out)."""
+    return " ".join(p for p in parts if p)
+
+
 def _th(th: int | None) -> str:
     return str(th) if th else "?"
+
+
+def th_text(level: int | None) -> str:
+    """The Town Hall's icon (``TH17`` when it isn't uploaded), ``TH?`` when unknown."""
+    return th_icon(level) or "TH?"
+
+
+def war_league_icon(name: str | None) -> str:
+    """The war league's icon (``Crystal League I`` -> ``cwl_crystal_i``), empty if not uploaded."""
+    if not name:
+        return ""
+    return EMOJIS.get("cwl_" + str(name).lower().replace(" league", "").replace(" ", "_"))
+
+
+def result_arrow(result: str | None) -> str:
+    """Green up for a win, red down for a loss, nothing for a tie."""
+    return arrow("up") if result == "win" else arrow("down") if result == "lose" else ""
 
 
 def state_value(war: Any) -> str:
@@ -116,6 +156,24 @@ def war_sides(war: Any, clan_tag: str) -> tuple[Any, Any]:
     return war.opponent, war.clan
 
 
+def side_badge(side: Any) -> str | None:
+    """A coc.py clan's badge URL (the medium size), or None."""
+    badge = getattr(side, "badge", None)
+    url = getattr(badge, "url", None) or getattr(badge, "medium", None)
+    return url if isinstance(url, str) else None
+
+
+def set_clan(e: discord.Embed, name: str | None, tag: str | None, badge_url: str | None) -> discord.Embed:
+    """The clan (badge and linked name) as the embed's author. When the author line already holds
+    a notice (API maintenance, from ``make_embed``), the clan goes at the start of the footer
+    instead, so call this after setting the footer."""
+    if not e.author.name:
+        return clan_author(e, name, tag, badge_url)
+    if name or tag:
+        e.set_footer(text=SEP.join(x for x in (name or tag, e.footer.text) if x), icon_url=badge_url or None)
+    return e
+
+
 def _when(t: Any) -> datetime | None:
     if t is None:
         return None
@@ -139,6 +197,35 @@ def fit_lines(lines: Iterable[str], limit: int = FIELD_LIMIT) -> str:
         out.append(line)
         size += cost
     return "\n".join(out)
+
+
+def fit_more(lines: Sequence[str], limit: int = FIELD_LIMIT) -> str:
+    """Lines joined, the last ones replaced by "… and N more" when they'd pass ``limit``."""
+    for keep in range(len(lines), -1, -1):
+        rest = len(lines) - keep
+        text = "\n".join([*lines[:keep], *([f"… and {rest} more"] if rest else [])])
+        if len(text) <= limit:
+            return text
+    return f"{len(lines)} more"
+
+
+def fit_sections(sections: Sequence[tuple[str, Sequence[str]]], limit: int = DESCRIPTION_LIMIT) -> str:
+    """Headed sections separated by a blank line. Until it all fits ``limit`` characters, the
+    longest section loses its last line (noting how many it left off)."""
+    keep = [len(lines) for _, lines in sections]
+
+    def render() -> str:
+        parts = []
+        for (head, lines), n in zip(sections, keep, strict=True):
+            body = [*lines[:n], *([f"… and {len(lines) - n} more"] if n < len(lines) else [])]
+            parts.append("\n".join([head, *body]))
+        return "\n\n".join(parts)
+
+    text = render()
+    while len(text) > limit and any(keep):
+        keep[max(range(len(keep)), key=lambda i: keep[i])] -= 1
+        text = render()
+    return text[:limit]
 
 
 def split_block(block: str, limit: int = FIELD_LIMIT) -> list[str]:
@@ -176,10 +263,17 @@ def pack_fields(
     return fields, len(blocks)
 
 
-def chip_rows(pairs: Sequence[tuple[object, str]]) -> str:
-    """A line per (value, label): the values as chips padded to one width, so they line up."""
-    w = chip_width(v for v, _ in pairs)
-    return "\n".join(f"{chip(v, w)} {label}" for v, label in pairs)
+def add_fields(
+    e: discord.Embed, fields: Sequence[tuple[str, str]], *, inline: bool = False, reserve: int = 150
+) -> int:
+    """Add (name, value) fields while the embed stays within Discord's limits (``reserve``
+    characters kept back for a footer); returns how many were added."""
+    for i, (name, value) in enumerate(fields):
+        name, value = _cut(name, 256), _cut(value, FIELD_LIMIT)
+        if len(e.fields) >= MAX_FIELDS or len(e) + len(name) + len(value) + reserve > EMBED_LIMIT:
+            return i
+        e.add_field(name=name, value=value, inline=inline)
+    return len(fields)
 
 
 def rank_table(
@@ -207,65 +301,80 @@ def rank_table(
     return "```\n" + "\n".join(lines) + "\n```"
 
 
+def _plain(name: str | None, limit: int) -> str:
+    """A name cut to ``limit`` for a code block (no backticks to break out of it)."""
+    return (name or "?")[:limit].replace("`", "'")
+
+
 # ------------------------------------------------------------------ live war
 
 
-def th_matchup(ours: Sequence[Any], theirs: Sequence[Any]) -> str:
-    """A line per Town Hall on either side: a TH chip, then our count and theirs as aligned chips."""
+def _th_counts(members: Iterable[Any]) -> dict[int, int]:
+    return dict(Counter(m.town_hall for m in members))
 
-    def count(ms: Sequence[Any]) -> dict[int, int]:
-        out: dict[int, int] = {}
-        for m in ms:
-            out[m.town_hall] = out.get(m.town_hall, 0) + 1
-        return out
 
-    a, b = count(ours), count(theirs)
+def th_columns(ours: Sequence[Any], theirs: Sequence[Any]) -> tuple[list[str], list[str]]:
+    """For each side, a line per Town Hall that either side has, highest first: the Town Hall's
+    icon and how many (– for none). Both lists have the same rows, so side by side they line up."""
+    a, b = _th_counts(ours), _th_counts(theirs)
     ths = sorted(set(a) | set(b), reverse=True)
-    if not ths:
-        return "—"
-    lw = chip_width(f"TH{th}" for th in ths)
-    nw = chip_width([*a.values(), *b.values()])
-    return "\n".join(
-        f"{chip(f'TH{th}', lw, right=False)} {chip(a.get(th, 0), nw)} – {chip(b.get(th, 0), nw)}"
-        for th in ths
-    )
+
+    def column(counts: dict[int, int]) -> list[str]:
+        return [f"{th_text(th)} **{counts[th]}**" if counts.get(th) else f"{th_text(th)} –" for th in ths]
+
+    return column(a), column(b)
 
 
-def score_line(our_stars: int, their_stars: int, our_dest: float, their_dest: float) -> str:
-    """``⚔️ 42★ – 38★ · 98.2% – 91.0%``"""
-    return summary("war", f"{our_stars}★ – {their_stars}★", f"{our_dest:.1f}% – {their_dest:.1f}%")
-
-
-def attacks_line(ours: int, theirs: int, total: int) -> str:
-    """``🗡️ `28/30` – `25/30` attacks``, both chips the same width."""
-    a, b = f"{ours}/{total}", f"{theirs}/{total}"
-    w = chip_width([a, b])
-    return f"🗡️ {chip(a, w)} – {chip(b, w)} attacks"
-
-
-def war_overview_embed(war: Any, clan_tag: str, color: discord.Color) -> discord.Embed:
+def war_overview_embed(
+    war: Any, clan_tag: str, color: discord.Color, *, label: str | None = None
+) -> discord.Embed:
+    """A live war: our clan (badge) as the author; the opponent, linked and with its badge as the
+    thumbnail, in the title; the war's state and timer (and who's ahead); then a column per clan,
+    ours first and named, with stars and destruction, attacks used and its Town Halls.
+    ``label``: what the title calls the war (default "War" or "CWL")."""
     ours, theirs = war_sides(war, clan_tag)
     state = state_value(war)
     is_cwl = bool(getattr(war, "is_cwl", False))
     per = getattr(war, "attacks_per_member", None) or (1 if is_cwl else 2)
     total = war.team_size * per
+    size = f"{war.team_size} vs {war.team_size}"
     if state == "preparation":
-        timer = f"battle day starts {ts(_when(war.start_time))}"
-    elif state == "inWar":
-        timer = f"ends {ts(_when(war.end_time))}"
+        lines = [f"**Preparation day** · {size}", f"Battle day starts {ts(_when(war.start_time))}"]
     else:
-        timer = f"ended {ts(_when(war.end_time))}"
-    status = [f"**{STATE_LABEL.get(state, state)}**", f"{war.team_size}v{war.team_size}"]
-    lines = [SEP.join([*status, *(["CWL"] if is_cwl else []), timer])]
-    if state != "preparation":
-        lines.append(score_line(ours.stars, theirs.stars, ours.destruction, theirs.destruction))
-        lines.append(attacks_line(ours.attacks_used, theirs.attacks_used, total))
-    e = discord.Embed(title=f"{ours.name} vs {theirs.name}", description="\n".join(lines), color=color)
-    e.add_field(name="Town Halls", value=th_matchup(ours.members, theirs.members))
+        result = war_result(ours.stars, theirs.stars, ours.destruction, theirs.destruction)
+        if state == "inWar":
+            ends = f"{LIVE_WORDS[result]} · ends {ts(_when(war.end_time))}"
+            lines = [f"**Battle day** · {size}", _join(result_arrow(result), ends)]
+        else:
+            head = f"**{RESULT_WORDS[result]}** · {size}"
+            lines = [_join(result_arrow(result), head), f"Ended {ts(_when(war.end_time))}"]
+    title = f"{label or ('CWL' if is_cwl else 'War')} vs {escape(theirs.name)}"
+    e = discord.Embed(
+        title=_cut(title, 256),
+        url=clan_link(theirs.tag) if getattr(theirs, "tag", None) else None,
+        description="\n".join(lines),
+        color=color,
+    )
+    clan_author(e, ours.name, ours.tag, side_badge(ours))
+    if badge := side_badge(theirs):
+        e.set_thumbnail(url=badge)
+    for side, town_halls in zip((ours, theirs), th_columns(ours.members, theirs.members), strict=True):
+        rows = []
+        if state != "preparation":
+            rows += [
+                f"{star_icon()} **{side.stars}** · {side.destruction:.2f}%",
+                f"{ICONS['war']} **{side.attacks_used}**/{total} attacks",
+            ]
+        if rows and town_halls:
+            rows.append("")  # a blank line between the score and the Town Halls
+        e.add_field(name=_cut(escape(side.name), 256), value=fit_lines([*rows, *town_halls]) or "—")
     return e
 
 
-def lineup_embed(war: Any, clan_tag: str, color: discord.Color) -> discord.Embed:
+def lineup_embed(war: Any, clan_tag: str, color: discord.Color, *, label: str | None = None) -> discord.Embed:
+    """Both lineups by map position in a table (plain text: it's a code block), with the stars
+    our best attack took on each of their bases. Our clan as the author, the opponent's badge as
+    the thumbnail."""
     ours, theirs = war_sides(war, clan_tag)
     rows = []
     our_members = sorted(ours.members, key=lambda m: m.map_position)
@@ -276,13 +385,22 @@ def lineup_embed(war: Any, clan_tag: str, color: discord.Color) -> discord.Embed
         rows.append(
             (
                 i + 1,
-                f"TH{a.town_hall} {a.name[:12]}" if a else "",
-                f"TH{b.town_hall} {b.name[:12]}" if b else "",
+                f"TH{a.town_hall} {_plain(a.name, 12)}" if a else "",
+                f"TH{b.town_hall} {_plain(b.name, 12)}" if b else "",
                 _stars_on(war, b) if b else "",
             )
         )
-    e = discord.Embed(title=f"Lineup · {ours.name} vs {theirs.name}", color=color)
-    e.description = table(rows, ["#", ours.name[:15], theirs.name[:15], "★"])[:4096]
+    label = label or ("CWL" if getattr(war, "is_cwl", False) else "War")
+    e = discord.Embed(
+        title=_cut(f"{label} lineup vs {escape(theirs.name)}", 256),
+        url=clan_link(theirs.tag) if getattr(theirs, "tag", None) else None,
+        color=color,
+    )
+    clan_author(e, ours.name, ours.tag, side_badge(ours))
+    if badge := side_badge(theirs):
+        e.set_thumbnail(url=badge)
+    e.description = table(rows, ["#", _plain(ours.name, 15), _plain(theirs.name, 15), "★"])[:4096]
+    e.set_footer(text="★ = our best attack on each of their bases")
     return e
 
 
@@ -291,69 +409,179 @@ def _stars_on(war: Any, defender: Any) -> str:
     for a in getattr(war, "attacks", None) or []:
         if a.defender_tag == defender.tag:
             best = max(best, a.stars)
-    return stars(best) if best else ""
+    return text_stars(best) if best else ""
+
+
+def remaining_embed(
+    e: discord.Embed,
+    war: Any,
+    clan_tag: str,
+    left: Sequence[tuple[Mapping[str, Any], int]],
+    mentions: Mapping[str, int] | None = None,
+) -> discord.Embed:
+    """Fill ``e`` with who still has attacks: the war and its timer, the total, then the players
+    grouped by attacks left (map position, Town Hall icon, name and their Discord user when
+    ``mentions`` has them). ``left``: (member with tag/name/map_position/town_hall, attacks left)."""
+    mentions = mentions or {}
+    ours, theirs = war_sides(war, clan_tag)
+    label = "CWL" if getattr(war, "is_cwl", False) else "War"
+    if state_value(war) == "preparation":
+        when = f"battle day starts {ts(_when(war.start_time))}"
+    else:
+        when = f"ends {ts(_when(war.end_time))}"
+    head = [f"{label} vs **{escape(theirs.name)}** · {when}"]
+    if not left:
+        head.append(f"{arrow('up')} Everyone has used all their attacks.")
+    else:
+        total = sum(n for _, n in left)
+        head.append(f"{ICONS['war']} {bold_count(total, 'attack')} left · {bold_count(len(left), 'player')}")
+    groups: dict[int, list[str]] = {}
+    for m, n in left:
+        user = f"<@{mentions[m['tag']]}>" if m["tag"] in mentions else ""
+        line = _join(f"**{m['map_position']}.**", th_icon(m.get("town_hall")), escape(m["name"]), user)
+        groups.setdefault(n, []).append(line)
+    sections = [("\n".join(head), [])]
+    sections += [
+        (f"**{plural(n, 'attack')} left**", lines) for n, lines in sorted(groups.items(), reverse=True)
+    ]
+    e.description = fit_sections(sections, DESCRIPTION_LIMIT - 96)
+    set_clan(e, ours.name, ours.tag, side_badge(ours))
+    return e
+
+
+def war_log_field(entry: Any) -> tuple[str, str]:
+    """A war log entry as a field: the result (green up / red down) and the opponent in the name;
+    both clans' stars and destruction (ours first) and when it ended in the value. A CWL entry
+    has no opponent: just the season's stars."""
+    end = ts(_when(getattr(entry, "end_time", None)))
+    if getattr(entry, "is_league_entry", False):
+        return f"{ICONS['cwl']} Clan War League", f"{star_icon()} **{entry.clan.stars}** stars · ended {end}"
+    res = str(getattr(entry.result, "value", entry.result) or "")
+    size = f"{entry.team_size} vs {entry.team_size}"
+    name = _join(
+        result_arrow(res), f"{RESULT_WORDS.get(res, 'War')} vs {escape(entry.opponent.name)} ({size})"
+    )
+    c, o = entry.clan, entry.opponent
+    value = (
+        f"{star_icon()} **{c.stars}** – {o.stars} · **{c.destruction:.1f}%** – {o.destruction:.1f}%"
+        f" · ended {end}"
+    )
+    return name, value
+
+
+def war_log_embed(e: discord.Embed, entries: Sequence[Any]) -> discord.Embed:
+    """Fill ``e`` with a field per war log entry (newest first), as many as fit."""
+    fields = [war_log_field(x) for x in entries]
+    shown = add_fields(e, fields)
+    if not fields:
+        e.description = "No wars in the log."
+    elif shown < len(fields):
+        e.set_footer(text=f"Showing the latest {shown} of {len(fields)}")
+    return e
+
+
+def calls_embed(
+    e: discord.Embed,
+    war: Mapping[str, Any],
+    callers: Sequence[Mapping[str, Any]],
+    enemies: Mapping[int, Mapping[str, Any]],
+    best: Mapping[str, int],
+    names: Mapping[str, str],
+) -> discord.Embed:
+    """Fill ``e`` with the claimed enemy bases by map position: the base (Town Hall icon and
+    name) with the stars we already took on it, then who claimed it and their note. ``war`` is a
+    wars row; ``enemies`` their members by map position; ``best`` our best stars by defender tag."""
+    lines = []
+    for c in callers:
+        enemy = enemies.get(c["position"])
+        base = _join(th_icon(enemy.get("town_hall")), escape(enemy["name"])) if enemy else "?"
+        got = best.get(enemy["player_tag"], 0) if enemy else 0
+        who = f"**{escape(names[c['player_tag']])}**" if names.get(c["player_tag"] or "") else ""
+        who = _join(who, f"<@{c['user_id']}>" if c["user_id"] else "")
+        note = f" · _{escape(c['note'])}_" if c["note"] else ""
+        lines.append(_join(f"**{c['position']}.**", base, war_stars(got) if got else "", "→", who) + note)
+    e.description = (
+        fit_more(lines, DESCRIPTION_LIMIT - 96) if lines else "No bases claimed yet. Use `/caller assign`."
+    )
+    opp = war.get("opponent_name") or "?"
+    e.title = _cut(f"{war_label(war)} calls vs {escape(opp)}", 256)
+    e.url = clan_link(war["opponent_tag"]) if war.get("opponent_tag") else None
+    if war.get("opponent_badge_url"):
+        e.set_thumbnail(url=war["opponent_badge_url"])
+    if war.get("team_size"):
+        e.set_footer(text=f"{len(callers)} of {war['team_size']} bases claimed")
+    return e
 
 
 # ------------------------------------------------------------------ /war history
 
 
-def history_embed(name: str, label: str, h: PlayerWarHistory, color: discord.Color) -> discord.Embed:
+def history_embed(
+    name: str, label: str, h: PlayerWarHistory, color: discord.Color, *, tag: str | None = None
+) -> discord.Embed:
+    """A player's (or a user's accounts') war record: "Name (#TAG)" linked to the profile as the
+    title (one account), offense and defense side by side, the three-star rate overall, on first
+    hits and by Town Hall difference, then the latest attacks."""
     o, d = h.offense, h.defense
     e = discord.Embed(
-        title=f"War history · {name}", description=summary("war", plural(h.wars, "war"), label), color=color
+        title=_cut(f"{escape(name)} ({tag})" if tag else escape(name), 256),
+        url=player_link(tag) if tag else None,
+        description=f"{ICONS['war']} **War history** · {label} · {bold_count(h.wars, 'war')}",
+        color=color,
     )
-    missed = f" · {o.missed} missed" if o.missed else ""
-    e.add_field(
-        name=f"{ICONS['war']} Offense",
-        value=chip_rows(
-            [
-                (o.attacks, f"hits{missed}"),
-                (pct(o.triple_rate), f"3★ rate ({o.triples})"),
-                (f"{o.avg_stars:.2f}", "avg ★"),
-                (f"{o.avg_destruction:.1f}%", "avg destruction"),
-                (pct(o.fresh_triple_rate), f"fresh-hit 3★ ({o.fresh_triples}/{o.fresh})"),
-            ]
-        ),
-    )
-    e.add_field(
-        name=f"{ICONS['defense']} Defense",
-        value=chip_rows(
-            [
-                (d.defenses, "times attacked"),
-                (d.triples_allowed, "triples allowed"),
-                (pct(d.hold_rate), "held"),
-                (f"{d.avg_stars:.2f}", "avg ★ allowed"),
-            ]
-        ),
-    )
-    e.add_field(name="By TH difference", value=bucket_lines(o), inline=False)
+    offense = [f"{ICONS['war']} {bold_count(o.attacks, 'attack')}"]
+    if o.missed:
+        offense.append(f"{arrow('down')} **{o.missed}** missed")
+    offense += [
+        f"{star_icon()} **{o.avg_stars:.2f}** avg stars",
+        f"**{o.avg_destruction:.1f}%** avg destruction",
+    ]
+    e.add_field(name="Offense", value="\n".join(offense))
+    defense = [
+        f"{ICONS['defense']} **{d.defenses}** times attacked",
+        f"**{pct(d.hold_rate)}** held, not tripled",
+        f"{star_icon()} **{d.avg_stars:.2f}** avg stars allowed",
+    ]
+    e.add_field(name="Defense", value="\n".join(defense))
+    e.add_field(name="Three-star rate", value=triple_rate_lines(o), inline=False)
     if h.recent:
-        e.add_field(name="Recent attacks", value=recent_attack_lines(h.recent), inline=False)
+        recent = split_block(fit_lines(recent_attack_lines(h.recent), 2 * FIELD_LIMIT))
+        for i, part in enumerate(recent):
+            e.add_field(name="Recent attacks" if i == 0 else BLANK, value=part, inline=False)
     return e
 
 
-def bucket_lines(o: AttackSummary) -> str:
-    """Hits and 3★ rate hitting up, even and down, as aligned chips."""
-    rows = [(label, *o.bucket_rate(key)) for key, label in (("up", "up"), ("even", "even"), ("down", "down"))]
-    lw = chip_width(label for label, _, _ in rows)
-    nw = chip_width(n for _, n, _ in rows)
-    rw = chip_width(pct(rate) for _, _, rate in rows)
-    return "\n".join(
-        f"{chip(label, lw, right=False)} {chip(n, nw)} hits · {chip(pct(rate), rw)} 3★"
-        for label, n, rate in rows
-    )
+def triple_rate_lines(o: AttackSummary) -> str:
+    """The share of attacks that took three stars: overall, as the first hit on a base, and
+    against a higher, the same and a lower Town Hall."""
 
+    def line(text: str, triples: int, n: int) -> str:
+        rate = f"**{triples / n * 100:.0f}%**" if n else "**–**"
+        return f"{rate} {text} ({triples}/{n})"
 
-def recent_attack_lines(recent: Sequence[dict]) -> str:
-    """A line per attack: stars, destruction chip, TH matchup, opponent (and CWL), newest first."""
-    dests = [f"{a['destruction']:.0f}%" for a in recent]
-    w = chip_width(dests)
     lines = [
-        f"{stars(a['stars'])} {chip(dest, w)} TH{_th(a['attacker_th'])}→TH{_th(a['defender_th'])}"
-        f" · {escape(a['opponent_name'])}{' · CWL' if a['war_type'] == 'cwl' else ''}"
-        for a, dest in zip(recent, dests, strict=True)
+        f"{war_stars(3)} {line('of all attacks', o.triples, o.attacks)}",
+        line("as the first hit on a base", o.fresh_triples, o.fresh),
     ]
-    return fit_lines(lines)
+    for key, text in (("up", "a higher"), ("even", "the same"), ("down", "a lower")):
+        n, triples = o.buckets[key]
+        lines.append(line(f"against {text} Town Hall", triples, n))
+    return "\n".join(lines)
+
+
+def recent_attack_lines(recent: Sequence[Mapping[str, Any]]) -> list[str]:
+    """A line per attack, newest first: the stars (silver = already taken, gold = new),
+    destruction, attacker's and defender's Town Halls, and the opponent (and CWL)."""
+    return [
+        _join(
+            war_stars(a["stars"], a.get("new_stars")),
+            f"**{a['destruction']:.0f}%**",
+            f"{th_text(a['attacker_th'])} → {th_text(a['defender_th'])}",
+            f"vs {escape(a['opponent_name'])}",
+            "· CWL" if a["war_type"] == "cwl" else "",
+        )
+        for a in recent
+    ]
 
 
 # ------------------------------------------------------------------ /stats rankings
@@ -386,31 +614,38 @@ def defense_rank_table(rows: Sequence[tuple[str, DefenseSummary]], names: dict[s
 
 
 def attack_totals(rows: Sequence[tuple[str, AttackSummary]]) -> str:
-    """``⚔️ 412 hits · 72.1% 3★ · 2.41★ avg · 7 missed`` across the ranked players."""
+    """Across the ranked players: attacks and missed, then the three-star rate and average stars."""
     hits = sum(s.attacks for _, s in rows)
     triples = sum(s.triples for _, s in rows)
     star_total = sum(s.stars for _, s in rows)
     missed = sum(s.missed for _, s in rows)
-    return summary(
-        "war",
-        plural(hits, "hit"),
-        f"{triples / hits * 100:.1f}% 3★" if hits else None,
-        f"{star_total / hits:.2f}★ avg" if hits else None,
-        f"{missed} missed" if missed else None,
-    )
+    lines = [
+        _join(
+            ICONS["war"],
+            bold_count(hits, "attack"),
+            f"· {arrow('down')} **{missed}** missed" if missed else "",
+        )
+    ]
+    if hits:
+        lines.append(
+            f"{war_stars(3)} **{triples / hits * 100:.1f}%** tripled"
+            f" · {star_icon()} **{star_total / hits:.2f}** avg stars"
+        )
+    return "\n".join(lines)
 
 
 def defense_totals(rows: Sequence[tuple[str, DefenseSummary]]) -> str:
-    """``🛡️ 380 defenses · 81.2% held · 1.62★ avg`` across the ranked players."""
+    """Across the ranked players: defenses, then the hold rate and average stars allowed."""
     n = sum(s.defenses for _, s in rows)
     tripled = sum(s.triples_allowed for _, s in rows)
     star_total = sum(s.stars_allowed for _, s in rows)
-    return summary(
-        "defense",
-        plural(n, "defense"),
-        f"{(n - tripled) / n * 100:.1f}% held" if n else None,
-        f"{star_total / n:.2f}★ avg" if n else None,
-    )
+    lines = [f"{ICONS['defense']} {bold_count(n, 'defense')}"]
+    if n:
+        lines.append(
+            f"**{(n - tripled) / n * 100:.1f}%** held, not tripled"
+            f" · {star_icon()} **{star_total / n:.2f}** avg stars allowed"
+        )
+    return "\n".join(lines)
 
 
 def stats_footer(war_type: str | None, period: str, wars: int, town_hall: int | None = None) -> str:
@@ -445,49 +680,128 @@ def cwl_member_table(rows: Sequence[CWLMemberStats], *, missed: bool = False) ->
     return rank_table(data, headers)
 
 
+def cwl_attacks_summary(rows: Sequence[CWLMemberStats]) -> str:
+    """``⚔️ **95**/105 attacks used · ▼ **3** missed`` across the clan's season."""
+    used, rounds, missed = (sum(getattr(m, k) for m in rows) for k in ("attacks", "rounds", "missed"))
+    return _join(
+        ICONS["war"],
+        f"**{used}**/{rounds} attacks used",
+        f"· {arrow('down')} **{missed}** missed" if missed else "",
+    )
+
+
+def cwl_stars_summary(rows: Sequence[CWLMemberStats]) -> str:
+    """The clan's season stars, triples and total destruction."""
+    stars = sum(m.stars for m in rows)
+    triples = sum(m.triples for m in rows)
+    destruction = sum(m.destruction for m in rows)
+    return (
+        f"{star_icon()} **{stars}** stars · {war_stars(3)} **{triples}** triples"
+        f" · **{destruction:,.0f}%** destruction"
+    )
+
+
 def standings_table(rows: Sequence[Standing]) -> str:
     data = [
-        (i + 1, s.name[:15], s.total_stars, f"{s.destruction:.0f}", f"{s.wins}-{s.losses}-{s.ties}")
+        (i + 1, _plain(s.name, 15), s.total_stars, f"{s.destruction:.0f}", f"{s.wins}-{s.losses}-{s.ties}")
         for i, s in enumerate(rows)
     ]
     return table(data, ["#", "Clan", "★", "Dest", "W-L-T"])
 
 
+def standings_description(
+    rows: Sequence[Standing],
+    clan_tag: str,
+    *,
+    round_no: int,
+    rounds: int,
+    league: str | None = None,
+    movement: Mapping[str, str] | None = None,
+) -> str:
+    """The war league (icon and name) and round; our clan's place (with a green up / red down
+    arrow when it moved in the last round) and stars; then the standings table."""
+    head = SEP.join(
+        x
+        for x in (
+            _join(war_league_icon(league), f"**{league}**") if league else "",
+            f"Round **{round_no}**/{rounds}",
+        )
+        if x
+    )
+    lines = [head]
+    place = next((i for i, s in enumerate(rows) if s.tag == clan_tag), None)
+    if place is not None:
+        s = rows[place]
+        move = (movement or {}).get(clan_tag)
+        lines.append(
+            _join(
+                arrow(move) if move in ("up", "down") else "",
+                f"**{escape(s.name)}** · **{ordinal(place + 1)}** of {len(rows)} ·",
+                star_icon(),
+                bold_count(s.total_stars, "star"),
+            )
+        )
+    return "\n".join(lines) + "\n" + standings_table(rows)
+
+
+def th_spread_line(town_halls: Iterable[int]) -> str:
+    """How many of each Town Hall, highest first: ``<th18> **5**  <th17> **3**``."""
+    return "  ".join(f"{th_text(th)} **{n}**" for th, n in th_spread(town_halls).items()) or "—"
+
+
+def cwl_group_fields(clans: Sequence[Any], clan_tag: str) -> list[tuple[str, str]]:
+    """A field per clan in a CWL group, ours first (marked with a war star): its name and roster
+    size, then its Town Halls."""
+    fields = []
+    for c in sorted(clans, key=lambda c: c.tag != clan_tag):
+        ths = [m.town_hall for m in c.members]
+        name = _join(
+            star_icon() if c.tag == clan_tag else "", f"{escape(c.name)} · {plural(len(ths), 'player')}"
+        )
+        fields.append((name, th_spread_line(ths)))
+    return fields
+
+
 # ------------------------------------------------------------------ /cwl history
 
 
-def cwl_round_line(r: dict, dest_width: int | None = None) -> str:
-    """Round chip, stars, destruction chip, enemy base and its TH (``R2 ★★☆ 78% → #21 · TH17``),
-    or ``missed`` / not played yet."""
+def cwl_round_line(r: Mapping[str, Any], dest_width: int | None = None) -> str:
+    """Round chip, stars (silver = already taken, gold = new), destruction chip, the enemy base's
+    map position and Town Hall (``R2 ★★☆ 78% → #21 <th17>``), or missed / not played yet."""
     rnd = chip(f"R{r.get('cwl_round') or '?'}")
     a = r.get("attack")
     if a:
         dest = chip(f"{a['destruction']:.0f}%", dest_width)
         target = f"#{a['target_pos']}" if a.get("target_pos") else "#?"
-        th = f"{SEP}TH{a['defender_th']}" if a.get("defender_th") else ""
-        return f"{rnd} {stars(a['stars'])} {dest} → {target}{th}"
+        return _join(
+            rnd, war_stars(a["stars"], a.get("new_stars")), dest, "→", target, th_icon(a.get("defender_th"))
+        )
     state = r.get("state")
     if state == "warEnded":
-        return f"{rnd} missed"
+        return f"{rnd} {arrow('down')} missed"
     if state == "preparation":
         return f"{rnd} preparation day"
     return f"{rnd} not attacked yet"
 
 
-def cwl_season_block(rows: Sequence[dict], *, with_name: bool = False) -> str:
-    """One account's CWL season from its ``player_cwl_history`` rows (any order): a header with the
-    season, the usual map position and Town Hall, the clan, a line per round, then summaries."""
+def cwl_season_block(rows: Sequence[Mapping[str, Any]], *, with_name: bool = False) -> str:
+    """One account's CWL season from its ``player_cwl_history`` rows (any order): the season (and
+    the account), the clan with the account's Town Hall and usual map position, a line per round,
+    then the attack and defense totals."""
     rows = sorted(rows, key=lambda r: r.get("cwl_round") or 0)
     latest = rows[-1]
     # Most common map position; on a tie, the latest round's (Counter keeps first-seen order).
     positions = Counter(r["map_position"] for r in reversed(rows) if r.get("map_position"))
     pos = positions.most_common(1)[0][0] if positions else None
     th = max((r["town_hall"] for r in rows if r.get("town_hall")), default=None)
-    where = SEP.join(p for p in (f"#{pos}" if pos else "", f"TH{th}" if th else "") if p)
     name = f"· {escape(latest.get('name'))}" if with_name else ""
-    extra = " ".join(p for p in (name, f"({where})" if where else "") if p)
-    lines = [header(cwl_season_label(latest.get("cwl_season")), "cwl", extra or None)]
-    lines.append(escape(latest.get("clan_name") or latest.get("clan_tag")))
+    lines = [_join(ICONS["cwl"], f"**{cwl_season_label(latest.get('cwl_season'))}**", name)]
+    where = (
+        escape(latest.get("clan_name") or latest.get("clan_tag")),
+        th_icon(th),
+        f"map position **{pos}**" if pos else "",
+    )
+    lines.append(SEP.join(x for x in where if x))
 
     attacks = [r["attack"] for r in rows if r.get("attack")]
     w = chip_width(f"{a['destruction']:.0f}%" for a in attacks) or None
@@ -496,24 +810,24 @@ def cwl_season_block(rows: Sequence[dict], *, with_name: bool = False) -> str:
     decided = len(attacks) + sum(1 for r in rows if not r.get("attack") and r.get("state") == "warEnded")
     if decided:
         lines.append(
-            summary(
-                "war",
-                f"{len(attacks)}/{decided} wars",
-                f"{sum(a['stars'] for a in attacks)}★",
-                f"{sum(a['destruction'] for a in attacks):.0f}%",
-            )
+            f"{ICONS['war']} **{len(attacks)}**/{decided} attacks"
+            f" · {star_icon()} {bold_count(sum(a['stars'] for a in attacks), 'star')}"
+            f" · **{sum(a['destruction'] for a in attacks):.0f}%** destruction"
         )
     defenses = [r["defense"] for r in rows if r.get("defense")]
     if defenses:
         given = sum(d["stars"] for d in defenses)
-        lines.append(summary("defense", plural(len(defenses), "defense"), f"{given}★ given"))
+        lines.append(
+            f"{ICONS['defense']} {bold_count(len(defenses), 'defense')}"
+            f" · {star_icon()} {bold_count(given, 'star')} allowed"
+        )
     return "\n".join(lines)
 
 
-def cwl_history_blocks(rows: Sequence[dict]) -> list[str]:
+def cwl_history_blocks(rows: Sequence[Mapping[str, Any]]) -> list[str]:
     """A block per CWL season and account, newest season first. With several accounts, each
     header names the account."""
-    groups: dict[tuple, list[dict]] = {}
+    groups: dict[tuple, list[Mapping[str, Any]]] = {}
     for r in rows:
         key = (r.get("cwl_season") or "", r.get("player_tag"), r.get("clan_tag"))
         groups.setdefault(key, []).append(r)
@@ -522,7 +836,7 @@ def cwl_history_blocks(rows: Sequence[dict]) -> list[str]:
     return [cwl_season_block(groups[k], with_name=with_name) for k in keys]
 
 
-def fill_cwl_history(e: discord.Embed, rows: Sequence[dict]) -> discord.Embed:
+def fill_cwl_history(e: discord.Embed, rows: Sequence[Mapping[str, Any]]) -> discord.Embed:
     """Add the season blocks to ``e`` as fields, as many as fit in one message, with a footer
     saying how many were left off."""
     blocks = cwl_history_blocks(rows)

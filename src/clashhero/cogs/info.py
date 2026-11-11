@@ -10,6 +10,7 @@ from typing import Any
 
 import discord
 from discord import app_commands
+from discord.utils import escape_markdown
 
 from clashhero.cogs._base import BaseCog, send_error
 from clashhero.cogs._info_embeds import (
@@ -19,6 +20,7 @@ from clashhero.cogs._info_embeds import (
     activity_days,
     activity_histogram,
     ago,
+    fit,
     pack_blocks,
     player_page_id,
     profile_parts,
@@ -31,10 +33,12 @@ from clashhero.cogs._info_embeds import (
     units_blocks,
     upgrades_blocks,
 )
+from clashhero.cogs._log_embeds import arrow, clan_author
 from clashhero.constants import CLAN_TYPE_LABELS, WAR_FREQUENCY_LABELS
 from clashhero.repos import ranks, stats
 from clashhero.services import cards
-from clashhero.services.emojis import EMOJIS
+from clashhero.services.country_flags import flag_emoji
+from clashhero.services.emojis import EMOJIS, slug
 from clashhero.utils.fmt import clan_link, make_embed, player_link, role_name, table, ts
 from clashhero.utils.ranked import league_icon, league_name
 from clashhero.utils.resolve import (
@@ -72,6 +76,91 @@ def _enum(v: Any) -> str:
     return str(getattr(v, "value", v)) if v is not None else "—"
 
 
+# ------------------------------------------------------------------ display helpers
+
+
+def clan_heading(e: discord.Embed, name: str | None, tag: str, badge_url: str | None) -> discord.Embed:
+    """The clan as the embed's author: its badge beside "Name (#TAG)", linked to it in game.
+
+    While the Clash API is down for maintenance, make_embed puts its notice in the author line;
+    the notice then moves to the top of the description, so call this once that is set."""
+    notice = e.author.name
+    if notice:
+        moved = f"-# {notice}\n{e.description or ''}".rstrip()
+        if len(moved) > 4096:  # no room: the notice keeps the author line
+            return e
+        e.description = moved
+    return clan_author(e, f"{name} ({tag})" if name and name != tag else tag, tag, badge_url)
+
+
+def badge_of(clan: Any) -> str | None:
+    """A coc.py clan's badge URL, if it has one."""
+    return getattr(getattr(clan, "badge", None), "url", None)
+
+
+def war_league_icon(name: str | None) -> str:
+    """The CWL league's game icon (``cwl_gold_i`` for "Gold League I"), or "" until uploaded."""
+    return EMOJIS.get("cwl_" + slug(name.replace(" League", ""))) if name else ""
+
+
+def _bold_icon(icon: str, value: str) -> str:
+    return f"{icon} **{value}**" if icon else f"**{value}**"
+
+
+def clan_info_fields(c: Any) -> list[tuple[str, str, bool]]:
+    """(name, value, inline) fields for /clan info from a coc.py Clan: numbers in bold beside
+    their game icons, the war record with green ▲ wins and red ▼ losses, one fact per line."""
+    trophy = EMOJIS.get("res_trophy", "🏆")
+    war_league = getattr(getattr(c, "war_league", None), "name", None)
+    loc = getattr(c, "location", None)
+    location = " ".join(
+        x for x in (flag_emoji(getattr(loc, "country_code", None)), getattr(loc, "name", None)) if x
+    )
+    record = [f"{arrow('up')} **{c.war_wins or 0:,}** won"]
+    if c.public_war_log:
+        record += [f"{arrow('down')} **{c.war_losses or 0:,}** lost", f"**{c.war_ties or 0:,}** tied"]
+    record.append(f"**{c.war_win_streak or 0}** win streak")
+    reqs = []
+    if getattr(c, "required_townhall", None):
+        reqs.append(_bold_icon(EMOJIS.town_hall(c.required_townhall), f"TH{c.required_townhall}+"))
+    reqs.append(_bold_icon(trophy, f"{c.required_trophies or 0:,}"))
+    fields = [
+        ("Level", f"**{c.level}**", True),
+        ("Members", f"**{c.member_count}**/50", True),
+        ("Type", CLAN_TYPE_LABELS.get(_enum(c.type), _enum(c.type)), True),
+        ("War League", " ".join(x for x in (war_league_icon(war_league), war_league or "—") if x), True),
+        ("Capital League", getattr(getattr(c, "capital_league", None), "name", None) or "—", True),
+        ("Location", location or "—", True),
+        ("War Record", "\n".join(record), True),
+        ("War Frequency", WAR_FREQUENCY_LABELS.get(_enum(c.war_frequency), _enum(c.war_frequency)), True),
+        ("War Log", "Public" if c.public_war_log else "Private", True),
+        ("Requirements", "\n".join(reqs), True),
+        ("Clan Points", _bold_icon(trophy, f"{c.points or 0:,}"), True),
+        ("Capital Points", f"**{getattr(c, 'capital_points', 0) or 0:,}**", True),
+    ]
+    labels = (getattr(c, "_raw_data", None) or {}).get("labels") or []
+    if labels:
+        value = " · ".join(f"{EMOJIS.label(lb.get('name'))} {lb.get('name')}".strip() for lb in labels)
+        fields.append(("Labels", value, False))
+    dist = th_distribution(getattr(m, "town_hall", None) for m in c.members)
+    fields.append(("Town Hall Spread", fit(render_th_distribution(dist), 1024, "\n"), False))
+    return fields
+
+
+def donation_totals(donated: int, received: int) -> str:
+    """Donated (blue ▲) and received (red ▼), coloured as in the donation log."""
+    return f"{arrow('up', 'blue')} **{donated:,}** donated · {arrow('down')} **{received:,}** received"
+
+
+def membership_line(row: Any) -> str:
+    """/clan history: a green ▲ for a join or a red ▼ for a leave, the clan (linked) and when."""
+    joined = row["kind"] == "join"
+    tag = row["clan_tag"]
+    clan = f"[{escape_markdown(row['clan_name']) if row['clan_name'] else tag}]({clan_link(tag)})"
+    verb = "Joined" if joined else "Left"
+    return f"{arrow('up' if joined else 'down')} {verb} **{clan}** {ts(row['occurred_at'], 'f')}"
+
+
 class Info(BaseCog):
     """Clan and player information."""
 
@@ -87,12 +176,23 @@ class Info(BaseCog):
 
     # ------------------------------------------------------------------ helpers
 
-    async def _member_rows(self, clan_tag: str) -> list[dict]:
-        """Members from collected data, falling back to a live API call for untracked clans."""
+    async def _clan_name_badge(self, clan_tag: str) -> tuple[str | None, str | None]:
+        """The clan's stored name and badge URL (None for a clan the bot doesn't track)."""
+        row = await self.db.get_clan_row(clan_tag)
+        return (row["name"], row["badge_url"]) if row else (None, None)
+
+    async def _members(self, clan_tag: str) -> tuple[list[dict], str | None, str | None]:
+        """Members from collected data, falling back to a live API call for untracked clans; with
+        the clan's name and badge URL."""
         rows = [dict(r) for r in await self.db.clan_member_rows(clan_tag)]
         if rows:
-            return rows
+            name, badge = await self._clan_name_badge(clan_tag)
+            return rows, name, badge
         c = await self.coc.get_clan(clan_tag)
+        return self._live_member_rows(c), c.name, badge_of(c)
+
+    @staticmethod
+    def _live_member_rows(c: Any) -> list[dict]:
         return [
             {
                 "player_tag": m.tag,
@@ -123,41 +223,11 @@ class Info(BaseCog):
             url=clan_link(c.tag),
             description=(c.description or "")[:1000] or None,
         )
-        badge = getattr(getattr(c, "badge", None), "url", None)
+        badge = badge_of(c)
         if badge:
             e.set_thumbnail(url=badge)
-        e.add_field(name="Level", value=str(c.level))
-        e.add_field(name="Members", value=f"{c.member_count}/50")
-        e.add_field(name="Type", value=CLAN_TYPE_LABELS.get(_enum(c.type), _enum(c.type)))
-        e.add_field(name="War League", value=getattr(c.war_league, "name", "—") or "—")
-        e.add_field(name="Capital League", value=getattr(c.capital_league, "name", "—") or "—")
-        loc = getattr(c, "location", None)
-        e.add_field(name="Location", value=getattr(loc, "name", None) or "—")
-        record = f"{c.war_wins or 0} W"
-        if c.public_war_log:
-            record += f" / {c.war_losses or 0} L / {c.war_ties or 0} T"
-        record += f"\nStreak: {c.war_win_streak or 0}"
-        e.add_field(name="War Record", value=record)
-        e.add_field(
-            name="War Frequency",
-            value=WAR_FREQUENCY_LABELS.get(_enum(c.war_frequency), _enum(c.war_frequency)),
-        )
-        e.add_field(name="War Log", value="Public" if c.public_war_log else "Private")
-        reqs = [f"{c.required_trophies or 0} trophies"]
-        if getattr(c, "required_townhall", None):
-            reqs.append(f"TH{c.required_townhall}+")
-        e.add_field(name="Requirements", value=", ".join(reqs))
-        e.add_field(name="Clan Points", value=str(c.points or 0))
-        e.add_field(name="Capital Points", value=str(getattr(c, "capital_points", 0) or 0))
-        dist = th_distribution(getattr(m, "town_hall", None) for m in c.members)
-        labels = (getattr(c, "_raw_data", None) or {}).get("labels") or []
-        if labels:
-            e.add_field(
-                name="Labels",
-                value=" · ".join(f"{EMOJIS.label(lb.get('name'))} {lb.get('name')}".strip() for lb in labels),
-                inline=False,
-            )
-        e.add_field(name="Town Hall Spread", value=render_th_distribution(dist)[:1024], inline=False)
+        for name, value, inline in clan_info_fields(c):
+            e.add_field(name=name, value=value, inline=inline)
         await interaction.followup.send(embed=e)
 
     @clan.command(name="members", description="Member list with a chosen view")
@@ -171,7 +241,7 @@ class Info(BaseCog):
     ) -> None:
         tag = await resolve_clan(interaction, clan, must_be_tracked=False)
         await interaction.response.defer()
-        rows = await self._member_rows(tag)
+        rows, clan_name, badge = await self._members(tag)
         mode = view.value if view else "th"
         now = datetime.now(UTC)
         if mode == "trophies":
@@ -220,9 +290,14 @@ class Info(BaseCog):
                 [(r["town_hall"] or "?", r["trophies"], short(r["name"])) for r in rows],
                 ["TH", "CUPS", "NAME"],
             )
+        label = next((c.name for c in MEMBER_VIEWS if c.value == mode), "Town Hall")
         e = await make_embed(
-            self.bot, interaction.guild_id, title=f"Members · {tag} ({len(rows)})", description=body[:4096]
+            self.bot,
+            interaction.guild_id,
+            title=f"Members ({len(rows)}) · {label}",
+            description=fit(body, 4000, "\n"),
         )
+        clan_heading(e, clan_name, tag, badge)
         await interaction.followup.send(embed=e)
 
     @clan.command(name="compo", description="Town Hall composition of a clan")
@@ -230,16 +305,17 @@ class Info(BaseCog):
     async def clan_compo(self, interaction: discord.Interaction, clan: str | None = None) -> None:
         tag = await resolve_clan(interaction, clan, must_be_tracked=False)
         await interaction.response.defer()
-        rows = await self._member_rows(tag)
+        rows, clan_name, badge = await self._members(tag)
         dist = th_distribution(r["town_hall"] for r in rows)
         ths = [r["town_hall"] for r in rows if r["town_hall"]]
         avg = sum(ths) / len(ths) if ths else 0
         e = await make_embed(
             self.bot,
             interaction.guild_id,
-            title=f"Composition · {tag}",
+            title="Town Hall composition",
             description=render_th_distribution(dist),
         )
+        clan_heading(e, clan_name, tag, badge)
         e.set_footer(text=f"{len(rows)} members · average TH {avg:.2f}")
         await interaction.followup.send(embed=e)
 
@@ -265,15 +341,16 @@ class Info(BaseCog):
             )
             for i, r in enumerate(rows[:50])
         ]
-        tot_d = sum(r["donations"] for r in rows)
-        tot_r = sum(r["received"] for r in rows)
+        totals = donation_totals(sum(r["donations"] for r in rows), sum(r["received"] for r in rows))
         e = await make_embed(
             self.bot,
             interaction.guild_id,
-            title=f"Donations · {tag}",
-            description=table(lines, ["#", "DON", "REC", "RATIO", "NAME"])[:4096],
+            title="Donations",
+            description=f"{totals}\n{table(lines, ['#', 'DON', 'REC', 'RATIO', 'NAME'])}",
         )
-        e.set_footer(text=f"Season ending {window.id} · total {tot_d:,} donated / {tot_r:,} received")
+        name, badge = await self._clan_name_badge(tag)
+        clan_heading(e, name, tag, badge)
+        e.set_footer(text=f"Season ending {window.id}")
         await interaction.response.send_message(embed=e)
 
     @clan.command(name="lastseen", description="When each member was last active (estimated)")
@@ -286,9 +363,9 @@ class Info(BaseCog):
             [(ago(r["last_seen"], now), r["day_activity"], short(r["name"])) for r in rows],
             ["SEEN", "24H", "NAME"],
         )
-        e = await make_embed(
-            self.bot, interaction.guild_id, title=f"Last seen · {tag}", description=body[:4096]
-        )
+        e = await make_embed(self.bot, interaction.guild_id, title="Last seen", description=body[:4000])
+        name, badge = await self._clan_name_badge(tag)
+        clan_heading(e, name, tag, badge)
         e.set_footer(text="Estimated from observed activity (donations, attacks, upgrades, ...)")
         await interaction.response.send_message(embed=e)
 
@@ -346,14 +423,16 @@ class Info(BaseCog):
     ) -> None:
         tag = await resolve_player(interaction, player, user)
         rows = await stats.membership_history(self.db, tag)
-        lines = [
-            f"{'📥' if r['kind'] == 'join' else '📤'} {r['kind'].title()} "
-            f"**{r['clan_name'] or r['clan_tag']}** {ts(r['occurred_at'], 'f')}"
-            for r in rows
-        ] or ["No join/leave events recorded for this player."]
+        known = await self.db.get_player_row(tag)
+        lines = [membership_line(r) for r in rows] or ["No join/leave events recorded for this player."]
         e = await make_embed(
-            self.bot, interaction.guild_id, title=f"Clan history · {tag}", description="\n".join(lines)[:4096]
+            self.bot,
+            interaction.guild_id,
+            title=f"{escape_markdown(known['name'])} ({tag})" if known else tag,
+            url=player_link(tag),
+            description=fit("\n".join(lines), 4000, "\n"),  # newest first; the oldest are cut
         )
+        e.set_footer(text="Clan history · joins and leaves seen in tracked clans")
         await interaction.response.send_message(embed=e)
 
     # ------------------------------------------------------------------ /player
@@ -403,7 +482,7 @@ async def render_player_page(
 ) -> tuple[list[discord.Embed], discord.ui.View]:
     """Fetch a player and build one page of their card (embeds plus the page buttons)."""
     p = await client.coc.get_player(tag)
-    title, url = f"{p.name} ({p.tag})", player_link(p.tag)
+    title, url = f"{escape_markdown(p.name)} ({p.tag})", player_link(p.tag)
     if page == "profile":
         embed = await make_embed(client, guild_id, title=title, url=url)
         link = await client.db.get_link(p.tag)
@@ -433,6 +512,9 @@ async def render_player_page(
         pages = pack_blocks(builder(unit_levels(p), p.town_hall or 0))
         first = await make_embed(client, guild_id, title=title, url=url, description=pages[0])
         embeds = [first, *(discord.Embed(color=first.color, description=d) for d in pages[1:])]
+    clan = getattr(p, "clan", None)
+    if clan is not None:  # the player's clan above their name, with its badge
+        clan_heading(embeds[0], clan.name, clan.tag, badge_of(clan))
     embeds[-1].set_footer(text=f"{PAGE_LABELS[page]} · TH{p.town_hall}")
     embeds[-1].timestamp = datetime.now(UTC)
     return embeds, player_page_view(page, p.tag)

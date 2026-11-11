@@ -10,23 +10,56 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 import coc
 import discord
+from discord.utils import escape_markdown
 
 from clashhero.cogs._base import send_error
+from clashhero.cogs._log_embeds import arrow, clan_author
 from clashhero.repos import roster_scoring as scoring
 from clashhero.repos import rosters as repo
+from clashhero.services.emojis import EMOJIS
 from clashhero.services.outbox import send_server_log, send_to_channel
 from clashhero.services.snapshots import home_units
 from clashhero.utils.checks import has_permission
 from clashhero.utils.fmt import chunk_lines, display_width, make_embed, pad, ts
-from clashhero.utils.style import fail_embed, ok_embed
+from clashhero.utils.style import ICONS, SEP, chip, fail_embed, ok_embed
 
 log = logging.getLogger(__name__)
 
 FIELD_LIMIT = 1024
+# Discord allows 6000 characters over a whole embed; a roster post with icons that would go over
+# falls back to plain text (app emoji markup is ~30 characters each).
+EMBED_LIMIT = 5900
+
+CATEGORY_LABELS = {"cwl": "CWL", "war": "War", "esports": "E-Sports", "trophy": "Trophy"}
+CATEGORY_ICONS = {"cwl": "cwl", "war": "war", "trophy": "trophy", "esports": "🎮"}  # ICONS keys or emoji
+
+
+def category_label(category: str) -> str:
+    """The roster category with its game icon: ``🏆 CWL``."""
+    key = CATEGORY_ICONS.get(category, "")
+    return f"{ICONS.get(key, key)} {CATEGORY_LABELS.get(category, category.title())}".strip()
+
+
+def icon_stat(icon: str, value: object, fallback: str) -> str:
+    """``{icon}**16**``, or ``TH **16**`` when the icon isn't uploaded."""
+    return f"{icon}**{value}**" if icon else f"{fallback} **{value}**"
+
+
+def th_range(low: int | None, high: int | None) -> str:
+    """A Town Hall requirement with the Town Hall icons: ``<th14>**14+**``, ``TH **14–16**``."""
+    lo_icon, hi_icon = EMOJIS.town_hall(low), EMOJIS.town_hall(high)
+    if low and high:
+        if lo_icon and hi_icon:
+            return f"{lo_icon}**{low}** – {hi_icon}**{high}**"
+        return f"TH **{low}–{high}**"
+    if low:
+        return icon_stat(lo_icon, f"{low}+", "TH")
+    return f"up to {icon_stat(hi_icon, high, 'TH')}" if high else ""
 
 
 def clip_lines(lines: Sequence[str], limit: int = FIELD_LIMIT) -> str:
@@ -248,12 +281,49 @@ async def _set_role(guild: discord.Guild, user_id: int, role_id: int, *, add: bo
         log.warning("Roster role update failed: %s", e)
 
 
+CHANGE_STYLES = {  # verb -> (arrow, colour, wording)
+    "joined": ("up", discord.Color.green(), "signed up"),
+    "left": ("down", discord.Color.red(), "left"),
+}
+
+
+def change_embed(
+    roster,
+    verb: str,
+    names: Sequence[str],
+    actor_mention: str,
+    *,
+    signed_up: int | None = None,
+    clan_name: str | None = None,
+    badge_url: str | None = None,
+    at: datetime | None = None,
+) -> discord.Embed:
+    """A roster change for the server log: the clan (badge) as the author, the roster as the
+    title, who signed up (green ▲), left (red ▼) or moved, and who did it."""
+    direction, color, wording = CHANGE_STYLES.get(verb, ("", discord.Color.blue(), verb))
+    who = names_text([escape_markdown(n) for n in names])
+    line = " ".join(x for x in (arrow(direction) if direction else "", who, wording) if x)
+    e = discord.Embed(title=roster["name"], description=f"{line}\nby {actor_mention}", color=color)
+    clan_author(e, clan_name or roster["clan_tag"], roster["clan_tag"], badge_url)
+    footer = f"Roster #{roster['id']}"
+    if signed_up is not None:
+        footer += f"{SEP}{signed_up}/{roster['max_members']} signed up"
+    e.set_footer(text=footer)
+    e.timestamp = at
+    return e
+
+
 async def _log_change(bot, guild: discord.Guild, roster, actor, verb: str, names: Sequence[str]) -> None:
-    embed = await make_embed(
-        bot,
-        guild.id,
-        title=f"Roster: {roster['name']}",
-        description=f"{', '.join(names)} {verb} (by {actor.mention}).",
+    clan = await bot.db.get_clan_row(roster["clan_tag"])
+    embed = change_embed(
+        roster,
+        verb,
+        names,
+        actor.mention,
+        signed_up=await repo.member_count(bot.db, roster["id"]),
+        clan_name=clan["name"] if clan else None,
+        badge_url=clan["badge_url"] if clan else None,
+        at=datetime.now(UTC),
     )
     await send_server_log(bot, guild.id, "roster_change", embed)
 
@@ -311,9 +381,9 @@ def ping_chunks(header: str, users: Iterable[int], limit: int = 1900) -> list[st
 
 def autoping_header(roster, kind: str, when: str) -> str:
     if kind == "end":
-        text = f"Signups for **{roster['name']}** close {ts(when, 'R')}."
+        text = f"{ICONS['time']} Signups for **{roster['name']}** close {ts(when, 'R')}."
     else:
-        text = f"**{roster['name']}** starts {ts(when, 'R')}."
+        text = f"{ICONS['time']} **{roster['name']}** starts {ts(when, 'R')}."
     text += " " + (roster["autoping_message"] or "You're in the clan but haven't signed up yet.")
     if roster["channel_id"] and roster["message_id"]:
         text += (
@@ -351,42 +421,81 @@ async def send_autoping(bot, roster, kind: str, when: str) -> int:
 # ------------------------------------------------------------------ rendering
 
 
-def render_member_line(i: int, m) -> str:
-    th = m["town_hall"] or "?"
+def render_member_line(i: int, m, *, icons: bool = True) -> str:
+    """One signup: number, Town Hall (its game icon, else ``TH16``), name, combined hero levels,
+    tag and Discord user. Without ``icons`` it's plain text, for big rosters."""
+    th = m["town_hall"]
+    th_txt = (EMOJIS.town_hall(th) if icons and th else "") or chip(f"TH{th or '?'}")
     heroes = m["heroes_total"]
-    hero_txt = f" · {heroes}h" if heroes else ""
+    if not heroes:
+        hero_txt = ""
+    else:
+        hero_txt = f" {ICONS['heroes']}**{heroes}**" if icons else f" · {heroes}h"
     mention = f" <@{m['user_id']}>" if m["user_id"] else ""
-    return f"`{i:>2}.` `TH{th}` {m['name'] or '?'}{hero_txt} `{m['player_tag']}`{mention}"
+    name = escape_markdown(m["name"] or "?")
+    return f"`{i:>2}.` {th_txt} {name}{hero_txt} `{m['player_tag']}`{mention}"
 
 
-def render_roster_embed(
-    roster, groups, members, clan_name: str | None, color: discord.Color
-) -> discord.Embed:
-    """Pure: build the roster embed from rows."""
-    if roster["color"] is not None:
-        color = discord.Color(roster["color"])
-    title = f"{roster['name']}" + (f" · {clan_name}" if clan_name else "")
+def roster_info(roster, signed_up: int) -> list[str]:
+    """The roster post's description: category and signups, requirements, times, auto-ping and
+    whether it's closed."""
     info = [
-        f"**{roster['category'].upper()}** roster for `{roster['clan_tag']}`",
-        f"Members: **{len(members)}/{roster['max_members']}**",
+        f"{category_label(roster['category'])} roster{SEP}**{signed_up}/{roster['max_members']}** signed up"
     ]
-    reqs = []
-    if roster["min_th"] or roster["max_th"]:
-        reqs.append(f"TH {roster['min_th'] or 1}–{roster['max_th'] or '∞'}")
+    reqs = [th_range(roster["min_th"], roster["max_th"])]
     if roster["min_heroes"]:
-        reqs.append(f"{roster['min_heroes']}+ hero levels")
-    if reqs:
-        info.append("Requirements: " + ", ".join(reqs))
+        reqs.append(f"{ICONS['heroes']} **{roster['min_heroes']}+** hero levels")
+    if any(reqs):
+        info.append("Requirements: " + SEP.join(x for x in reqs if x))
+    times = []
     if roster["start_time"]:
-        info.append(f"Starts {ts(roster['start_time'], 'f')}")
+        times.append(f"Starts {ts(roster['start_time'], 'f')}")
     if roster["end_time"]:
-        info.append(f"Signups close {ts(roster['end_time'], 'R')}")
+        times.append(f"{'signups' if times else 'Signups'} close {ts(roster['end_time'], 'R')}")
+    if times:
+        info.append(f"{ICONS['time']} " + SEP.join(times))
     autoping = repo.describe_autoping(roster)
     if autoping:
         info.append(f"🔔 {autoping}")
     if roster["closed"]:
-        info.append("🔒 **Closed**")
-    embed = discord.Embed(title=title, description="\n".join(info), color=color)
+        info.append("🔒 **Closed**: no self signups")
+    return info
+
+
+def render_roster_embed(
+    roster,
+    groups,
+    members,
+    clan_name: str | None,
+    color: discord.Color,
+    *,
+    badge_url: str | None = None,
+) -> discord.Embed:
+    """Pure: build the roster embed from rows. The clan (with its badge) is the author, the roster
+    name the title; each group is a field listing its signups. Big rosters drop the icons so the
+    post stays within Discord's size limit."""
+    embed = _render_roster_embed(roster, groups, members, clan_name, color, badge_url, icons=True)
+    if len(embed) > EMBED_LIMIT:
+        embed = _render_roster_embed(roster, groups, members, clan_name, color, badge_url, icons=False)
+    return embed
+
+
+def _render_roster_embed(
+    roster,
+    groups,
+    members,
+    clan_name: str | None,
+    color: discord.Color,
+    badge_url: str | None,
+    *,
+    icons: bool,
+) -> discord.Embed:
+    if roster["color"] is not None:
+        color = discord.Color(roster["color"])
+    embed = discord.Embed(
+        title=roster["name"], description="\n".join(roster_info(roster, len(members))), color=color
+    )
+    clan_author(embed, clan_name or roster["clan_tag"], roster["clan_tag"], badge_url)
     ordered = repo.sort_members(members, roster["sort_by"])
     sections: list[tuple[str, list]] = [
         (g["name"], [m for m in ordered if m["group_id"] == g["id"]]) for g in groups
@@ -400,7 +509,7 @@ def render_roster_embed(
         lines = []
         for m in rows:
             n += 1
-            lines.append(render_member_line(n, m))
+            lines.append(render_member_line(n, m, icons=icons))
         chunks = chunk_lines(lines, FIELD_LIMIT - 10) if lines else ["—"]
         for i, chunk in enumerate(chunks):
             label = f"{name} ({len(rows)})" if i == 0 else f"{name} (cont.)"
@@ -418,7 +527,14 @@ async def build_roster_embed(bot, roster) -> discord.Embed:
     members = await repo.list_members(bot.db, roster["id"])
     clan = await bot.db.get_clan_row(roster["clan_tag"])
     color = (await make_embed(bot, roster["guild_id"])).color
-    return render_roster_embed(roster, groups, members, clan["name"] if clan else None, color)
+    return render_roster_embed(
+        roster,
+        groups,
+        members,
+        clan["name"] if clan else None,
+        color,
+        badge_url=clan["badge_url"] if clan else None,
+    )
 
 
 SUGGEST_MAX_ROWS = 50
@@ -486,9 +602,12 @@ def render_suggestion_embeds(
     """Pure: the ranked suggestion table plus how the score works and who was left out."""
     lines = suggestion_table_lines(scored, size, substitutes)
     blocks = chunk_lines(lines, SUGGEST_CHUNK) if scored else []
-    head = (
-        f"{len(scored)} eligible candidate(s) from `{roster['clan_tag']}` and current signups. "
-        f"Top {size} → Confirmed, next {substitutes} → Substitute. `*` = already signed up."
+    head = "\n".join(
+        (
+            f"**{len(scored)}** eligible from `{roster['clan_tag']}` and current signups",
+            f"Top **{size}** → Confirmed{SEP}next **{substitutes}** → Substitute",
+            "-# `*` after a name: already signed up",
+        )
     )
     embeds = [
         discord.Embed(

@@ -96,6 +96,7 @@ def test_arrows_and_numbers_are_drawn_in_colour():
     down = Image.open(io.BytesIO(emojis.arrow_image("down", emojis.LOSS_RED))).convert("RGBA")
     assert down.getpixel((64, 45))[3] == 255 and down.getpixel((64, 88))[3] < 255  # wide top, point below
     assert emojis.DONATED_BLUE in _colours(emojis.number_image(119, emojis.DONATED_BLUE))
+    assert (255, 196, 54) in _colours(emojis.star_image(*emojis.STARS["ui_star_new"]))
     wide = Image.open(io.BytesIO(emojis.number_image(9999, emojis.LOSS_RED))).getbbox()
     assert wide[0] >= 0 and wide[2] <= emojis.EMOJI_SIZE  # long numbers shrink to fit
     assert emojis.number_key("d", 119) == "nd_119"
@@ -139,7 +140,14 @@ async def test_drawn_arrows_upload_when_missing(registry, monkeypatch):
     monkeypatch.setattr(emojis, "_upload", _fast_upload)
     registry.load([E("ui_arrow_up", 3)])
     bot = Uploader()
-    assert await emojis.sync_drawn(bot) == 2 and sorted(bot.made) == ["ui_arrow_down", "ui_arrow_up_blue"]
+    assert await emojis.sync_drawn(bot) == 5
+    assert sorted(bot.made) == [
+        "ui_arrow_down",
+        "ui_arrow_up_blue",
+        "ui_star_empty",
+        "ui_star_new",
+        "ui_star_old",
+    ]
     assert await emojis.sync_drawn(bot) == 0
 
 

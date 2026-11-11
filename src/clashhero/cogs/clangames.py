@@ -3,26 +3,41 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 
 import discord
 from discord import app_commands
 
 from clashhero.cogs._base import BaseCog
+from clashhero.cogs._live_embeds import (
+    clan_row_header,
+    fit_names,
+    games_summary_lines,
+    games_table,
+    games_window_line,
+    icon_text,
+)
+from clashhero.cogs._log_embeds import arrow
 from clashhero.repos import capital as cap_repo
-from clashhero.utils.fmt import make_embed, table, ts
+from clashhero.services.emojis import EMOJIS
+from clashhero.utils.fmt import make_embed
 from clashhero.utils.resolve import ResolveError, clan_autocomplete, resolve_clan
 from clashhero.utils.seasons import clan_games, utcnow
 
 
-def games_embed_text(summary: cap_repo.GamesSummary, limit: int = 50) -> str:
-    data = [
-        (i + 1, r["name"][:16], f"{r['points']:,}" + (" ✅" if r["maxed"] else ""))
-        for i, r in enumerate(summary.rows[:limit])
-    ]
-    head = f"Clan points: **{summary.total:,}** · Tier **{summary.tier}/6**"
-    if summary.next_tier_at:
-        head += f" · {summary.next_tier_at - summary.total:,} to next tier"
-    return head + "\n" + (table(data, ["#", "Player", "Points"]) if data else "No points recorded yet.")
+def games_embed_text(summary: cap_repo.GamesSummary, when: str = "", limit: int = 50) -> str:
+    """The clan's points and tier, when the games start or end (``when``), then the leaderboard."""
+    head = "\n".join([*games_summary_lines(summary.total), *([when] if when else [])])
+    rows = summary.rows[:limit]
+    return f"{head}\n\n{games_table(rows, 4090 - len(head), cap=summary.cap)}"
+
+
+def month_label(games_id: str) -> str:
+    """'2026-11' -> 'November 2026' (unchanged if it isn't a month)."""
+    try:
+        return datetime.strptime(games_id, "%Y-%m").strftime("%B %Y")
+    except ValueError:
+        return games_id
 
 
 class ClanGames(BaseCog):
@@ -51,23 +66,25 @@ class ClanGames(BaseCog):
             games_id = month.strip()
         summary = cap_repo.summarize_games(await cap_repo.clan_games_rows(self.db, tag, games_id), cap)
         clan_row = await self.db.get_clan_row(tag)
+        current = games_id == window.id
+        when = games_window_line(window.start, window.end) if current else ""
         e = await make_embed(
             self.bot,
             interaction.guild_id,
-            title=f"Clan Games {games_id} · {clan_row['name'] if clan_row else tag}",
-            description=games_embed_text(summary)[:4096],
+            title=icon_text(EMOJIS.get("ui_clan_games"), f"Clan Games {month_label(games_id)}"),
+            description=games_embed_text(summary, when),
         )
-        if games_id == window.id:
-            now = utcnow()
-            if now < window.start:
-                e.set_footer(text="Clan Games haven't started yet.")
-                e.description = f"Starts {ts(window.start)}\n" + e.description
-            elif now < window.end:
-                e.description = f"Ends {ts(window.end)}\n" + e.description
+        clan_row_header(e, clan_row, tag)
+        if current and utcnow() < window.start:
+            e.set_footer(text="Clan Games haven't started yet.")
         if show_missing:
             missing = await cap_repo.clan_games_missing(self.db, tag, games_id)
-            names = ", ".join(discord.utils.escape_markdown(m["name"]) for m in missing) or "Nobody 🎉"
-            e.add_field(name=f"No points yet ({len(missing)})", value=names[:1024], inline=False)
+            names = [discord.utils.escape_markdown(m["name"]) for m in missing]
+            e.add_field(
+                name=icon_text(arrow("down") if missing else "", f"No points yet ({len(missing)})"),
+                value=fit_names(names) if names else f"{arrow('up')} Everyone has scored",
+                inline=False,
+            )
         await interaction.response.send_message(embed=e)
 
 

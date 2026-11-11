@@ -67,10 +67,10 @@ def roster_count(r) -> str:
 
 
 def roster_list_line(r, width: int | None = None) -> str:
-    """One /roster list row: ``` `12/15` **CWL main** · CWL · Clan · 🔔 · 🔒```."""
+    """One /roster list row: ``` `12/15` **CWL main** · 🏆 CWL · Clan · 🔔 · 🔒```."""
     parts = [
         f"{chip(roster_count(r), width)} **{r['name']}**",
-        r["category"].upper(),
+        views.category_label(r["category"]),
         r["clan_name"] or r["clan_tag"],
     ]
     if repo.describe_autoping(r):
@@ -255,7 +255,7 @@ class Rosters(BaseCog):
             res = await views.signup(
                 self.bot, interaction.guild, roster, tags, actor=interaction.user, as_manager=True
             )
-            msg += f"\nImported {chip(len(res.added))} member(s){SEP}skipped {chip(len(res.errors))}."
+            msg += f"\nImported **{len(res.added)}** member(s){SEP}skipped **{len(res.errors)}**."
             await interaction.followup.send(embed=ok_embed(msg), ephemeral=True)
             return
         await interaction.response.send_message(embed=ok_embed(msg), ephemeral=True)
@@ -422,7 +422,7 @@ class Rosters(BaseCog):
         data = repo.members_csv(members).encode()
         file = discord.File(io.BytesIO(data), filename=f"roster-{row['name'].replace(' ', '_')}.csv")
         await interaction.response.send_message(
-            embed=ok_embed(f"Exported **{row['name']}**: {chip(len(members))} member(s)."),
+            embed=ok_embed(f"Exported **{row['name']}**: **{len(members)}** member(s)."),
             file=file,
             ephemeral=True,
         )
@@ -497,7 +497,7 @@ class Rosters(BaseCog):
             self.bot, interaction.guild, row, [m["player_tag"] for m in members], actor=interaction.user
         )
         await interaction.response.send_message(
-            embed=ok_embed(f"Cleared {chip(len(removed))} signup(s) from **{row['name']}**."), ephemeral=True
+            embed=ok_embed(f"Cleared **{len(removed)}** signup(s) from **{row['name']}**."), ephemeral=True
         )
 
     @roster.command(name="ping", description="Ping roster members (asks for confirmation)")
@@ -809,7 +809,7 @@ def move_embed(moved: list[str], missing: list[str], roster_name: str) -> discor
     if not moved:
         e = fail_embed(f"Nobody was moved to **{roster_name}**.")
     else:
-        e = ok_embed(f"Moved {chip(len(moved))} to **{roster_name}**.")
+        e = ok_embed(f"Moved **{len(moved)}** to **{roster_name}**.")
     if missing:
         e.add_field(name=f"Not moved ({len(missing)})", value=views.clip_lines(missing), inline=False)
     return e

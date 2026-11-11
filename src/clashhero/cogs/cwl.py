@@ -20,21 +20,27 @@ from discord import app_commands
 
 from clashhero.cogs._base import BaseCog
 from clashhero.cogs._war_embeds import (
+    add_fields,
+    cwl_attacks_summary,
+    cwl_group_fields,
     cwl_member_table,
-    cwl_season_label,
+    cwl_stars_summary,
+    escape,
     fill_cwl_history,
     lineup_embed,
-    plural,
     resolve_player_tags,
-    standings_table,
+    set_clan,
+    side_badge,
+    standings_description,
     state_value,
     war_overview_embed,
 )
 from clashhero.repos import war as war_repo
 from clashhero.services import cards
-from clashhero.utils.fmt import guild_color, make_embed
+from clashhero.utils.fmt import guild_color, make_embed, player_link
 from clashhero.utils.resolve import ResolveError, clan_autocomplete, player_autocomplete, resolve_clan
 from clashhero.utils.seasons import cwl_season_id
+from clashhero.utils.style import ICONS
 
 log = logging.getLogger(__name__)
 
@@ -66,10 +72,6 @@ def war_to_standing_row(war: Any) -> dict:
         "team_size": war.team_size,
         "state": state_value(war),
     }
-
-
-def spread_text(town_halls: list[int]) -> str:
-    return " ".join(f"TH{th}×{n}" for th, n in war_repo.th_spread(town_halls).items()) or "—"
 
 
 def season_title(season: str | None) -> str:
@@ -131,9 +133,16 @@ class CWL(BaseCog):
             return []
         return [w async for w in self.coc.get_league_wars(tags)]
 
-    async def _clan_name(self, clan_tag: str) -> str:
+    async def _with_clan(self, e: discord.Embed, clan_tag: str) -> discord.Embed:
+        """The clan (badge and name, from the collector's copy) on ``e``."""
         row = await self.db.get_clan_row(clan_tag)
-        return row["name"] if row else clan_tag
+        return set_clan(e, row["name"] if row else clan_tag, clan_tag, row["badge_url"] if row else None)
+
+    @staticmethod
+    def _group_badge(group: Any, clan_tag: str) -> tuple[str | None, str | None]:
+        """(name, badge URL) of a clan in the league group."""
+        clan = next((c for c in group.clans if c.tag == clan_tag), None)
+        return getattr(clan, "name", None), side_badge(clan)
 
     async def _our_war(self, clan_tag: str, group: Any, round_no: int | None) -> tuple[int, Any]:
         """(round number, our war). Default round: latest one that has started."""
@@ -167,9 +176,8 @@ class CWL(BaseCog):
         await interaction.response.defer()
         group = await self._group(tag)
         r, w = await self._our_war(tag, group, round)
-        e = war_overview_embed(w, tag, await guild_color(self.bot, interaction.guild_id))
-        e.title = f"CWL round {r} · {e.title}"
-        await interaction.followup.send(embed=e)
+        color = await guild_color(self.bot, interaction.guild_id)
+        await interaction.followup.send(embed=war_overview_embed(w, tag, color, label=f"CWL round {r}"))
 
     @cwl.command(name="lineup", description="Both lineups for a CWL round")
     @app_commands.describe(round="Round 1-7 (default: the latest started round)")
@@ -184,9 +192,8 @@ class CWL(BaseCog):
         await interaction.response.defer()
         group = await self._group(tag)
         r, w = await self._our_war(tag, group, round)
-        e = lineup_embed(w, tag, await guild_color(self.bot, interaction.guild_id))
-        e.title = f"CWL round {r} · {e.title}"
-        await interaction.followup.send(embed=e)
+        color = await guild_color(self.bot, interaction.guild_id)
+        await interaction.followup.send(embed=lineup_embed(w, tag, color, label=f"CWL round {r}"))
 
     @cwl.command(name="stats", description="Group standings (stars incl. +10 per win, destruction)")
     @app_commands.autocomplete(clan=clan_autocomplete)
@@ -214,14 +221,25 @@ class CWL(BaseCog):
                 }
             )
         rows = war_repo.cwl_standings(wars)
-        round_label = f"{max(current_round(by_round), 1)}/{group.number_of_rounds or 7}"
+        round_no, rounds = max(current_round(by_round), 1), group.number_of_rounds or 7
+        round_label = f"{round_no}/{rounds}"
+        movement = cwl_movement(by_round)
+        try:
+            league = await self._war_league(tag)
+        except Exception:  # the standings still go out without the league
+            log.exception("Couldn't look up the war league of %s", tag)
+            league = None
         e = await make_embed(
             self.bot,
             interaction.guild_id,
-            title=f"CWL standings · {group.season}",
-            description=standings_table(rows) + f"\nRound {round_label}",
+            title=f"CWL standings · {season_title(group.season)}",
+            description=standings_description(
+                rows, tag, round_no=round_no, rounds=rounds, league=league, movement=movement
+            ),
         )
-        card = await self._standings_card(group, tag, rows, cwl_movement(by_round), round_label)
+        name, badge = self._group_badge(group, tag)
+        set_clan(e, name, tag, badge)
+        card = await self._standings_card(group, tag, rows, movement, round_label, league)
         if card is None:
             await interaction.followup.send(embed=e)
             return
@@ -241,7 +259,13 @@ class CWL(BaseCog):
         return None if not name or name == "Unranked" else name
 
     async def _standings_card(
-        self, group: Any, clan_tag: str, rows: Sequence[Any], movement: dict[str, str], round_label: str
+        self,
+        group: Any,
+        clan_tag: str,
+        rows: Sequence[Any],
+        movement: dict[str, str],
+        round_label: str,
+        league: str | None,
     ) -> bytes | None:
         """The standings as a PNG image, or None if it can't be drawn (the text embed still goes out)."""
         try:
@@ -249,9 +273,7 @@ class CWL(BaseCog):
             for c in group.clans:
                 badge = getattr(c, "badge", None)
                 badge_urls[c.tag] = getattr(badge, "medium", None) or getattr(badge, "url", None)
-            badges, league = await asyncio.gather(
-                cards.fetch_badges(badge_urls.values()), self._war_league(clan_tag)
-            )
+            badges = await cards.fetch_badges(badge_urls.values())
             card_rows = [
                 cards.CardRow(
                     rank=i + 1,
@@ -282,11 +304,12 @@ class CWL(BaseCog):
         tag = await resolve_clan(interaction, clan, must_be_tracked=False)
         await interaction.response.defer()
         group = await self._group(tag)
-        e = await make_embed(self.bot, interaction.guild_id, title=f"CWL group · {group.season}")
-        for c in sorted(group.clans, key=lambda c: c.tag != tag):
-            ths = [m.town_hall for m in c.members]
-            name = ("⭐ " if c.tag == tag else "") + f"{c.name} ({len(ths)} in roster)"
-            e.add_field(name=name[:256], value=spread_text(ths)[:1024], inline=False)
+        e = await make_embed(
+            self.bot, interaction.guild_id, title=f"CWL group · {season_title(group.season)}"
+        )
+        name, badge = self._group_badge(group, tag)
+        set_clan(e, name, tag, badge)
+        add_fields(e, cwl_group_fields(group.clans, tag))
         await interaction.followup.send(embed=e)
 
     # ------------------------------------------------------------------ season stats (DB)
@@ -300,18 +323,17 @@ class CWL(BaseCog):
         tag = await resolve_clan(interaction, clan)
         s = _season(season)
         rows = await war_repo.cwl_member_stats(self.db, tag, s)
-        missed = sum(m.missed for m in rows)
         e = await make_embed(
             self.bot,
             interaction.guild_id,
-            title=f"CWL attacks · {await self._clan_name(tag)}",
+            title=f"CWL attacks · {season_title(s)}",
             description=(
-                cwl_member_table(rows, missed=True) if rows else "No CWL data recorded for this season."
+                cwl_attacks_summary(rows) + "\n" + cwl_member_table(rows, missed=True)
+                if rows
+                else "No CWL data recorded for this season."
             ),
         )
-        footer = f"CWL {cwl_season_label(s)}"
-        e.set_footer(text=footer + (f" · {plural(missed, 'missed attack')}" if missed else ""))
-        await interaction.response.send_message(embed=e)
+        await interaction.response.send_message(embed=await self._with_clan(e, tag))
 
     @cwl.command(name="stars", description="Season star leaderboard for the clan's CWL")
     @app_commands.describe(season="CWL season like 2026-11 (default: current)")
@@ -325,11 +347,14 @@ class CWL(BaseCog):
         e = await make_embed(
             self.bot,
             interaction.guild_id,
-            title=f"CWL stars · {await self._clan_name(tag)}",
-            description=cwl_member_table(rows) if rows else "No CWL data recorded for this season.",
+            title=f"CWL stars · {season_title(s)}",
+            description=(
+                cwl_stars_summary(rows) + "\n" + cwl_member_table(rows)
+                if rows
+                else "No CWL data recorded for this season."
+            ),
         )
-        e.set_footer(text=f"CWL {cwl_season_label(s)}")
-        await interaction.response.send_message(embed=e)
+        await interaction.response.send_message(embed=await self._with_clan(e, tag))
 
     @cwl.command(name="history", description="A player's round-by-round CWL attacks and defenses")
     @app_commands.describe(season="CWL season like 2026-11 (default: all recorded)")
@@ -346,10 +371,17 @@ class CWL(BaseCog):
         if len(tags) == 1:
             latest = {r["player_tag"]: r["name"] for r in reversed(rows)}  # rows are newest first
             names = latest or await war_repo.player_names(self.db, tags)
-            name = names.get(tags[0], tags[0])
+            title, url = f"{escape(names.get(tags[0], tags[0]))} ({tags[0]})", player_link(tags[0])
         else:
-            name = f"{(user or interaction.user).display_name} ({len(tags)} accounts)"
-        e = await make_embed(self.bot, interaction.guild_id, title=f"CWL history · {name}")
+            title, url = f"{escape((user or interaction.user).display_name)} ({len(tags)} accounts)", None
+        which = season_title(_season(season)) if season else "every recorded season"
+        e = await make_embed(
+            self.bot,
+            interaction.guild_id,
+            title=title[:256],
+            url=url,
+            description=f"{ICONS['cwl']} **CWL history** · {which}",
+        )
         await interaction.response.send_message(embed=fill_cwl_history(e, rows))
 
 

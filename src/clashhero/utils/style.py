@@ -8,12 +8,13 @@ Conventions:
 - **Tables** (rankings) use ``utils.fmt.table`` in a code block with a short uppercase header.
 - **Results**: ``ok_embed`` (green, ✅) and ``fail_embed`` (red, ❌) for one-line confirmations
   and errors. Keep the text short; put details in fields.
-- Separate facts with `` · ``. Use ★/☆ for stars, never numbers alone.
+- Separate facts with `` · ``. Use star icons (``_log_embeds.war_stars``) outside code blocks.
+- Game icons over plain text: ``ICONS`` resolves to the game's app emojis once uploaded.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 
 import discord
 
@@ -26,8 +27,9 @@ FAILURE = discord.Color(0xD83A3A)
 
 SEP = " · "
 
-# Category headers (standard emoji; swap for custom app emojis later if wanted).
-ICONS = {
+# Category icons: the game's own icon (an app emoji) when it's uploaded, else a standard emoji.
+# Looked up when used, since the app's emojis load after startup.
+_ICON_FALLBACKS = {
     "elixir": "🟣",
     "dark": "⚫",
     "heroes": "👑",
@@ -44,10 +46,46 @@ ICONS = {
     "games": "🎯",
     "time": "⏱️",
     "trophy": "🏆",
-    "clan": "🏳️",
+    "clan": "🏰",
     "rushed": "⚠️",
     "done": "✅",
 }
+_GAME_ICONS = {
+    "elixir": "res_elixir",
+    "dark": "res_dark_elixir",
+    "heroes": "ui_heroes",
+    "pets": "ui_pets",
+    "equipment": "ui_equipment",
+    "sieges": "ui_donate_sieges",
+    "spells": "ui_donate_spells",
+    "troops": "ui_donate_troops",
+    "war": "ui_sword",
+    "cwl": "ui_cwl_star",
+    "legend": "lt_legend_i",
+    "defense": "ui_shield",
+    "capital": "res_capital_gold",
+    "games": "ui_clan_games",
+    "time": "ui_stopwatch",
+    "trophy": "res_trophy",
+    "clan": "ui_castle",
+}
+
+
+class _Icons(Mapping[str, str]):
+    def __getitem__(self, key: str) -> str:
+        from clashhero.services.emojis import EMOJIS
+
+        game = _GAME_ICONS.get(key)
+        return (EMOJIS.get(game) if game else "") or _ICON_FALLBACKS[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(_ICON_FALLBACKS)
+
+    def __len__(self) -> int:
+        return len(_ICON_FALLBACKS)
+
+
+ICONS: Mapping[str, str] = _Icons()
 
 
 def chip(value: object, width: int | None = None, *, right: bool = True) -> str:

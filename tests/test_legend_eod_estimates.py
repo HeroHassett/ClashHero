@@ -289,9 +289,9 @@ def test_history_view_layout():
     e = history()
     assert e.title == f"K!NG ALVARO ({TAG})" and e.url.endswith("2PQ8VLYC0")
     lines = e.description.split("\n")
-    assert lines[0] == "TH18 🏆 4949"  # plain text until the emojis are uploaded
+    assert lines[0] == "Town Hall 18 · **4,949** trophies"  # plain text until the emojis are uploaded
     assert lines[1] == "**Legend Season Logs (2 Nov – 30 Nov 2026)**"
-    assert lines[2] == "• 7 attacks and 1 defense won"
+    assert lines[2] == "⚔️ **7** attacks won · 🛡️ **1** defense won"
     table = re.search(r"```\n(.*?)\n```", e.description, re.S).group(1).split("\n")
     assert table[0].split() == ["DAY", "ATK", "DEF", "+/-", "INIT", "FINAL"]
     assert table[1].split() == ["1", "+258⁸", "-120⁴", "+138", "5000", "5018"]
@@ -303,7 +303,7 @@ def test_history_view_layout():
 def test_history_view_symbols_and_a_finished_season(monkeypatch):
     monkeypatch.setattr(EMOJIS, "_by_name", {"th18": "<:th18:1>", "lt_legend_i": "<:lt_legend_i:2>"})
     e = history(today=None)
-    assert e.description.split("\n")[0] == "<:th18:1> 18 <:lt_legend_i:2> 4949"
+    assert e.description.split("\n")[0] == "<:th18:1> Town Hall 18 · <:lt_legend_i:2> **4,949** trophies"
     assert e.footer.text == "Day 28/28 (2 Nov – 30 Nov 2026)"
 
 
@@ -328,7 +328,7 @@ def test_history_view_keeps_the_newest_days():
 def test_history_view_without_days():
     e = history(summary=repo.SeasonSummary([]))
     assert e.description.endswith("No legend days recorded for this season.")
-    assert "• 0 attacks and 0 defenses won" in e.description
+    assert "⚔️ **0** attacks won · 🛡️ **0** defenses won" in e.description
 
 
 def test_season_span_across_years():

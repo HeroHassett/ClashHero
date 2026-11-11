@@ -9,12 +9,14 @@ import discord
 from discord import app_commands
 
 from clashhero.cogs._base import BaseCog
+from clashhero.cogs._log_embeds import player_ref
 from clashhero.repos import bases as repo
+from clashhero.services.emojis import EMOJIS
 from clashhero.utils.checks import manager
-from clashhero.utils.fmt import chunk_lines, make_embed, ts
+from clashhero.utils.fmt import chunk_lines, make_embed, player_link, ts
 from clashhero.utils.resolve import ResolveError, player_autocomplete
 from clashhero.utils.seasons import cwl_season_id
-from clashhero.utils.style import SEP, chip, chip_width, ok_embed
+from clashhero.utils.style import ICONS, SEP, chip, chip_width, ok_embed
 
 TYPE_CHOICES = [
     app_commands.Choice(name=t.upper() if t == "cwl" else t.title(), value=t) for t in repo.BASE_TYPES
@@ -37,31 +39,59 @@ async def get_base_or_fail(interaction: discord.Interaction, name: str):
     return row
 
 
+TYPE_ICONS = {"war": "war", "cwl": "cwl", "legend": "legend"}  # keys into ICONS
+
+
+def type_label(base_type: str) -> str:
+    """The base type with its game icon: ``⚔️ War``, ``🏆 CWL``."""
+    icon = ICONS[TYPE_ICONS[base_type]] if base_type in TYPE_ICONS else ""
+    label = base_type.upper() if base_type == "cwl" else base_type.title()
+    return f"{icon} {label}".strip()
+
+
+def th_cell(level: int, width: int | None = None) -> str:
+    """The Town Hall's game icon, else a ``TH16`` chip padded to ``width`` so a list lines up."""
+    return EMOJIS.town_hall(level) or chip(f"TH{level}", width)
+
+
 def base_list_line(r, th_width: int | None = None) -> str:
-    """One /bases list row: ``` `TH16` **Ring** · war · used `2×` · [link]```."""
-    th = chip(f"TH{r['town_hall']}", th_width)
+    """One /bases list row: ``<th16> **Ring** · ⚔️ War · used **2×** · [Copy base](link)``."""
     uses = r["uses"]
-    parts = [f"{th} **{r['name']}**", r["type"], f"used {chip(f'{uses}×')}" if uses else "unused"]
+    parts = [
+        f"{th_cell(r['town_hall'], th_width)} **{r['name']}**",
+        type_label(r["type"]),
+        f"used **{uses}×**" if uses else "unused",
+    ]
     if repo.is_copy_link(r["link"]):
-        parts.append(f"[link]({r['link']})")
+        parts.append(f"[Copy base]({r['link']})")
     return SEP.join(parts)
 
 
 def usage_line(r, th_width: int | None = None) -> str:
-    """One /bases usage row: round, base, who used it and when."""
+    """One /bases usage row: round, base, who used it (linked to their profile) and when."""
     rnd = f"R{r['war_round']}" if r["war_round"] else "R?"
-    who = r["player_name"] or r["player_tag"] or "—"
-    th = chip(f"TH{r['town_hall']}", th_width)
-    return SEP.join((f"`{rnd}` {th} **{r['base_name']}**", who, ts(r["used_at"], "d")))
+    tag = r["player_tag"]
+    if not tag:
+        who = "—"
+    elif r["player_name"]:
+        who = player_ref(r["player_name"], tag)
+    else:
+        who = f"[{tag}]({player_link(tag)})"
+    head = f"`{rnd}` {th_cell(r['town_hall'], th_width)} **{r['base_name']}**"
+    return SEP.join((head, who, ts(r["used_at"], "d")))
 
 
 def render_base_card(base, color: discord.Color, uses_this_cwl: int | None = None) -> discord.Embed:
-    embed = discord.Embed(title=f"TH{base['town_hall']} · {base['name']}", color=color)
-    embed.add_field(
-        name="Type", value=base["type"].upper() if base["type"] == "cwl" else base["type"].title()
+    """A posted base: its name as the title, the Town Hall (game icon) and type, notes and the
+    screenshot."""
+    th = base["town_hall"]
+    th_icon = EMOJIS.town_hall(th)
+    head = f"{th_icon} **Town Hall {th}**" if th_icon else f"**Town Hall {th}**"
+    embed = discord.Embed(
+        title=base["name"], description=f"{head}{SEP}{type_label(base['type'])}", color=color
     )
     if uses_this_cwl is not None:
-        embed.add_field(name="Used this CWL", value=str(uses_this_cwl))
+        embed.add_field(name="Used this CWL", value=f"**{uses_this_cwl}×**")
     if base["notes"]:
         embed.add_field(name="Notes", value=base["notes"][:1024], inline=False)
     if base["image_url"]:
@@ -233,7 +263,7 @@ class Bases(BaseCog):
         where = f" in round {war_round}" if war_round else ""
         warn = "\n⚠️ It had already been used this CWL." if uses > 1 else ""
         await interaction.response.send_message(
-            embed=ok_embed(f"Marked **{base['name']}** as used{where}{SEP}{chip(f'{uses}×')} this CWL.{warn}")
+            embed=ok_embed(f"Marked **{base['name']}** as used{where}{SEP}**{uses}×** this CWL.{warn}")
         )
 
     @bases.command(name="unuse", description="Undo the latest usage of a base this CWL")

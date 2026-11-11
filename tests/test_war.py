@@ -8,10 +8,12 @@ from clashhero.cogs._war_embeds import (
     history_embed,
     lineup_embed,
     period_bounds,
-    th_matchup,
+    th_columns,
     war_overview_embed,
 )
 from clashhero.repos import war as wr
+from clashhero.services.emojis import EMOJIS
+from clashhero.utils.fmt import clan_link, player_link
 
 NOW = datetime(2026, 11, 7, 12, tzinfo=UTC)
 
@@ -318,6 +320,7 @@ def fake_war(state="inWar"):
     ours = NS(
         tag="#C",
         name="Us",
+        badge=NS(url="https://badge/us.png"),
         stars=5,
         destruction=60.0,
         attacks_used=3,
@@ -329,6 +332,7 @@ def fake_war(state="inWar"):
     theirs = NS(
         tag="#O",
         name="Them",
+        badge=NS(url="https://badge/them.png"),
         stars=2,
         destruction=40.0,
         attacks_used=2,
@@ -353,31 +357,197 @@ def fake_war(state="inWar"):
 def test_war_embeds():
     color = discord.Color.blue()
     e = war_overview_embed(fake_war(), "#C", color)
-    assert e.title == "Us vs Them"
-    status, score, attacks = e.description.split("\n")
-    assert status.startswith("**Battle day** · 2v2 · ends <t:")
-    assert score == "⚔️ 5★ – 2★ · 60.0% – 40.0%"
-    assert attacks == "🗡️ `3/4` – `2/4` attacks"
-    assert e.fields[0].name == "Town Halls"
-    prep = war_overview_embed(fake_war("preparation"), "#C", color)
-    assert "battle day starts <t:" in prep.description and "★" not in prep.description
+    # Our clan (badge, linked) as the author; the opponent linked in the title, its badge as the thumbnail.
+    assert (e.author.name, e.author.url, e.author.icon_url) == ("Us", clan_link("#C"), "https://badge/us.png")
+    assert (e.title, e.url, e.thumbnail.url) == ("War vs Them", clan_link("#O"), "https://badge/them.png")
+    state, timer = e.description.split("\n")
+    assert state == "**Battle day** · 2 vs 2"
+    assert timer.startswith("▲ Winning · ends <t:")
+    # A column per clan, ours first and named: score, attacks, then Town Halls lined up row for row.
+    assert [(f.name, f.inline) for f in e.fields] == [("Us", True), ("Them", True)]
+    assert e.fields[0].value.split("\n") == [
+        "★ **5** · 60.00%",
+        "⚔️ **3**/4 attacks",
+        "",
+        "TH16 **1**",
+        "TH15 **1**",
+    ]
+    assert e.fields[1].value.split("\n") == [
+        "★ **2** · 40.00%",
+        "⚔️ **2**/4 attacks",
+        "",
+        "TH16 **2**",
+        "TH15 –",
+    ]
+
+    prep = war_overview_embed(fake_war("preparation"), "#C", color, label="CWL round 3")
+    assert prep.title == "CWL round 3 vs Them"
+    assert prep.description.split("\n")[1].startswith("Battle day starts <t:")
+    assert "★" not in prep.fields[0].value and prep.fields[0].value == "TH16 **1**\nTH15 **1**"
+
+    ended = war_overview_embed(fake_war("warEnded"), "#C", color)
+    assert ended.description.startswith("▲ **Victory** · 2 vs 2\nEnded <t:")
+
     lineup = lineup_embed(fake_war(), "#C", color)
+    assert lineup.title == "War lineup vs Them" and lineup.author.name == "Us"
     assert "Alice" in lineup.description and "★★★" in lineup.description
 
 
-def test_th_matchup():
+def test_war_overview_icons(monkeypatch):
+    icons = ("ui_war_star", "ui_sword", "ui_arrow_down", "th15", "th16")
+    monkeypatch.setattr(EMOJIS, "_by_name", {n: f"<:{n}:1>" for n in icons})
     w = fake_war()
-    assert th_matchup(w.opponent.members, w.clan.members) == "`TH16` `1` – `2`\n`TH15` `1` – `0`"
-    assert th_matchup([], []) == "—"
+    w.opponent.stars = 1  # we're behind now
+    e = war_overview_embed(w, "#C", discord.Color.blue())
+    assert e.description.split("\n")[1].startswith("<:ui_arrow_down:1> Losing · ends <t:")
+    assert e.fields[0].value.split("\n") == [
+        "<:ui_war_star:1> **1** · 60.00%",
+        "<:ui_sword:1> **3**/4 attacks",
+        "",
+        "<:th16:1> **1**",
+        "<:th15:1> **1**",
+    ]
+    assert "`" not in e.description + "".join(f.value for f in e.fields)  # icons never go in code
+
+
+def test_th_columns():
+    w = fake_war()
+    assert th_columns(w.opponent.members, w.clan.members) == (
+        ["TH16 **1**", "TH15 **1**"],
+        ["TH16 **2**", "TH15 –"],
+    )
+    assert th_columns([], []) == ([], [])
 
 
 async def test_history_embed(db, seeded):
     h = await wr.player_war_history(db, ["#A"])
-    e = history_embed("Alice", "all time", h, discord.Color.blue())
-    assert e.description == "⚔️ 1 war · all time"
-    offense, defense, buckets, recent = (f.value for f in e.fields)
-    assert offense.split("\n")[0] == "`    2` hits"  # chips padded to the widest value (90.0%)
-    assert "`  50%` 3★ rate (1)" in offense
-    assert defense.split("\n")[0] == "`   1` times attacked"
-    assert buckets.split("\n")[0] == "`up  ` `1` hits · `100%` 3★"
-    assert recent.split("\n") == ["★★☆ ` 80%` TH16→TH16 · Opp", "★★★ `100%` TH16→TH17 · Opp"]
+    e = history_embed("Alice", "all time", h, discord.Color.blue(), tag="#A")
+    assert (e.title, e.url) == ("Alice (#A)", player_link("#A"))
+    assert e.description == "⚔️ **War history** · all time · **1** war"
+    offense, defense, rates, recent = (f.value for f in e.fields)
+    assert [f.name for f in e.fields] == ["Offense", "Defense", "Three-star rate", "Recent attacks"]
+    assert offense.split("\n") == ["⚔️ **2** attacks", "★ **2.50** avg stars", "**90.0%** avg destruction"]
+    assert defense.split("\n") == [
+        "🛡️ **1** times attacked",
+        "**100%** held, not tripled",
+        "★ **1.00** avg stars allowed",
+    ]
+    assert rates.split("\n") == [
+        "★★★ **50%** of all attacks (1/2)",
+        "**50%** as the first hit on a base (1/2)",
+        "**100%** against a higher Town Hall (1/1)",
+        "**0%** against the same Town Hall (0/1)",
+        "**–** against a lower Town Hall (0/0)",
+    ]
+    assert recent.split("\n") == ["★★☆ **80%** TH16 → TH16 vs Opp", "★★★ **100%** TH16 → TH17 vs Opp"]
+    several = history_embed("Ann (2 accounts)", "all time", h, discord.Color.blue())
+    assert (several.title, several.url) == ("Ann (2 accounts)", None)
+
+
+async def test_history_embed_icons(db, seeded, monkeypatch):
+    icons = ("ui_star_old", "ui_star_new", "ui_star_empty", "ui_arrow_down", "th16", "th17")
+    monkeypatch.setattr(EMOJIS, "_by_name", {n: f"<:{n}:1>" for n in icons})
+    await db.execute("UPDATE war_attacks SET new_stars = 1 WHERE attack_order = 2")  # 1 of its 2 stars new
+    h = await wr.player_war_history(db, ["#A"])
+    h.offense.missed = 1
+    e = history_embed("Alice", "all time", h, discord.Color.blue(), tag="#A")
+    assert "<:ui_arrow_down:1> **1** missed" in e.fields[0].value
+    # Silver for a star an earlier attack already took, gold for new ones, empty for the rest.
+    assert e.fields[3].value.split("\n")[0] == (
+        "<:ui_star_old:1><:ui_star_new:1><:ui_star_empty:1> **80%** <:th16:1> → <:th16:1> vs Opp"
+    )
+
+
+# ------------------------------------------------------------------ commands
+
+
+class Sent:
+    def __init__(self):
+        self.sent = []
+
+    async def defer(self, **kwargs):
+        pass
+
+    async def send(self, content=None, **kwargs):
+        self.sent.append({"content": content, **kwargs})
+
+    async def send_message(self, content=None, **kwargs):
+        self.sent.append({"content": content, **kwargs})
+
+
+def interaction_for(db, coc=None):
+    from clashhero.cogs.war import War
+
+    bot = NS(db=db, coc=coc)
+    reply = Sent()
+    interaction = NS(client=bot, guild_id=1, channel_id=10, user=NS(id=5), response=reply, followup=reply)
+    return War(bot), interaction, reply.sent
+
+
+async def test_remaining_pings_in_the_message_when_asked(db):
+    from clashhero.cogs.war import War
+
+    w = fake_war()
+    w.opponent.attacks = [NS(attacker_tag="#A")]  # Alice has 1 left, Bob 2
+    await db.link_player("#B", 77)
+    await db.add_guild_clan(1, "#C")  # the server's only clan, so the command picks it
+
+    class Coc:
+        async def get_current_war(self, tag):
+            return w
+
+    cog, interaction, sent = interaction_for(db, Coc())
+    await War.remaining.callback(cog, interaction, None, True)
+    [msg] = sent
+    assert msg["content"] == "<@77>"  # mentions inside an embed never notify
+    assert msg["allowed_mentions"].users is True
+    assert "**2.** TH15 Bob <@77>" in msg["embed"].description
+    assert msg["embed"].author.name == "Us"
+    await War.remaining.callback(cog, interaction, None, False)
+    assert sent[1]["content"] is None and "<@" not in sent[1]["embed"].description
+
+
+async def test_war_log_command(db):
+    from clashhero.cogs.war import War
+
+    entry = NS(
+        result=NS(value="win"),
+        end_time=NS(time=NOW),
+        team_size=15,
+        is_league_entry=False,
+        clan=NS(name="Us", stars=40, destruction=99.0, badge=NS(url="https://badge/us.png")),
+        opponent=NS(name="Them", stars=30, destruction=80.0),
+    )
+
+    class Coc:
+        async def get_war_log(self, tag, limit):
+            return [entry]
+
+    cog, interaction, sent = interaction_for(db, Coc())
+    await War.log.callback(cog, interaction, "#2PP", 10)
+    e = sent[0]["embed"]
+    assert e.title == "War log"
+    assert (e.author.name, e.author.icon_url) == (
+        "Us",
+        "https://badge/us.png",
+    )  # untracked: the log's own clan
+    assert [f.name for f in e.fields] == ["▲ Victory vs Them (15 vs 15)"]
+
+
+async def test_calls_show_the_clan_from_the_clan_row_for_old_wars(db, seeded):
+    from clashhero.cogs.war import War
+
+    await db.add_guild_clan(1, "#C")
+    await db.execute(
+        "INSERT INTO clans (clan_tag, name, badge_url, updated_at) "
+        "VALUES ('#C', 'Heroes', 'https://b/h.png', 'x')"
+    )
+    await db.execute("UPDATE wars SET state = 'inWar' WHERE id = ?", (seeded,))
+    await wr.set_caller(db, 1, seeded, 2, player_tag="#A", user_id=5, note=None, assigned_by=5)
+    cog, interaction, sent = interaction_for(db)
+    await War.caller_list.callback(cog, interaction, None)
+    e = sent[0]["embed"]
+    assert (e.author.name, e.author.icon_url) == ("Heroes", "https://b/h.png")
+    assert e.title == "War calls vs Opp"
+    assert e.description == "**2.** TH16 Yan ★★☆ → **Alice** <@5>"  # Alice took 2★ on Yan
+    assert e.footer.text == "1 of 2 bases claimed"

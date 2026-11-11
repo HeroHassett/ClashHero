@@ -151,12 +151,47 @@ def test_autorole_result_text():
         "allow_non_family": 0,
         "only_verified_clan_roles": 1,
     }
-    assert settings_text(s) == (
-        "Auto update ✅ · Removal delay `24h` · Allow not linked ❌\n"
-        "Non-family accounts count ❌ · Verified-only clan roles ✅"
-    )
-    assert sync_text(2, 1) == "Roles synced · `+2` added · `-1` removed."
+    assert settings_text(s).split("\n") == [
+        "✅ Auto update",
+        "⏱️ Removal delay **24h**",
+        "❌ Allow not linked",
+        "❌ Non-family accounts count",
+        "✅ Verified-only clan roles",
+    ]
+    assert sync_text(2, 1) == "Roles synced.\n▲ **2** added · ▼ **1** removed"
     assert (
         sync_text(0, 0, "<@1>", True)
-        == "Roles synced for <@1> · `+0` added · `-0` removed · nickname updated."
+        == "Roles synced for <@1>.\n▲ **0** added · ▼ **0** removed · nickname updated"
     )
+
+
+def test_autorole_list_lines(monkeypatch):
+    from clashhero.cogs.autoroles import _mapping_order, mapping_line
+    from clashhero.services.emojis import EMOJIS
+
+    monkeypatch.setattr(EMOJIS, "_by_name", {"th16": "<:th16:1>", "lt_crystal_league_ii": "<:lt_c2:2>"})
+    names = {"#C": "Alpha"}
+
+    def lines(*maps):
+        return [mapping_line(m, names) for m in sorted(maps, key=_mapping_order)]
+
+    assert lines(
+        Mapping("town_hall", "", "9", 1), Mapping("town_hall", "", "16", 2), Mapping("town_hall", "", "10", 3)
+    ) == [
+        "<:th16:1>**16** → <@&2>",
+        "TH **10** → <@&3>",
+        "TH **9** → <@&1>",
+    ]
+    assert lines(Mapping("clan_role", "#C", "member", 1), Mapping("clan_role", "#C", "coLeader", 2)) == [
+        "**Alpha** · Co-Leader → <@&2>",
+        "**Alpha** · Member → <@&1>",
+    ]
+    assert lines(Mapping("clan_role", "#GONE", "everyone", 4)) == ["**#GONE** · Everyone → <@&4>"]
+    assert (
+        mapping_line(Mapping("league", "", "crystal league ii", 5), names)
+        == "<:lt_c2:2> **Crystal League II** → <@&5>"
+    )
+    assert mapping_line(Mapping("trophy_band", "", "5200-5249", 6), names) == "🏆 **5,200–5,249** → <@&6>"
+    assert mapping_line(Mapping("builder_hall", "", "10", 7), names) == "BH **10** → <@&7>"
+    assert mapping_line(Mapping("family", "", "linked", 8), names) == "**Account linked** → <@&8>"
+    assert mapping_line(Mapping("war", "#C", "war", 9), names) == "⚔️ **Alpha** → <@&9>"

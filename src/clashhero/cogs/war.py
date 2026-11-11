@@ -14,20 +14,26 @@ from clashhero.cogs._war_embeds import (
     WAR_TYPE_CHOICES,
     attack_rank_table,
     attack_totals,
+    calls_embed,
     defense_rank_table,
     defense_totals,
     history_embed,
     lineup_embed,
     period_bounds,
+    plural,
+    remaining_embed,
     resolve_player_tags,
+    set_clan,
+    side_badge,
     state_value,
     stats_footer,
+    war_log_embed,
     war_overview_embed,
     war_sides,
 )
 from clashhero.repos import war as war_repo
 from clashhero.utils.checks import has_permission, require
-from clashhero.utils.fmt import guild_color, make_embed, stars, ts
+from clashhero.utils.fmt import guild_color, make_embed
 from clashhero.utils.resolve import (
     ResolveError,
     clan_autocomplete,
@@ -36,8 +42,6 @@ from clashhero.utils.resolve import (
     resolve_clans,
     resolve_player,
 )
-
-RESULT_ICON = {"win": "🟢", "lose": "🔴", "tie": "⚪"}
 
 
 class War(BaseCog):
@@ -93,24 +97,15 @@ class War(BaseCog):
         attacks = [{"attacker_tag": a.attacker_tag} for a in (ours.attacks or [])]
         left = war_repo.remaining_attacks(members, attacks, per)
         links = await self.db.links_for_tags([m["tag"] for m, _ in left]) if mention else {}
-        lines = [
-            f"`{m['map_position']:>2}` TH{m['town_hall']} {discord.utils.escape_markdown(m['name'])}"
-            f" — {n} left" + (f" <@{links[m['tag']]}>" if m["tag"] in links else "")
-            for m, n in left
-        ]
-        state = state_value(w)
-        when = "starts" if state == "preparation" else "ends"
-        t = w.start_time if state == "preparation" else w.end_time
-        e = await make_embed(
-            self.bot,
-            interaction.guild_id,
-            title=f"Remaining attacks · {ours.name}",
-            description=(
-                f"War {when} {ts(getattr(t, 'time', t))}\n\n"
-                + ("\n".join(lines) or "Everyone has attacked! 🎉")
-            )[:4096],
+        e = await make_embed(self.bot, interaction.guild_id, title="Remaining attacks")
+        remaining_embed(e, w, tag, left, links)
+        # Mentions inside an embed never notify anyone, so the pings go in the message itself.
+        pings = " ".join(dict.fromkeys(f"<@{links[m['tag']]}>" for m, _ in left if m["tag"] in links))
+        await interaction.followup.send(
+            content=pings[:2000] or None,
+            embed=e,
+            allowed_mentions=discord.AllowedMentions(users=mention),
         )
-        await interaction.followup.send(embed=e, allowed_mentions=discord.AllowedMentions(users=mention))
 
     @war.command(name="log", description="Recent war results from the in-game war log")
     @app_commands.autocomplete(clan=clan_autocomplete)
@@ -122,27 +117,14 @@ class War(BaseCog):
     ) -> None:
         tag = await resolve_clan(interaction, clan, must_be_tracked=False)
         await interaction.response.defer()
-        entries = await self.coc.get_war_log(tag, limit=count)
-        lines = []
-        for e in list(entries)[:count]:
-            res = str(getattr(e.result, "value", e.result) or "")
-            end = getattr(e.end_time, "time", None)
-            if getattr(e, "is_league_entry", False):
-                lines.append(f"🏆 CWL · {e.clan.stars}★ · {ts(end)}")
-                continue
-            icon = RESULT_ICON.get(res, "▫️")
-            opp = discord.utils.escape_markdown(e.opponent.name or "?")
-            lines.append(
-                f"{icon} {e.team_size}v{e.team_size} vs **{opp}**"
-                f" · {e.clan.stars}-{e.opponent.stars}★ · {e.clan.destruction:.1f}%-"
-                f"{e.opponent.destruction:.1f}% · {ts(end)}"
-            )
+        entries = list(await self.coc.get_war_log(tag, limit=count))[:count]
         clan_row = await self.db.get_clan_row(tag)
-        title = f"War log · {clan_row['name'] if clan_row else tag}"
-        e = await make_embed(
-            self.bot, interaction.guild_id, title=title, description="\n".join(lines) or "No wars in the log."
-        )
-        await interaction.followup.send(embed=e)
+        ours = entries[0].clan if entries else None  # the log's own clan
+        name = (clan_row["name"] if clan_row else None) or getattr(ours, "name", None) or tag
+        badge = (clan_row["badge_url"] if clan_row else None) or side_badge(ours)
+        e = await make_embed(self.bot, interaction.guild_id, title="War log")
+        war_log_embed(e, entries)
+        await interaction.followup.send(embed=set_clan(e, name, tag, badge))
 
     @war.command(name="history", description="A player's war performance (hit rate, 3★%, defense)")
     @app_commands.describe(
@@ -170,7 +152,8 @@ class War(BaseCog):
             else f"{(user or interaction.user).display_name} ({len(tags)} accounts)"
         )
         color = await guild_color(self.bot, interaction.guild_id)
-        await interaction.response.send_message(embed=history_embed(name, label, h, color))
+        tag = tags[0] if len(tags) == 1 else None
+        await interaction.response.send_message(embed=history_embed(name, label, h, color, tag=tag))
 
     # ------------------------------------------------------------------ /caller
 
@@ -243,7 +226,7 @@ class War(BaseCog):
             ):
                 raise ResolveError("Only the person who claimed that base (or a manager) can clear it.")
         n = await war_repo.clear_caller(self.db, interaction.guild_id, w["id"], position)
-        msg = f"Cleared {n} claim(s)."
+        msg = f"Cleared {plural(n, 'claim')}."
         await interaction.response.send_message(msg, embed=await self._callers_embed(interaction, w))
 
     @caller.command(name="list", description="Show claimed bases in the current war")
@@ -261,21 +244,20 @@ class War(BaseCog):
             if not a["is_opponent"]:
                 best[a["defender_tag"]] = max(best.get(a["defender_tag"], 0), a["stars"])
         names = await war_repo.player_names(self.db, [c["player_tag"] for c in callers if c["player_tag"]])
-        lines = []
-        for c in callers:
-            enemy = enemies.get(c["position"])
-            base = f"TH{enemy['town_hall']} {discord.utils.escape_markdown(enemy['name'])}" if enemy else "?"
-            got = best.get(enemy["player_tag"], 0) if enemy else 0
-            who = names.get(c["player_tag"], "") if c["player_tag"] else ""
-            who = f"{who} <@{c['user_id']}>" if c["user_id"] else who
-            note = f" — _{c['note']}_" if c["note"] else ""
-            lines.append(f"`{c['position']:>2}` {base} {stars(got) if got else ''} → {who}{note}")
-        return await make_embed(
-            self.bot,
-            interaction.guild_id,
-            title=f"Calls · vs {w['opponent_name']}",
-            description="\n".join(lines) or "No bases claimed yet. Use `/caller assign`.",
-        )
+        e = await make_embed(self.bot, interaction.guild_id)
+        calls_embed(e, w, callers, enemies, best, names)
+        name, badge = w.get("clan_name"), w.get("clan_badge_url")
+        if not name or not badge:  # wars stored before the clan's name and badge were
+            row = await self.db.get_clan_row(w["clan_tag"])
+            name = name or (row["name"] if row else None)
+            badge = badge or (row["badge_url"] if row else None)
+        return set_clan(e, name, w["clan_tag"], badge)
+
+    async def _one_clan(self, e: discord.Embed, tags: list[str]) -> discord.Embed:
+        """With a single clan, show it (badge and name) on the stats embed."""
+        if len(tags) == 1 and (row := await self.db.get_clan_row(tags[0])):
+            set_clan(e, row["name"], tags[0], row["badge_url"])
+        return e
 
     # ------------------------------------------------------------------ /stats
 
@@ -315,7 +297,7 @@ class War(BaseCog):
             ),
         )
         e.set_footer(text=stats_footer(war_type.name if war_type else None, label, wars, town_hall))
-        await interaction.response.send_message(embed=e)
+        await interaction.response.send_message(embed=await self._one_clan(e, tags))
 
     @stats.command(name="defense", description="War defense hold rates per player")
     @app_commands.describe(
@@ -351,7 +333,7 @@ class War(BaseCog):
             ),
         )
         e.set_footer(text=stats_footer(war_type.name if war_type else None, label, wars, town_hall))
-        await interaction.response.send_message(embed=e)
+        await interaction.response.send_message(embed=await self._one_clan(e, tags))
 
 
 async def setup(bot) -> None:

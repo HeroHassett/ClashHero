@@ -3,6 +3,7 @@ import pytest
 
 from clashhero.cogs._roster_views import render_roster_embed
 from clashhero.repos import rosters as repo
+from clashhero.utils.fmt import clan_link
 
 
 def roster_row(**kw):
@@ -141,11 +142,18 @@ def test_sort_and_csv_and_embed():
         "sort_by": "th",
     }
     groups = [{"id": 1, "name": "Confirmed"}, {"id": 2, "name": "Substitute"}]
-    e = render_roster_embed(roster, groups, rows, "My Clan", discord.Color.blue())
-    assert e.title == "CWL · My Clan"
-    assert "2/15" in e.description and "Closed" in e.description and "TH 14" in e.description
+    e = render_roster_embed(
+        roster, groups, rows, "My Clan", discord.Color.blue(), badge_url="https://b/c.png"
+    )
+    assert e.title == "CWL"
+    assert e.author.name == "My Clan" and e.author.icon_url == "https://b/c.png"
+    assert e.author.url == clan_link("#C")
+    info = e.description.split("\n")
+    assert info[0] == "🏆 CWL roster · **2/15** signed up"
+    assert info[1] == "Requirements: TH **14+**" and info[-1] == "🔒 **Closed**: no self signups"
     assert [f.name for f in e.fields] == ["Confirmed (1)", "Substitute (1)"]
-    assert "<@5>" in e.fields[0].value
+    assert e.fields[0].value == "` 1.` `TH15` b 👑**200** `#A` <@5>"
+    assert e.fields[1].value == "` 2.` `TH16` a 👑**100** `#B`"
 
 
 async def test_signup_rules_end_to_end(db):
@@ -477,9 +485,9 @@ def test_roster_list_line():
         "closed": 1,
         "autoping_end_hours": 6,
     }
-    assert roster_list_line(r, 5) == "` 3/15` **CWL main** · CWL · #C · 🔔 · 🔒"
-    plain = {**r, "clan_name": "Clan", "closed": 0, "autoping_end_hours": None}
-    assert roster_list_line(plain) == "`3/15` **CWL main** · CWL · Clan"
+    assert roster_list_line(r, 5) == "` 3/15` **CWL main** · 🏆 CWL · #C · 🔔 · 🔒"
+    plain = {**r, "clan_name": "Clan", "closed": 0, "autoping_end_hours": None, "category": "esports"}
+    assert roster_list_line(plain) == "`3/15` **CWL main** · 🎮 E-Sports · Clan"
 
 
 def test_signup_result_embeds():
@@ -514,6 +522,88 @@ def test_roster_result_helpers():
     applied = views.apply_embed("CWL", "**Confirmed**\nSigned up: A")
     assert applied.description == "✅ Lineup applied to **CWL**.\n\n**Confirmed**\nSigned up: A"
     moved = move_embed(["#A"], ["#B (destination full)"], "Subs")
-    assert moved.color == SUCCESS and moved.description == "✅ Moved `1` to **Subs**."
+    assert moved.color == SUCCESS and moved.description == "✅ Moved **1** to **Subs**."
     assert moved.fields[0].name == "Not moved (1)" and moved.fields[0].value == "#B (destination full)"
     assert move_embed([], ["#B"], "Subs").color == FAILURE
+
+
+ROSTER = {
+    "id": 4,
+    "name": "CWL main",
+    "clan_tag": "#C",
+    "category": "cwl",
+    "max_members": 65,
+    "min_th": 14,
+    "max_th": 16,
+    "min_heroes": 250,
+    "start_time": "2026-11-08T08:00:00+00:00",
+    "end_time": "2026-11-07T15:00:00+00:00",
+    "closed": 0,
+    "color": None,
+    "sort_by": "th",
+}
+
+
+def _member(i: int, th: int = 16) -> dict:
+    return {
+        "player_tag": f"#P{i:03}",
+        "name": f"Player_{i}",
+        "town_hall": th,
+        "heroes_total": 300,
+        "signed_up_at": str(i),
+        "group_id": 1,
+        "user_id": 100000000000000000 + i,
+        "trophies": 5000,
+    }
+
+
+def test_roster_embed_uses_game_icons(monkeypatch):
+    from clashhero.services.emojis import EMOJIS
+
+    icons = {"th14": "<:th14:14>", "th16": "<:th16:16>", "ui_heroes": "<:ui_heroes:9>"}
+    icons |= {"ui_cwl_star": "<:ui_cwl_star:8>", "ui_stopwatch": "<:ui_stopwatch:7>"}
+    monkeypatch.setattr(EMOJIS, "_by_name", icons)
+    e = render_roster_embed(
+        ROSTER, [{"id": 1, "name": "Confirmed"}], [_member(1)], "Clan", discord.Color.blue()
+    )
+    info = e.description.split("\n")
+    assert info[0] == "<:ui_cwl_star:8> CWL roster · **1/65** signed up"
+    assert (
+        info[1] == "Requirements: <:th14:14>**14** – <:th16:16>**16** · <:ui_heroes:9> **250+** hero levels"
+    )
+    assert info[2].startswith("<:ui_stopwatch:7> Starts <t:") and " · signups close <t:" in info[2]
+    # names are escaped so markdown in them can't break the line
+    assert (
+        e.fields[0].value == "` 1.` <:th16:16> Player\\_1 <:ui_heroes:9>**300** `#P001` <@100000000000000001>"
+    )
+
+
+def test_big_roster_drops_icons_to_fit(monkeypatch):
+    from clashhero.services.emojis import EMOJIS
+
+    monkeypatch.setattr(
+        EMOJIS, "_by_name", {"th16": "<:th16:1234567890123456789>", "ui_heroes": "<:ui_heroes:1>"}
+    )
+    groups = [{"id": 1, "name": "Confirmed"}]
+    small = render_roster_embed(ROSTER, groups, [_member(i) for i in range(15)], "Clan", discord.Color.blue())
+    assert "<:th16:" in small.fields[0].value
+    big = render_roster_embed(ROSTER, groups, [_member(i) for i in range(65)], "Clan", discord.Color.blue())
+    assert len(big) <= 6000 and "<:th16:" not in "".join(f.value for f in big.fields)
+    assert "`TH16` Player\\_0 · 300h `#P000`" in big.fields[0].value
+
+
+def test_roster_change_embed():
+    from clashhero.cogs._roster_views import change_embed
+
+    joined = change_embed(
+        ROSTER, "joined", ["A", "B_c"], "<@7>", signed_up=12, clan_name="Clan", badge_url="u"
+    )
+    assert joined.title == "CWL main" and joined.color == discord.Color.green()
+    assert joined.description == "▲ **A**, **B\\_c** signed up\nby <@7>"
+    assert joined.author.name == "Clan" and joined.author.icon_url == "u"
+    assert joined.footer.text == "Roster #4 · 12/65 signed up"
+    left = change_embed(ROSTER, "left", ["A"], "<@7>")
+    assert left.description.startswith("▼ **A** left") and left.color == discord.Color.red()
+    assert left.author.name == "#C" and left.footer.text == "Roster #4"
+    moved = change_embed(ROSTER, "moved to Substitute", ["A"], "<@7>")
+    assert moved.description.startswith("**A** moved to Substitute") and moved.color == discord.Color.blue()

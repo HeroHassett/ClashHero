@@ -100,3 +100,17 @@ def test_record_lines_align_counts():
         "`    3` links",
     ]
     assert record_lines({}) == []
+
+
+def test_account_line(monkeypatch):
+    from clashhero.cogs.privacy import account_line, fit_lines
+    from clashhero.services.emojis import EMOJIS
+    from clashhero.utils.fmt import player_link
+
+    row = {"player_tag": "#P", "name": "Ann", "town_hall": 16, "verified": 1}
+    assert account_line(row) == f"[Ann]({player_link('#P')}) `#P` · ✅ verified"
+    monkeypatch.setattr(EMOJIS, "_by_name", {"th16": "<:th16:1>"})
+    assert account_line({**row, "verified": 0}) == f"<:th16:1> [Ann]({player_link('#P')}) `#P`"
+    assert account_line({**row, "name": None, "town_hall": None}).startswith(f"[#P]({player_link('#P')}) ·")
+    fitted = fit_lines([f"line {i:03}" for i in range(300)], 100)
+    assert len(fitted) <= 100 and fitted.endswith("more") and fitted.startswith("line 000\n")

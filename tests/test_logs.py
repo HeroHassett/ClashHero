@@ -70,8 +70,107 @@ def test_missed_attacks():
     missed = E.missed_attacks(members, attacks, 2)
     assert [(m["player_tag"], used) for m, used in missed] == [("#B", 1), ("#C", 0)]
     embed = E.missed_attacks_embed(WAR, missed, 2)
-    assert [f.name for f in embed.fields] == ["2 missed", "1 missed"]
-    assert E.missed_attacks_embed(WAR, [], 2).description.startswith("Everyone")
+    assert [f.name for f in embed.fields] == ["▼ 2 attacks missed", "▼ 1 attack missed"]
+    assert embed.fields[0].value == f"**3.** [C]({player_link('#C')})"
+    assert "Everyone used all their attacks" in E.missed_attacks_embed(WAR, [], 2).description
+
+
+CWL_WAR = {
+    **WAR,
+    "war_type": "cwl",
+    "cwl_round": 7,
+    "clan_tag": "#2J8VGUCV2",
+    "clan_name": "Aurora",
+    "clan_badge_url": "https://badge/ours.png",
+    "opponent_tag": "#OPP",
+    "opponent_name": "VN WAR_PRO",
+    "opponent_badge_url": "https://badge/theirs.png",
+    "team_size": 15,
+    "attacks_per_member": 1,
+    "clan_stars": 42,
+    "opponent_stars": 39,
+    "clan_destruction": 95.333,
+    "opponent_destruction": 90.1,
+    "clan_attacks": 14,
+}
+
+
+def test_war_attack_post(monkeypatch):
+    from clashhero.services.emojis import EMOJIS
+
+    icons = {
+        n: f"<:{n}:1>" for n in ("ui_sword", "ui_star_old", "ui_star_new", "ui_star_empty", "ui_war_star")
+    }
+    monkeypatch.setattr(EMOJIS, "_by_name", {**icons, "th18": "<:th18:1>"})
+    attack = {
+        "is_opponent": 0,
+        "attacker_tag": "#LVL",
+        "defender_tag": "#SK",
+        "attacker_pos": 15,
+        "defender_pos": 13,
+        "attacker_th": 18,
+        "defender_th": 18,
+        "stars": 2,
+        "new_stars": 1,
+        "is_fresh": 0,
+        "destruction": 88.0,
+    }
+    at = datetime(2026, 11, 11, 6, 37, tzinfo=UTC)
+    e = E.war_attack_embed(CWL_WAR, attack, "lvl", "SKING", at=at)
+    line, result = e.description.split("\n")
+    assert line == (
+        f"<:ui_sword:1> **15.** [lvl]({player_link('#LVL')}) <:th18:1>"
+        f"  →  **13.** [SKING]({player_link('#SK')}) <:th18:1>"
+    )
+    assert result == "<:ui_star_old:1><:ui_star_new:1><:ui_star_empty:1> **88%**"  # 1 old, 1 new, 1 missed
+    assert (e.author.name, e.author.icon_url) == ("Aurora", "https://badge/ours.png")
+    assert [(f.name, f.value) for f in e.fields] == [
+        ("Aurora", "<:ui_war_star:1> **42** · 95.33%"),  # ours first, named
+        ("VN WAR_PRO", "<:ui_war_star:1> **39** · 90.10%"),
+    ]
+    assert e.footer.text == "vs VN WAR_PRO · CWL round 7 · 14/15 attacks"
+    assert (e.footer.icon_url, e.timestamp, e.color) == ("https://badge/theirs.png", at, E.GREEN)
+    fresh = E.war_attack_embed(CWL_WAR, {**attack, "is_fresh": 1, "is_opponent": 1}, "SKING", "lvl")
+    assert fresh.description.endswith("· first hit on this base") and fresh.color == E.RED
+
+
+def test_war_state_posts():
+    prep = E.war_state_embed(CWL_WAR, "preparation")
+    assert prep.title == "CWL round 7 vs VN WAR_PRO" and prep.url.endswith("tag=OPP")
+    assert prep.thumbnail.url == "https://badge/theirs.png" and prep.author.name == "Aurora"
+    assert prep.description.startswith("**Preparation day** · 15 vs 15") and not prep.fields
+    battle = E.war_state_embed(CWL_WAR, "inWar")
+    assert battle.description.startswith("**Battle day**") and len(battle.fields) == 2
+    won = E.war_state_embed(CWL_WAR, "warEnded")
+    assert "**Victory**" in won.description and won.color == E.GREEN
+    lost = E.war_state_embed({**CWL_WAR, "result": "lose"}, "warEnded")
+    assert "**Defeat**" in lost.description and lost.color == E.RED
+
+
+def test_only_fresh_war_days_are_announced():
+    started = datetime(2026, 11, 10, 8, 0, tzinfo=UTC)
+    war = {**CWL_WAR, "start_time": started.isoformat(), "preparation_start": started.isoformat()}
+    assert E.state_is_news(war, "inWar", started + timedelta(minutes=5))
+    assert not E.state_is_news(war, "inWar", started + timedelta(hours=22))  # noticed after a restart
+    assert not E.state_is_news(war, "preparation", started + timedelta(hours=2))
+    assert E.state_is_news(war, "warEnded", started + timedelta(days=3))  # a result is always news
+    assert E.state_is_news({**CWL_WAR, "start_time": None}, "inWar", started)
+
+
+def test_lineup_post():
+    e = E.cwl_lineup_embed(
+        "2026-11",
+        [E.LineupPlayer("Alice", "#A", 16)],
+        [E.LineupPlayer("Bob", "#B")],
+        clan_name="Aurora",
+        clan_tag="#C",
+        badge_url="https://badge",
+    )
+    assert e.author.name == "Aurora" and e.author.icon_url == "https://badge"
+    assert [(f.name, f.value) for f in e.fields] == [
+        ("▲ Added", f"TH16 [Alice]({player_link('#A')})"),
+        ("▼ Removed", f"[Bob]({player_link('#B')})"),
+    ]
 
 
 def test_embed_builders_smoke():
@@ -98,7 +197,7 @@ def test_embed_builders_smoke():
         E.war_preference_embed("Alice", "#A", False),
         E.league_change_embed("Alice", "#A", None, "Legend League", 5000),
         E.donations_embed("Clan", "#C", [E.Donation("Alice", 20, 0), E.Donation("Bob", 0, 15)]),
-        E.clan_games_progress_embed("Clan", [("Alice", 200, 1200)]),
+        E.clan_games_progress_embed("Clan", [E.GamesProgress("Alice", "#A", 200, 1200)]),
         E.war_attack_embed(WAR, attack, "Alice", "Xeno"),
         E.war_attack_embed(
             {**WAR, "war_type": "cwl", "cwl_round": 3}, {**attack, "is_opponent": 1}, "X", "A"
@@ -106,7 +205,7 @@ def test_embed_builders_smoke():
         E.war_state_embed(WAR, "preparation"),
         E.war_state_embed(WAR, "inWar"),
         E.war_state_embed(WAR, "warEnded"),
-        E.cwl_lineup_embed("2026-11", ["Alice (TH16)"], []),
+        E.cwl_lineup_embed("2026-11", [E.LineupPlayer("Alice", "#A", 16)], []),
         E.capital_contribution_embed("Alice", "#A", 5000),
         E.raid_attack_embed("Alice", 2, 4000, 4, 6),
         E.raid_summary_embed(
@@ -289,7 +388,7 @@ def test_upgrades_embed_groups_by_player():
     ]
     [embed] = E.upgrades_embeds("Clan", entries)
     desc = embed.description
-    assert embed.title == "Clan upgrades"
+    assert embed.title == "Upgrades" and embed.author.name == "Clan"
     # Most upgrades first; heroes before spells inside a player's block.
     assert desc.index("Alice") < desc.index("Bob")
     assert desc.index("Barbarian King 90 → **91**") < desc.index("Overgrowth Spell unlocked")
@@ -306,7 +405,7 @@ def test_upgrades_embeds_split_when_long():
     ]
     embeds = E.upgrades_embeds("Clan", entries)
     assert len(embeds) > 1
-    assert embeds[0].title == f"Clan upgrades (1/{len(embeds)})"
+    assert embeds[0].title == f"Upgrades (1/{len(embeds)})"
     joined = "\n".join(e.description for e in embeds)
     for e in embeds:
         assert len(e.description) <= 4000
@@ -316,18 +415,122 @@ def test_upgrades_embeds_split_when_long():
     # A player's block isn't split across embeds when it fits.
     for e in embeds:
         for block in e.description.split("\n\n"):
-            assert block.startswith("**[Player")
-            assert block.count("• ") == 10
+            assert block.startswith("TH16 **[Player")  # Town Hall, then the linked name
+            assert block.count("• ") == 10  # units without an icon get a bullet
 
 
 def test_super_troops_embeds():
     [embed] = E.super_troops_embeds("Clan", [("Bob", "#B", ["Super Archer"]), ("Al", "#A", ["A", "B"])])
     assert embed.description.splitlines() == [
-        "**Al** boosted **A**, **B**",
-        "**Bob** boosted **Super Archer**",
+        f"**[Al]({player_link('#A')})** boosted **A**, **B**",
+        f"**[Bob]({player_link('#B')})** boosted **Super Archer**",
     ]
+    assert embed.title == "Super troop boosts" and embed.author.name == "Clan"
     assert embed.footer.text == "3 boosts"
     assert E.super_troops_embeds("Clan", [("Bob", "#B", [])]) == []
+
+
+def test_player_posts(monkeypatch):
+    from clashhero.services.emojis import EMOJIS
+
+    icons = {"th17": "<:th17:1>", "th18": "<:th18:2>", "ui_arrow_up": "<:up:3>", "ui_arrow_down": "<:down:4>"}
+    monkeypatch.setattr(EMOJIS, "_by_name", icons)
+    at = datetime(2026, 11, 11, 8, 0, tzinfo=UTC)
+    ctx = E.PlayerContext(
+        town_hall=17, league="Legend I", trophies=5227, clan_name="Aurora", badge_url="b", at=at
+    )
+    renamed = E.name_change_embed("#A", "Old_*", "New", ctx)
+    assert renamed.title == "New (#A)" and renamed.url == player_link("#A")
+    assert renamed.description.startswith("Changed their name from **Old\\_\\***")
+    assert "<:th17:1>" in renamed.description  # Town Hall and trophies from the stored profile
+    assert (renamed.footer.text, renamed.footer.icon_url, renamed.timestamp) == ("Aurora", "b", at)
+    th = E.town_hall_embed("Al", "#A", 17, 18, ctx)
+    assert th.description.split("\n")[:2] == [
+        "<:up:3> Upgraded to **Town Hall 18** · was 17",
+        "<:th17:1> → <:th18:2>",
+    ]
+    assert th.description.count("<:th17:1>") == 1  # the profile line doesn't repeat the old Town Hall
+    assert E.war_preference_embed("Al", "#A", True, ctx).description.startswith("<:up:3> Opted **in**")
+    out = E.war_preference_embed("Al", "#A", False)
+    assert (
+        out.description == "<:down:4> Opted **out** of war" and out.color == E.RED and out.footer.text is None
+    )
+    up = E.league_change_embed("Al", "#A", "Legend II", "Legend I", 5000, ctx)
+    assert up.description.startswith("<:up:3> Promoted to **Legend I**") and up.color == E.GREEN
+    assert "was Legend II" in up.description and "**5,000**" in up.description
+    down = E.league_change_embed("Al", "#A", "Legend I", "Legend II", 4800)
+    assert down.description.startswith("<:down:4> Dropped to") and down.color == E.RED
+    assert E.league_change_embed("Al", "#A", None, "Legend I", 5000).description.startswith("Now in")
+
+
+async def test_player_logs_post_with_context_and_a_profile_button(cog, sent, db):
+    await cog.on_clash_name_change(ev.NameChanged("#C", "#A", "Old", "New"))
+    assert sent == []  # nobody follows the log
+    await db.set_clan_log(1, "#C", "name_change", 100)
+    await db.set_clan_log(1, "#C", "town_hall", 100)
+    await cog.on_clash_name_change(ev.NameChanged("#C", "#A", "Old", "New"))
+    await cog.on_clash_town_hall_upgrade(ev.TownHallUpgraded("#C", "#A", "New", 16, 17))
+    await cog.on_clash_war_preference(ev.WarPreferenceChanged("#C", "#A", "New", True))  # not followed
+    assert [(c[2], c[3].title, c[4].children[0].url) for c in sent] == [
+        ("name_change", "New (#A)", player_link("#A")),
+        ("town_hall", "New (#A)", player_link("#A")),
+    ]
+    assert sent[0][3].footer.text == "#C" and sent[0][3].timestamp is not None
+
+
+def test_clan_posts(monkeypatch):
+    from clashhero.services.emojis import EMOJIS
+
+    icons = {
+        "ui_arrow_up": "<:up:1>",
+        "ui_arrow_down": "<:down:2>",
+        "cwl_crystal_iii": "<:c3:3>",
+        "cwl_gold_i": "<:g1:4>",
+        "ui_clan_games": "<:cg:5>",
+        "th16": "<:th16:6>",
+        "res_capital_gold": "<:gold:7>",
+        "res_raid_medal": "<:medal:8>",
+    }
+    monkeypatch.setattr(EMOJIS, "_by_name", icons)
+    level = E.clan_attribute_embed("Aurora", "#C", "level", 20, 21, badge_url="b")
+    assert level.description == "<:up:1> Clan level: **21**\nwas 20" and level.color == E.GREEN
+    assert (level.author.name, level.author.icon_url) == ("Aurora", "b")
+    league = E.clan_attribute_embed("Aurora", "#C", "war_league", "Crystal League III", "Gold League I")
+    assert (
+        league.description
+        == "<:down:2> War League: <:g1:4> **Gold League I**\nwas <:c3:3> Crystal League III"
+    )
+    assert league.color == E.RED
+
+    games = E.clan_games_progress_embed(
+        "Aurora",
+        [E.GamesProgress("Bo", "#B", 50, 900), E.GamesProgress("Al", "#A", 300, 4000, 16)],
+        clan_tag="#C",
+    )
+    assert games.title == "<:cg:5> Clan Games progress" and games.author.name == "Aurora"
+    assert games.description.split("\n") == [
+        f"<:th16:6> **+300** [Al]({player_link('#A')}) · 4,000/4,000 <:up:1>",  # maxed
+        f"**+50** [Bo]({player_link('#B')}) · 900/4,000",
+    ]
+
+    gave = E.capital_contribution_embed("Al", "#A", 12_000)
+    assert gave.title == "Al (#A)" and gave.description == "Contributed <:gold:7> **12,000** Capital Gold"
+    raid = E.raid_attack_embed("Al", 2, 4000, 6, 6, tag="#A")
+    assert raid.title == "Al (#A)" and "**2** attacks · <:gold:7> **4,000** looted" in raid.description
+    summary = E.raid_summary_embed(
+        "Aurora",
+        {
+            "total_loot": 1_234_567,
+            "attack_count": 150,
+            "districts_destroyed": 50,
+            "offensive_reward": 1200,
+            "defensive_reward": 300,
+        },
+        [{"name": "Al", "loot": 24_000, "attacks": 6, "attack_limit": 6}],
+        clan_tag="#C",
+    )
+    assert summary.description.split("\n")[0] == "<:gold:7> **1,234,567** Capital Gold looted"
+    assert summary.fields[0].value == "**1.** Al · <:gold:7> **24,000** · 6/6"
 
 
 def test_clan_settings_embed():
@@ -364,11 +567,11 @@ def test_clan_settings_embed():
 
 def test_clan_move_embed_and_profile_view():
     ours = E.clan_move_embed("Alice", "#A", "Old Clan", "New Clan", "#NEW", own_clan=True)
-    assert "**Alice** (left Old Clan) is now in" in ours.description
-    assert "New Clan" in ours.description and "(#NEW)" in ours.description
-    assert "this server's clans" in ours.description
+    assert ours.title == "Alice (#A)" and ours.url == player_link("#A")
+    assert ours.description.startswith("Left **Old Clan** · now in **[New Clan](")
+    assert "`#NEW`" in ours.description and "this server's clans" in ours.description
     theirs = E.clan_move_embed("Alice", "#A", "Old Clan", None, "#NEW")
-    assert "this server" not in theirs.description and "[#NEW]" in theirs.description
+    assert "this server" not in theirs.description and "[\\#NEW]" in theirs.description  # no name: the tag
     [button] = E.profile_view("#A").children
     assert button.label == "Profile"
     assert button.style is discord.ButtonStyle.link
@@ -446,15 +649,16 @@ async def test_upgrades_and_boosts_are_batched_per_clan(cog, sent):
     assert "Overgrowth Spell unlocked" in upgrades
     assert "Hog Rider 11 → **12**" in upgrades
     assert "Zed" not in upgrades
-    assert sent[0][3].title == "#C upgrades"  # clan not in the DB: falls back to the tag
-    assert sent[1][3].description == "**Alice** boosted **Super Archer**"
+    assert sent[0][3].author.name == "#C"  # clan not in the DB: falls back to the tag
+    assert sent[1][3].description == f"**[Alice]({player_link('#A')})** boosted **Super Archer**"
 
     sent.clear()
     await cog.flush_now()
     assert sent == []
 
 
-async def test_clan_settings_log(cog, sent):
+async def test_clan_settings_log(cog, sent, db):
+    await db.set_clan_log(1, "#C", "clan_settings", 100)
     await cog.on_clash_clan_settings(ev.ClanSettingsChanged("#C", "Clan", (("type", "open", "closed"),)))
     [(_, tag, log_type, embed, _)] = sent
     assert (tag, log_type) == ("#C", "clan_settings")
@@ -554,7 +758,7 @@ async def test_clan_move_follow_up_marks_own_clans(cog, sent, db):
     assert "this server's clans" in by_channel[100].description
     assert "this server" not in by_channel[200].description
     assert by_channel[200].color.value == 0x123456
-    assert "(left #OLD)" in by_channel[100].description  # clan name unknown: tag
+    assert "Left **\\#OLD**" in by_channel[100].description  # clan name unknown: tag
     assert sent[0][4].children[0].label == "Profile"
 
 
@@ -600,7 +804,7 @@ async def test_failed_edit_posts_the_move_instead(cog, sent, db):
     sent.clear()
     await cog.on_clash_player_clan_changed(ev.PlayerClanChanged("#A", "Alice", "#OLD", "#X", "X"))
     assert [(c[0], c[1]) for c in sent] == [("channel", 100), ("edit", 200)]
-    assert "is now in" in sent[0][3].description
+    assert "now in" in sent[0][3].description
 
 
 async def test_move_seen_before_the_leave_goes_into_the_leave_post(cog, sent, db):

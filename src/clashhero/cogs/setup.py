@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Sequence
 
 import discord
 from discord import app_commands
+from discord.utils import escape_markdown
 
 from clashhero.cogs._base import BaseCog
+from clashhero.cogs.logs import embed_pages, log_field_name
+from clashhero.constants import CLAN_LOG_TYPES, LIVE_KINDS, SERVER_LOG_TYPES
 from clashhero.utils.checks import has_permission, manager
-from clashhero.utils.fmt import make_embed
+from clashhero.utils.fmt import clan_link, guild_color, make_embed
 from clashhero.utils.resolve import ResolveError, clan_autocomplete, parse_tag, resolve_clan
 from clashhero.utils.style import SEP, chip, fail_embed, ok_embed
 
@@ -46,6 +50,59 @@ def clan_linked_text(name: str, tag: str, channel_mention: str | None = None) ->
     """Confirmation for /setup clan: what was linked and the next step."""
     default = f" Default clan for {channel_mention}." if channel_mention else ""
     return f"Linked **{name}** `{tag}` to this server.{default}\nNext: `/logs clan` to pick log channels."
+
+
+def _ordered(kinds: set[str], order: dict[str, str]) -> list[str]:
+    """Log or live kinds in the order the bot lists them, unknown ones last."""
+    known = list(order)
+    return sorted(kinds, key=lambda k: (known.index(k) if k in known else len(known), k))
+
+
+def setup_list_embeds(
+    rows: Sequence, logs: Sequence, live: Sequence, channels: Sequence, server_logs: Sequence, color
+) -> list[discord.Embed]:
+    """/setup list: an embed per clan with its badge beside its name (linked to it in game), its
+    alias and category, the channels it's the default clan for, its logs and live messages; then
+    the server's own logs."""
+    embeds = []
+    for r in rows:
+        tag = r["clan_tag"]
+        e = discord.Embed(color=color)
+        e.set_author(name=f"{r['name'] or tag} ({tag})", url=clan_link(tag), icon_url=r["badge_url"] or None)
+        lines = []
+        meta = [
+            f"Alias {chip(r['alias'])}" if r["alias"] else "",
+            f"Category **{r['category']}**" if r["category"] else "",
+        ]
+        if any(meta):
+            lines.append(SEP.join(x for x in meta if x))
+        chans = [f"<#{c['channel_id']}>" for c in channels if c["clan_tag"] == tag]
+        if chans:
+            lines.append(f"📍 Default clan in {', '.join(chans)}")
+        clan_logs = _ordered({lg["log_type"] for lg in logs if lg["clan_tag"] == tag}, CLAN_LOG_TYPES)
+        if clan_logs:
+            lines.append(f"📜 **{len(clan_logs)}** logs: " + ", ".join(log_field_name(k) for k in clan_logs))
+        else:
+            lines.append("📜 No logs yet: `/logs clan`")
+        clan_live = _ordered({lv["kind"] for lv in live if lv["scope"] == tag}, LIVE_KINDS)
+        if clan_live:
+            lines.append("📡 Live: " + ", ".join(LIVE_KINDS.get(k, k) for k in clan_live))
+        e.description = "\n".join(lines)[:4000]
+        embeds.append(e)
+    if not rows:
+        embeds.append(
+            discord.Embed(
+                title="Server setup", description="No clans linked yet. Use `/setup clan`.", color=color
+            )
+        )
+    if server_logs:
+        kinds = {s["log_type"]: s for s in server_logs}
+        lines = [
+            f"{log_field_name(k, SERVER_LOG_TYPES)} → <#{kinds[k]['channel_id']}>"
+            for k in _ordered(set(kinds), SERVER_LOG_TYPES)
+        ]
+        embeds.append(discord.Embed(title="Server logs", description="\n".join(lines)[:4000], color=color))
+    return embeds
 
 
 async def is_clan_leader(bot, user_id: int, clan_tag: str) -> bool:
@@ -93,9 +150,11 @@ class Setup(BaseCog):
         if channel is not None:
             await self.db.set_channel_clan(channel.id, interaction.guild_id, clan.tag)
         await self.collector.refresh_clan_now(clan.tag)
-        await interaction.followup.send(
-            embed=ok_embed(clan_linked_text(clan.name, clan.tag, channel.mention if channel else None))
-        )
+        embed = ok_embed(clan_linked_text(clan.name, clan.tag, channel.mention if channel else None))
+        badge = getattr(getattr(clan, "badge", None), "url", None)
+        if badge:
+            embed.set_thumbnail(url=badge)
+        await interaction.followup.send(embed=embed)
 
     @setup_group.command(name="remove-clan", description="Unlink a clan and all its features")
     @app_commands.autocomplete(clan=clan_autocomplete)
@@ -137,40 +196,11 @@ class Setup(BaseCog):
         live = await self.db.fetchall("SELECT * FROM live_messages WHERE guild_id = ?", (gid,))
         channels = await self.db.fetchall("SELECT * FROM channel_clans WHERE guild_id = ?", (gid,))
         server_logs = await self.db.fetchall("SELECT * FROM server_logs WHERE guild_id = ?", (gid,))
-        embed = await make_embed(self.bot, gid, title="Server setup")
-        if not rows:
-            embed.description = "No clans linked yet. Use `/setup clan`."
-        for r in rows[:20]:
-            tag = r["clan_tag"]
-            clan_logs = sorted({lg["log_type"] for lg in logs if lg["clan_tag"] == tag})
-            clan_live = sorted({lv["kind"] for lv in live if lv["scope"] == tag})
-            chans = [f"<#{c['channel_id']}>" for c in channels if c["clan_tag"] == tag]
-            lines = [
-                SEP.join(
-                    x
-                    for x in (
-                        f"Alias {chip(r['alias'])}" if r["alias"] else None,
-                        f"Category **{r['category']}**" if r["category"] else None,
-                    )
-                    if x
-                )
-                or None,
-                f"📍 Default in {', '.join(chans)}" if chans else None,
-                f"📜 Logs: {SEP.join(clan_logs)}" if clan_logs else "📜 Logs: none",
-                f"📡 Live: {SEP.join(clan_live)}" if clan_live else None,
-            ]
-            embed.add_field(
-                name=f"{r['name'] or '?'} ({tag})",
-                value="\n".join(x for x in lines if x)[:1024],
-                inline=False,
-            )
-        if server_logs:
-            embed.add_field(
-                name="Server logs",
-                value="\n".join(f"{s['log_type']} → <#{s['channel_id']}>" for s in server_logs)[:1024],
-                inline=False,
-            )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        embeds = setup_list_embeds(rows, logs, live, channels, server_logs, await guild_color(self.bot, gid))
+        pages = embed_pages(embeds)
+        await interaction.response.send_message(embeds=pages[0], ephemeral=True)
+        for page in pages[1:]:
+            await interaction.followup.send(embeds=page, ephemeral=True)
 
     # ------------------------------------------------------------------ /alias
 
@@ -242,9 +272,8 @@ class Setup(BaseCog):
         rows = await self.db.get_guild_clan_rows(interaction.guild_id)
         groups: dict[str, list[str]] = {}
         for r in rows:
-            groups.setdefault(r["category"] or "Uncategorized", []).append(
-                f"{r['name'] or '?'} (`{r['clan_tag']}`)"
-            )
+            name = escape_markdown(r["name"] or "?")
+            groups.setdefault(r["category"] or "Uncategorized", []).append(f"**{name}** `{r['clan_tag']}`")
         embed = await make_embed(self.bot, interaction.guild_id, title="Clan categories")
         for name, clans in groups.items():
             embed.add_field(name=f"{name} ({len(clans)})", value="\n".join(clans)[:1024], inline=False)

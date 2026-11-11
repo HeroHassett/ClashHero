@@ -109,7 +109,7 @@ def test_week_embed():
     days = [WeekDay(f"2026-11-0{2 + i}", 3000, 3040, DayStats("#P", [40], [], cap=None)) for i in range(7)]
     e = week_embed(name="P", tag="#P", league="Legend II", week_id="2026-11-02", days=days, weekly_cap=30)
     fields = {f.name: f.value for f in e.fields}
-    assert fields["Attacks"] == "7/30" and fields["Net"] == "+280"
+    assert fields["Attacks"] == "**7/30** · ▲ **+280**" and fields["Net"] == "▲ **+280**"
 
 
 async def test_day_caps_follow_tier(db):

@@ -8,8 +8,10 @@ import discord
 from discord import app_commands
 
 from clashhero.cogs._base import BaseCog
+from clashhero.cogs._log_embeds import clan_author, th_icon
+from clashhero.services.emojis import EMOJIS
 from clashhero.services.snapshots import active_super_troops
-from clashhero.utils.fmt import chunk_lines, clan_link, guild_color
+from clashhero.utils.fmt import chunk_lines, guild_color
 from clashhero.utils.resolve import clan_autocomplete, resolve_clan
 
 # Discord caps an embed at 6000 chars in total; leave room for title/description/footer.
@@ -37,14 +39,19 @@ def boosts_embeds(
     boosted: int,
     members: int,
     color: discord.Color | int | None = None,
+    *,
+    badge_url: str | None = None,
 ) -> list[discord.Embed]:
-    """One field per super troop listing who has it active, split across embeds when needed."""
+    """One field per super troop (its icon, name and how many have it) listing who has it
+    active with their Town Hall icon; the clan (badge, linked) as the author. Split across embeds
+    when needed."""
     fields: list[tuple[str, str]] = []
     for troop, players in by_troop.items():
-        lines = [f"TH{th} · {discord.utils.escape_markdown(name)}" for name, th in players]
+        lines = [f"{th_icon(th)} {discord.utils.escape_markdown(name)}".strip() for name, th in players]
+        icon = EMOJIS.unit(troop)
         for i, chunk in enumerate(chunk_lines(lines, 1000)):
             label = f"{troop} ({len(players)})" if i == 0 else f"{troop} (cont.)"
-            fields.append((label, chunk.rstrip("\n") or "—"))
+            fields.append((f"{icon} {label}" if icon else label, chunk.rstrip("\n") or "—"))
 
     if by_troop:
         desc = f"**{boosted}** of {members} members have a super troop active."
@@ -65,11 +72,11 @@ def boosts_embeds(
     for i, page in enumerate(pages, 1):
         suffix = f" ({i}/{len(pages)})" if len(pages) > 1 else ""
         e = discord.Embed(
-            title=f"{clan_name} super troop boosts{suffix}",
-            url=clan_link(clan_tag),
+            title=f"Super troop boosts{suffix}",
             description=desc if i == 1 else None,
             color=color,
         )
+        clan_author(e, clan_name, clan_tag, badge_url)
         for name, value in page:
             e.add_field(name=name, value=value, inline=True)
         e.set_footer(text=clan_tag)
@@ -94,7 +101,8 @@ class Boosts(BaseCog):
         by_troop = group_boosts(players)
         boosted = sum(1 for _, _, troops in players if troops)
         color = await guild_color(self.bot, interaction.guild_id)
-        embeds = boosts_embeds(c.name, c.tag, by_troop, boosted, len(players), color)
+        badge = getattr(getattr(c, "badge", None), "url", None)
+        embeds = boosts_embeds(c.name, c.tag, by_troop, boosted, len(players), color, badge_url=badge)
         for embed in embeds:
             await interaction.followup.send(embed=embed)
 

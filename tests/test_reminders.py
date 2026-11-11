@@ -31,6 +31,9 @@ def test_build_messages():
     msgs = build_messages("Attack!", [("Clan", pending)], {"#A": 1, "#B": 1}, True)
     text = "".join(msgs)
     assert "<@1> Alice 1/2, Bob 0/2" in text and "Not linked: Cara 0/2" in text
+    assert "\n**Clan** · **3** remaining\n" in text
+    with_icon = "".join(build_messages("Attack!", [("Clan", pending)], {}, True, icon="<:ui_sword:1>"))
+    assert with_icon.startswith("Attack!\n<:ui_sword:1> **Clan** · **3** remaining\n")
     assert build_messages("Attack!", [("Clan", pending)], {}, False) == ["Attack!"]
     assert build_messages("Attack!", [("Clan", [])], {}, True) == []
     # role filter drops user 1 entirely
@@ -233,7 +236,11 @@ def test_reminder_block():
         "clans": "#A #B",
         "message": "Attack!",
     }
-    assert reminder_block(row) == "`#3` ⚔️ **Clan War** · `2h` before the end\n<#55> · `#A` `#B`\n> Attack!"
+    assert (
+        reminder_block(row) == "`#3` ⚔️ **Clan War** · ⏱️ **2h** before the end\n<#55> · `#A`, `#B`\n> Attack!"
+    )
+    named = reminder_block(row, {"#A": "Alpha_1"})
+    assert named.splitlines()[1] == "<#55> · **Alpha\\_1**, `#B`"
     filtered = reminder_block({**row, "type": "raid", "clans": "", "min_th": 14})
     assert filtered.splitlines()[0].startswith("`#3` 🏰 **Capital Raid Weekend**")
     assert filtered.splitlines()[1] == "<#55>"

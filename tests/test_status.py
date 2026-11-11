@@ -7,7 +7,7 @@ import pytest
 from test_collector import NOW, setup  # noqa: F401
 
 from clashhero.cogs._log_embeds import maintenance_embed
-from clashhero.cogs.status import presence_for, status_fields
+from clashhero.cogs.status import presence_for, status_fields, tracking_text
 from clashhero.utils.fmt import duration, maintenance_notice, make_embed
 
 
@@ -39,6 +39,8 @@ def test_status_fields():
     )
     assert "maintenance" in fields["Clash of Clans API"] and "1h 12m" in fields["Clash of Clans API"]
     assert "waiting for first update" in fields["Last updated"]
+    assert fields["Last updated"].split("\n")[0] == f"🏰 Clans & donations: <t:{int(now.timestamp())}:R>"
+    assert fields["Last updated"].split("\n")[2] == "⚔️ Wars & CWL: waiting for first update"
     fields = dict(status_fields(in_maintenance=False, maintenance_since=None, last_success={}, now=now))
     assert fields["Clash of Clans API"] == "✅ Online"
 
@@ -78,3 +80,7 @@ async def test_collector_tracks_maintenance_window(setup):  # noqa: F811
     events = [e for n, e in bot.events if n == "clash_maintenance"]
     assert [e.started for e in events] == [True, False]
     assert events[1].since is not None and not col.in_maintenance
+
+
+def test_tracking_text():
+    assert tracking_text(12, 3400) == "🏰 **12** clans · **3,400** players"

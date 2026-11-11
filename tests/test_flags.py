@@ -8,6 +8,7 @@ import pytest
 from clashhero.cogs import flags as cog
 from clashhero.db import Database
 from clashhero.repos import flags as repo
+from clashhero.utils.fmt import player_link
 
 NOW = datetime(2026, 11, 7, tzinfo=UTC)
 
@@ -142,26 +143,59 @@ def test_flag_line_shows_weight():
         "created_by": 9,
         "created_at": NOW.isoformat(),
     }
-    assert cog.flag_line(base).startswith("`#3` ⚠️ **A** `#P1` · `×3` · missed war · by <@9>")
+    head, reason, meta = cog.flag_line(base).split("\n")
+    assert head == f"`#3` ⚠️ **Strike ×3** · [A]({player_link('#P1')}) `#P1`"
+    assert reason == "> missed war" and meta.startswith("-# by <@9> <t:")
     assert "×" not in cog.flag_line({**base, "weight": 1})
-    assert "⛔" in cog.flag_line({**base, "flag_type": "ban", "weight": 1})
+    ban = cog.flag_line({**base, "flag_type": "ban", "weight": 1, "name": None})
+    assert ban.startswith(f"`#3` ⛔ **Ban** · [#P1]({player_link('#P1')})\n")
+    assert cog.flag_line(base, player=False).split("\n")[0] == "`#3` ⚠️ **Strike ×3**"
     expiring = cog.flag_line({**base, "reason": None, "expires_at": NOW.isoformat()})
     assert "missed war" not in expiring and expiring.endswith(":R>") and " · expires <t:" in expiring
+    assert len(expiring.split("\n")) == 2
 
 
 def test_flags_summary_counts_bans_and_strikes():
     rows = [{"flag_type": "ban"}, {"flag_type": "strike"}, {"flag_type": "strike"}]
-    assert cog.flags_summary(rows) == "⛔ `1` ban · ⚠️ `2` strikes"
-    assert cog.flags_summary([]) == "⛔ `0` bans · ⚠️ `0` strikes"
+    assert cog.flags_summary(rows) == "⛔ **1** ban · ⚠️ **2** strikes"
+    assert cog.flags_summary([]) == "⛔ **0** bans · ⚠️ **0** strikes"
 
 
 def test_summary_line_pads_total():
     r = {"total": 7, "name": "A", "player_tag": "#P1", "strikes": 3, "last_strike": NOW.isoformat()}
     line = cog.summary_line(1, {**r, "banned": 0}, width=2)
-    assert line.startswith("` 1.` ` 7` **A** `#P1` · 3 strikes · last <t:")
+    assert line.startswith(f"` 1.` ` 7` [A]({player_link('#P1')}) `#P1` · 3 strikes, latest <t:")
     assert "banned" not in line
     assert cog.summary_line(2, {**r, "strikes": 1, "banned": 1}).endswith(" · ⛔ banned")
-    assert "1 strike ·" in cog.summary_line(2, {**r, "strikes": 1, "banned": 0})
+    assert "1 strike, latest" in cog.summary_line(2, {**r, "strikes": 1, "banned": 0})
+
+
+def test_fit_blocks_notes_what_is_left_out():
+    blocks = [f"line {i:03}" for i in range(1000)]
+    kept = cog.fit_blocks(blocks, 600)
+    assert len("\n".join(kept)) <= 600
+    assert kept[-1].startswith("-# … ") and kept[-1].endswith("Narrow it down with the filters.")
+    assert int(kept[-1].split()[2]) == 1000 - (len(kept) - 1)
+    assert cog.fit_blocks(["a", "b"]) == ["a", "b"]
+    assert cog.fit_blocks(blocks, 600, hint="See `/flag list`.")[-1].endswith(
+        "more not shown. See `/flag list`."
+    )
+
+
+def test_long_reasons_are_cut():
+    r = {
+        "id": 1,
+        "flag_type": "ban",
+        "weight": 1,
+        "expires_at": None,
+        "reason": "x" * 1000,
+        "name": "A",
+        "player_tag": "#P1",
+        "created_by": 9,
+        "created_at": NOW.isoformat(),
+    }
+    reason = cog.flag_line(r).split("\n")[1]
+    assert len(reason) == 302 and reason.endswith("…")
 
 
 def test_dm_embed():
@@ -176,7 +210,8 @@ def test_dm_embed():
         total=5,
     )
     fields = {f.name: f.value for f in e.fields}
-    assert "strike" in e.title and fields["Weight"] == "2" and fields["Active strike total"] == "5"
+    assert "strike" in e.title and fields["Weight"] == "**2**" and fields["Active strike total"] == "**5**"
+    assert e.description == f"Account: [A]({player_link('#P1')}) `#P1`"
     assert fields["Expires"] == "Never" and fields["Reason"] == "No reason given."
     ban = cog.dm_embed(
         guild_name="Family",
@@ -230,6 +265,10 @@ class _Channel:
 
 async def test_join_alert_still_fires_with_strike_total(db):
     await db.add_guild_clan(1, "#C")
+    await db.execute(
+        "INSERT INTO clans (clan_tag, name, badge_url, updated_at) "
+        "VALUES ('#C', 'Clan', 'https://b/c.png', 'x')"
+    )
     await db.set_server_log(1, "flag_alert", 50)
     await repo.create_flag(db, 1, "#P1", "strike", "late", 9, datetime.now(UTC), weight=4)
     await repo.create_flag(db, 1, "#P1", "ban", None, 9, datetime.now(UTC))
@@ -240,9 +279,13 @@ async def test_join_alert_still_fires_with_strike_total(db):
     await flags.on_clash_member_join(NS(clan_tag="#C", clan_name="Clan", member=member, member_count=10))
     assert len(channel.sent) == 1
     embed = channel.sent[0]["embed"]
+    assert embed.title == "A (#P1)" and embed.url == player_link("#P1")
+    assert embed.author.name == "Clan" and embed.author.icon_url == "https://b/c.png"
+    assert embed.description.split("\n") == ["🚩 Joined **Clan** with **2** active flags", "TH **16**"]
     fields = {f.name: f.value for f in embed.fields}
-    assert "`×4`" in fields["Flags"] and "⛔" in fields["Flags"]
-    assert fields["Active strike total"] == "4"
+    assert "**Strike ×4**" in fields["Flags"] and "⛔ **Ban**" in fields["Flags"]
+    assert "#P1" not in fields["Flags"]  # the title already says who
+    assert fields["Active strike total"] == "⚠️ **4**"
     # Not flagged: no alert.
     await flags.on_clash_member_join(
         NS(clan_tag="#C", clan_name="Clan", member=NS(tag="#P2", name="B", town_hall=15), member_count=11)

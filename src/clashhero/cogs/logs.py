@@ -322,24 +322,32 @@ class Logs(BaseCog):
             if by_player:
                 await self._post_donations(clan_tag, by_player)
         for clan_tag, by_player in games.items():
-            entries = [tuple(v) for v in by_player.values()]
-            if entries:
-                await send_clan_log(
-                    self.bot,
-                    clan_tag,
-                    "clan_games",
-                    E.clan_games_progress_embed(self._clan_names.get(clan_tag, clan_tag), entries),
-                )
+            if by_player:
+                await self._post_clan_games(clan_tag, by_player)
         for clan_tag, by_player in upgrades.items():
             entries = [
                 (name, tag, th, [(kind, unit, old, new) for (kind, unit), (old, new) in changes.items()])
                 for tag, (name, th, changes) in by_player.items()
             ]
-            for embed in E.upgrades_embeds(self._clan_names.get(clan_tag, clan_tag), entries):
+            embeds = E.upgrades_embeds(
+                self._clan_names.get(clan_tag, clan_tag),
+                entries,
+                clan_tag=clan_tag,
+                badge_url=await self._badge(clan_tag),
+                at=datetime.now(UTC),
+            )
+            for embed in embeds:
                 await send_clan_log(self.bot, clan_tag, "upgrades", embed)
         for clan_tag, by_player in boosts.items():
             entries = [(name, tag, troops) for tag, (name, troops) in by_player.items()]
-            for embed in E.super_troops_embeds(self._clan_names.get(clan_tag, clan_tag), entries):
+            embeds = E.super_troops_embeds(
+                self._clan_names.get(clan_tag, clan_tag),
+                entries,
+                clan_tag=clan_tag,
+                badge_url=await self._badge(clan_tag),
+                at=datetime.now(UTC),
+            )
+            for embed in embeds:
                 await send_clan_log(self.bot, clan_tag, "super_troops", embed)
 
     @flush_batches.error
@@ -357,23 +365,57 @@ class Logs(BaseCog):
 
     @commands.Cog.listener()
     async def on_clash_clan_change(self, e: ev.ClanAttributeChanged) -> None:
-        await send_clan_log(
-            self.bot,
+        if not await self.db.clan_log_targets(e.clan_tag, "clan_achievements"):
+            return
+        embed = E.clan_attribute_embed(
+            e.clan_name,
             e.clan_tag,
-            "clan_achievements",
-            E.clan_attribute_embed(e.clan_name, e.clan_tag, e.attribute, e.old, e.new),
+            e.attribute,
+            e.old,
+            e.new,
+            badge_url=await self._badge(e.clan_tag),
+            at=datetime.now(UTC),
         )
+        await send_clan_log(self.bot, e.clan_tag, "clan_achievements", embed)
 
     @commands.Cog.listener()
     async def on_clash_clan_settings(self, e: ev.ClanSettingsChanged) -> None:
         self._clan_names[e.clan_tag] = e.clan_name
-        if e.changes:
-            await send_clan_log(
-                self.bot,
+        if e.changes and await self.db.clan_log_targets(e.clan_tag, "clan_settings"):
+            embed = E.clan_settings_embed(
+                e.clan_name,
                 e.clan_tag,
-                "clan_settings",
-                E.clan_settings_embed(e.clan_name, e.clan_tag, e.changes),
+                e.changes,
+                badge_url=await self._badge(e.clan_tag),
+                at=datetime.now(UTC),
             )
+            await send_clan_log(self.bot, e.clan_tag, "clan_settings", embed)
+
+    async def _town_hall(self, snap: Any, tag: str) -> int | None:
+        """A player's Town Hall: from the clan's last poll, else their stored profile."""
+        member = snap.members.get(tag) if snap is not None else None
+        if member is not None and member.town_hall:
+            return member.town_hall
+        row = await self.db.get_player_row(tag)
+        return row["town_hall"] if row else None
+
+    async def _post_clan_games(self, clan_tag: str, by_player: dict[str, list]) -> None:
+        if not await self.db.clan_log_targets(clan_tag, "clan_games"):
+            return
+        collector = getattr(self.bot, "collector", None)
+        snap = collector.clan_snapshot(clan_tag) if collector is not None else None
+        entries = [
+            E.GamesProgress(name, tag, points, total, await self._town_hall(snap, tag))
+            for tag, (name, points, total) in by_player.items()
+        ]
+        embed = E.clan_games_progress_embed(
+            self._clan_names.get(clan_tag, clan_tag),
+            entries,
+            clan_tag=clan_tag,
+            badge_url=await self._badge(clan_tag),
+            at=datetime.now(UTC),
+        )
+        await send_clan_log(self.bot, clan_tag, "clan_games", embed)
 
     async def _post_donations(self, clan_tag: str, by_player: dict[str, list]) -> None:
         """One clan's donations over the batch: who gave and who got, with each player's Town
@@ -549,6 +591,7 @@ class Logs(BaseCog):
             e.new_clan_name,
             e.new_clan_tag,
             own_clan=target["guild_id"] in own_guilds,
+            at=datetime.now(UTC),
         )
         if target["color"] is not None:
             embed.color = discord.Color(target["color"])
@@ -576,22 +619,43 @@ class Logs(BaseCog):
         )
         await send_clan_log(self.bot, e.clan_tag, "role_change", embed, view=E.profile_view(e.player_tag))
 
+    async def _player_context(self, clan_tag: str, player_tag: str) -> E.PlayerContext:
+        """The player's stored profile and clan for a player post."""
+        player = await self.db.get_player_row(player_tag)
+        return E.PlayerContext(
+            town_hall=player["town_hall"] if player else None,
+            league=player["league"] if player else None,
+            trophies=player["trophies"] if player else None,
+            clan_name=await self._clan_name(clan_tag),
+            badge_url=await self._badge(clan_tag),
+            at=datetime.now(UTC),
+        )
+
+    async def _player_log(self, clan_tag: str | None, log_type: str, tag: str, build) -> None:
+        """Post ``build(context)`` to the clan's ``log_type`` log with a Profile button, if anyone
+        follows it."""
+        if not clan_tag or not await self.db.clan_log_targets(clan_tag, log_type):
+            return
+        embed = build(await self._player_context(clan_tag, tag))
+        await send_clan_log(self.bot, clan_tag, log_type, embed, view=E.profile_view(tag))
+
     @commands.Cog.listener()
     async def on_clash_name_change(self, e: ev.NameChanged) -> None:
-        if e.clan_tag:
-            await send_clan_log(
-                self.bot, e.clan_tag, "name_change", E.name_change_embed(e.player_tag, e.old_name, e.new_name)
-            )
+        await self._player_log(
+            e.clan_tag,
+            "name_change",
+            e.player_tag,
+            lambda ctx: E.name_change_embed(e.player_tag, e.old_name, e.new_name, ctx),
+        )
 
     @commands.Cog.listener()
     async def on_clash_town_hall_upgrade(self, e: ev.TownHallUpgraded) -> None:
-        if e.clan_tag:
-            await send_clan_log(
-                self.bot,
-                e.clan_tag,
-                "town_hall",
-                E.town_hall_embed(e.name, e.player_tag, e.old_level, e.new_level),
-            )
+        await self._player_log(
+            e.clan_tag,
+            "town_hall",
+            e.player_tag,
+            lambda ctx: E.town_hall_embed(e.name, e.player_tag, e.old_level, e.new_level, ctx),
+        )
 
     @commands.Cog.listener()
     async def on_clash_units_upgraded(self, e: ev.UnitsUpgraded) -> None:
@@ -613,39 +677,55 @@ class Logs(BaseCog):
 
     @commands.Cog.listener()
     async def on_clash_war_preference(self, e: ev.WarPreferenceChanged) -> None:
-        if e.clan_tag:
-            await send_clan_log(
-                self.bot,
-                e.clan_tag,
-                "war_preference",
-                E.war_preference_embed(e.name, e.player_tag, e.opted_in),
-            )
+        await self._player_log(
+            e.clan_tag,
+            "war_preference",
+            e.player_tag,
+            lambda ctx: E.war_preference_embed(e.name, e.player_tag, e.opted_in, ctx),
+        )
 
     @commands.Cog.listener()
     async def on_clash_league_change(self, e: ev.LeagueChanged) -> None:
-        if e.clan_tag:
-            await send_clan_log(
-                self.bot,
-                e.clan_tag,
-                "league_change",
-                E.league_change_embed(e.name, e.player_tag, e.old_league, e.new_league, e.trophies),
-            )
+        await self._player_log(
+            e.clan_tag,
+            "league_change",
+            e.player_tag,
+            lambda ctx: E.league_change_embed(
+                e.name, e.player_tag, e.old_league, e.new_league, e.trophies, ctx
+            ),
+        )
 
     # ------------------------------------------------------------------ war listeners
+
+    async def _war_with_clan(self, clan_tag: str, war: Any) -> dict[str, Any]:
+        """The war row with our clan's name and badge filled in (wars stored before those were
+        kept have neither until their next poll)."""
+        out = dict(war)
+        out.setdefault("clan_tag", clan_tag)
+        if not out.get("clan_name"):
+            out["clan_name"] = await self._clan_name(clan_tag)
+        if not out.get("clan_badge_url"):
+            out["clan_badge_url"] = await self._badge(clan_tag)
+        return out
 
     @commands.Cog.listener()
     async def on_clash_war_attack(self, e: ev.WarAttackMade) -> None:
         log_type = "cwl_attacks" if e.war.get("war_type") == "cwl" else "war_attacks"
-        await send_clan_log(
-            self.bot,
-            e.clan_tag,
-            log_type,
-            E.war_attack_embed(e.war, e.attack, e.attacker_name, e.defender_name),
-        )
+        if not await self.db.clan_log_targets(e.clan_tag, log_type):
+            return
+        war = await self._war_with_clan(e.clan_tag, e.war)
+        embed = E.war_attack_embed(war, e.attack, e.attacker_name, e.defender_name, at=datetime.now(UTC))
+        await send_clan_log(self.bot, e.clan_tag, log_type, embed)
 
     @commands.Cog.listener()
     async def on_clash_war_state(self, e: ev.WarStateChanged) -> None:
-        await send_clan_log(self.bot, e.clan_tag, "war_state", E.war_state_embed(e.war, e.new_state))
+        now = datetime.now(UTC)
+        war = await self._war_with_clan(e.clan_tag, e.war)
+        # A preparation or battle day the bot only noticed late (it was down) isn't news any more.
+        if E.state_is_news(war, e.new_state, now):
+            await send_clan_log(
+                self.bot, e.clan_tag, "war_state", E.war_state_embed(war, e.new_state, at=now)
+            )
         if e.new_state != "warEnded" or e.old_state is None:
             return
         members = await self.db.fetchall("SELECT * FROM war_members WHERE war_id = ?", (e.war["id"],))
@@ -653,43 +733,51 @@ class Logs(BaseCog):
         per = e.war.get("attacks_per_member") or (1 if e.war.get("war_type") == "cwl" else 2)
         missed = E.missed_attacks(members, attacks, per)
         log_type = "cwl_missed" if e.war.get("war_type") == "cwl" else "war_missed"
-        await send_clan_log(self.bot, e.clan_tag, log_type, E.missed_attacks_embed(e.war, missed, per))
+        await send_clan_log(self.bot, e.clan_tag, log_type, E.missed_attacks_embed(war, missed, per, at=now))
 
     @commands.Cog.listener()
     async def on_clash_cwl_lineup_change(self, e: ev.CWLLineupChanged) -> None:
-        async def names(tags: list[str]) -> list[str]:
+        if not await self.db.clan_log_targets(e.clan_tag, "cwl_lineup_change"):
+            return
+
+        async def players(tags: list[str]) -> list[E.LineupPlayer]:
             out = []
             for t in tags:
                 row = await self.db.get_player_row(t)
-                out.append(f"{row['name']} (TH{row['town_hall']})" if row else t)
+                out.append(E.LineupPlayer(row["name"] if row else t, t, row["town_hall"] if row else None))
             return out
 
-        await send_clan_log(
-            self.bot,
-            e.clan_tag,
-            "cwl_lineup_change",
-            E.cwl_lineup_embed(e.season, await names(e.added), await names(e.removed)),
+        embed = E.cwl_lineup_embed(
+            e.season,
+            await players(e.added),
+            await players(e.removed),
+            clan_name=await self._clan_name(e.clan_tag),
+            clan_tag=e.clan_tag,
+            badge_url=await self._badge(e.clan_tag),
+            at=datetime.now(UTC),
         )
+        await send_clan_log(self.bot, e.clan_tag, "cwl_lineup_change", embed)
 
     # ------------------------------------------------------------------ capital listeners
 
     @commands.Cog.listener()
     async def on_clash_capital_contribution(self, e: ev.CapitalContribution) -> None:
-        if e.clan_tag:
-            await send_clan_log(
-                self.bot,
-                e.clan_tag,
-                "capital_contributions",
-                E.capital_contribution_embed(e.name, e.player_tag, e.amount),
-            )
+        await self._player_log(
+            e.clan_tag,
+            "capital_contributions",
+            e.player_tag,
+            lambda ctx: E.capital_contribution_embed(e.name, e.player_tag, e.amount, ctx),
+        )
 
     @commands.Cog.listener()
     async def on_clash_raid_attack(self, e: ev.RaidAttacksMade) -> None:
-        await send_clan_log(
-            self.bot,
+        await self._player_log(
             e.clan_tag,
             "capital_raids",
-            E.raid_attack_embed(e.name, e.attacks, e.loot, e.total_attacks, e.attack_limit),
+            e.player_tag,
+            lambda ctx: E.raid_attack_embed(
+                e.name, e.attacks, e.loot, e.total_attacks, e.attack_limit, tag=e.player_tag, ctx=ctx
+            ),
         )
 
     @commands.Cog.listener()
@@ -700,12 +788,15 @@ class Logs(BaseCog):
         members = await self.db.fetchall(
             "SELECT * FROM raid_members WHERE clan_tag = ? AND start_time = ?", (e.clan_tag, e.start_time)
         )
-        await send_clan_log(
-            self.bot,
-            e.clan_tag,
-            "capital_summary",
-            E.raid_summary_embed(await self._clan_name(e.clan_tag), season, members),
+        embed = E.raid_summary_embed(
+            await self._clan_name(e.clan_tag),
+            season,
+            members,
+            clan_tag=e.clan_tag,
+            badge_url=await self._badge(e.clan_tag),
+            at=datetime.now(UTC),
         )
+        await send_clan_log(self.bot, e.clan_tag, "capital_summary", embed)
 
     # ------------------------------------------------------------------ server listeners
 

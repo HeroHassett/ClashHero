@@ -3,26 +3,88 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from typing import Any
 
 import coc
 import discord
 from discord import app_commands
+from discord.utils import escape_markdown
 
 from clashhero.cogs._base import BaseCog
-from clashhero.cogs._info_embeds import short
-from clashhero.cogs.info import SEASON_CHOICES, season_window
+from clashhero.cogs._info_embeds import fit, short, sym, with_icon
+from clashhero.cogs._log_embeds import arrow, star_icon, war_label
+from clashhero.cogs.info import SEASON_CHOICES, donation_totals, season_window, war_league_icon
 from clashhero.repos import stats
-from clashhero.utils.fmt import make_embed, table, ts
+from clashhero.utils.fmt import clan_link, make_embed, table, ts
 from clashhero.utils.resolve import resolve_clans
 from clashhero.utils.seasons import clan_games, cwl_season_id
+from clashhero.utils.style import ICONS
 
 STATE_LABELS = {"preparation": "Preparation", "inWar": "Battle day", "warEnded": "Ended"}
+
+# /summary best: each category's game icon (shown once it's uploaded).
+BEST_ICONS = {
+    "Donations": "ui_donate_troops",
+    "War stars (new)": "ui_war_star",
+    "Capital gold": "res_capital_gold",
+    "Attack wins": "ui_sword",
+    "Activity": "ui_stopwatch",
+    "Clan Games": "ui_clan_games",
+}
 
 
 def clan_names(rows: Sequence) -> dict[str, str]:
     return {r["clan_tag"]: r["name"] or r["clan_tag"] for r in rows}
+
+
+def section(title: str) -> str:
+    """A bold heading between two tables (a table's code block ends without a newline)."""
+    return f"\n**{title}**\n"
+
+
+def war_block(name: str, war: Mapping[str, Any] | None) -> list[str]:
+    """/summary wars, one clan: the matchup (the opponent linked); the war and its size; the score
+    with a green ▲ when ahead or a red ▼ when behind (once battle day starts); and the day's end."""
+    if not war:
+        return [f"**{escape_markdown(name)}** · not in war"]
+    opponent = escape_markdown(war.get("opponent_name") or "?")
+    if war.get("opponent_tag"):
+        opponent = f"[{opponent}]({clan_link(war['opponent_tag'])})"
+    size = war.get("team_size") or "?"
+    lines = [
+        f"**{escape_markdown(name)}** vs **{opponent}**",
+        f"{sym('ui_sword', '⚔️')} {war_label(war)} · {size} vs {size}",
+    ]
+    state = war.get("state")
+    if state != "preparation":
+        ours = (war.get("clan_stars") or 0, war.get("clan_destruction") or 0)
+        theirs = (war.get("opponent_stars") or 0, war.get("opponent_destruction") or 0)
+        trend = arrow("up") if ours > theirs else arrow("down") if ours < theirs else ""
+        score = f"{star_icon()} **{ours[0]}** – **{theirs[0]}** · {ours[1]:.1f}% – {theirs[1]:.1f}%"
+        lines.append(f"{trend} {score}".strip())
+    if state == "preparation":
+        when = f"Preparation · battle day starts {ts(war.get('start_time'))}"
+    elif state == "inWar":
+        when = f"Battle day · ends {ts(war.get('end_time'))}"
+    else:
+        when = f"{STATE_LABELS.get(state, state)} {ts(war.get('end_time'))}"
+    lines.append(f"{ICONS['time']} {when}")
+    return lines
+
+
+def cwl_block(name: str, league: str, status: str) -> list[str]:
+    """/summary cwl-status, one clan: its war league with the league's icon, then the status."""
+    head = " ".join(x for x in (war_league_icon(league), f"**{escape_markdown(name)}** · {league}") if x)
+    return [head, status]
+
+
+def best_field(title: str, rows: Sequence[Mapping[str, Any]]) -> tuple[str, str]:
+    """/summary best, one category: its icon and name, then the top players with their values
+    right-aligned in chips so the column lines up."""
+    value = "\n".join(f"`{r['value']:>7,}` {escape_markdown(short(r['name'], 18))}" for r in rows) or "—"
+    return with_icon(sym(BEST_ICONS.get(title, "")), title), fit(value, 1024, "\n")
 
 
 def missed_by_clan(rows: Sequence) -> dict[str, dict[str, int]]:
@@ -98,10 +160,14 @@ class Summary(BaseCog):
             ],
             ["CLAN", "DONATED", "RECEIVED"],
         )
-        body += "**Top donors**\n" + table(
+        body += section("Top donors") + table(
             [(i + 1, f"{r['value']:,}", short(r["name"])) for i, r in enumerate(top)], ["#", "DON", "NAME"]
         )
-        await self._send(interaction, "Donations summary", body, f"Season ending {w.id}")
+        totals = donation_totals(
+            sum(r["donations"] or 0 for r in per_clan), sum(r["received"] or 0 for r in per_clan)
+        )
+        title = with_icon(sym("ui_donate_troops"), "Donations summary")
+        await self._send(interaction, title, f"{totals}\n{body}", f"Season ending {w.id}")
 
     @summary.command(name="trophies", description="Trophy totals per clan and top players")
     async def trophies(self, interaction: discord.Interaction, clans: str | None = None) -> None:
@@ -120,32 +186,19 @@ class Summary(BaseCog):
             ],
             ["CLAN", "MEM", "TOTAL", "AVG"],
         )
-        body += "**Top players**\n" + table(
+        body += section("Top players") + table(
             [(i + 1, r["trophies"], r["town_hall"] or "?", short(r["name"])) for i, r in enumerate(top)],
             ["#", "CUPS", "TH", "NAME"],
         )
-        await self._send(interaction, "Trophy summary", body)
+        await self._send(interaction, with_icon(sym("res_trophy"), "Trophy summary"), body)
 
     @summary.command(name="wars", description="Current war status for every clan")
     async def wars(self, interaction: discord.Interaction, clans: str | None = None) -> None:
         tags, names = await self._ctx(interaction, clans)
-        rows = {r["clan_tag"]: r for r in await stats.current_wars(self.db, tags)}
-        lines = []
-        for t in tags:
-            w = rows.get(t)
-            name = names.get(t, t)
-            if not w:
-                lines.append(f"**{name}** · not in war")
-                continue
-            kind = "CWL" if w["war_type"] == "cwl" else w["war_type"].title()
-            when = ts(w["end_time"]) if w["state"] == "inWar" else ts(w["start_time"])
-            label = "ends" if w["state"] == "inWar" else "starts"
-            lines.append(
-                f"**{name}** vs **{w['opponent_name']}** ({kind} {w['team_size']}v{w['team_size']})\n"
-                f"{STATE_LABELS.get(w['state'], w['state'])} · ⭐ {w['clan_stars']}–{w['opponent_stars']} · "
-                f"{w['clan_destruction']:.1f}%–{w['opponent_destruction']:.1f}% · {label} {when}"
-            )
-        await self._send(interaction, "Current wars", "\n\n".join(lines) or "No clans.")
+        rows = {r["clan_tag"]: dict(r) for r in await stats.current_wars(self.db, tags)}
+        blocks = ["\n".join(war_block(names.get(t, t), rows.get(t))) for t in tags]
+        body = fit("\n\n".join(blocks), 4000, "\n\n") or "No clans."
+        await self._send(interaction, with_icon(sym("ui_sword"), "Current wars"), body)
 
     @summary.command(name="war-results", description="Season war wins/losses per clan")
     @app_commands.choices(season=SEASON_CHOICES)
@@ -171,7 +224,8 @@ class Summary(BaseCog):
             ],
             ["CLAN", "W", "L", "T", "WIN%"],
         )
-        await self._send(interaction, "War results", body, f"Wars started in season ending {w.id}")
+        title = with_icon(sym("ui_sword"), "War results")
+        await self._send(interaction, title, body, f"Wars started in season ending {w.id}")
 
     @summary.command(name="missed-wars", description="Missed war attacks this season, per clan and player")
     @app_commands.choices(season=SEASON_CHOICES)
@@ -192,10 +246,10 @@ class Summary(BaseCog):
             ],
             ["CLAN", "MISSED", "PLAYERS", "WARS"],
         )
-        body += "**Players**\n" + table(
+        body += section("Players") + table(
             [(m, wars, short(n)) for n, _, m, wars in missed_by_player(rows)[:25]], ["MISSED", "WARS", "NAME"]
         )
-        await self._send(interaction, "Missed attacks", body, f"Season ending {w.id}")
+        await self._send(interaction, f"{arrow('down')} Missed attacks", body, f"Season ending {w.id}")
 
     @summary.command(name="cwl-status", description="CWL league and current status for every clan")
     async def cwl_status(self, interaction: discord.Interaction, clans: str | None = None) -> None:
@@ -217,8 +271,9 @@ class Summary(BaseCog):
                 status = "Not spun / not in CWL"
             except coc.PrivateWarLog:
                 status = "War log private"
-            lines.append(f"**{names.get(t, t)}** · {league}\n{status}")
-        await self._send(interaction, f"CWL status · {cwl_season_id()}", "\n\n".join(lines))
+            lines.append("\n".join(cwl_block(names.get(t, t), league, status)))
+        title = with_icon(sym("ui_cwl_star"), f"CWL status · {cwl_season_id()}")
+        await self._send(interaction, title, fit("\n\n".join(lines), 4000, "\n\n"))
 
     @summary.command(name="clan-games", description="Clan Games points per clan and top scorers")
     async def clan_games_summary(self, interaction: discord.Interaction, clans: str | None = None) -> None:
@@ -238,11 +293,11 @@ class Summary(BaseCog):
             ],
             ["CLAN", "POINTS", "PLAYERS", "MAXED"],
         )
-        body += "**Top scorers**\n" + table(
+        body += section("Top scorers") + table(
             [(i + 1, r["points"], short(r["name"])) for i, r in enumerate(top)], ["#", "PTS", "NAME"]
         )
-        body += f"\n{ts(games.start, 'D')} → {ts(games.end, 'D')}"
-        await self._send(interaction, f"Clan Games · {games.id}", body)
+        body += f"\n{ICONS['time']} {ts(games.start, 'D')} → {ts(games.end, 'D')}"
+        await self._send(interaction, with_icon(sym("ui_clan_games"), f"Clan Games · {games.id}"), body)
 
     @summary.command(name="capital", description="Last raid weekend results per clan")
     async def capital(self, interaction: discord.Interaction, clans: str | None = None) -> None:
@@ -261,7 +316,9 @@ class Summary(BaseCog):
             ],
             ["CLAN", "LOOT", "ATK", "PLAYERS", "DIST"],
         )
-        await self._send(interaction, "Capital raids (latest weekend)", body)
+        await self._send(
+            interaction, with_icon(sym("res_capital_gold"), "Capital raids (latest weekend)"), body
+        )
 
     @summary.command(name="activity", description="Most active players this season")
     @app_commands.choices(season=SEASON_CHOICES)
@@ -282,10 +339,12 @@ class Summary(BaseCog):
             ],
             ["CLAN", "ACTIVITY"],
         )
-        body += "**Most active**\n" + table(
+        body += section("Most active") + table(
             [(i + 1, r["value"], short(r["name"])) for i, r in enumerate(top)], ["#", "SCORE", "NAME"]
         )
-        await self._send(interaction, "Activity", body, f"Season ending {w.id}")
+        await self._send(
+            interaction, with_icon(sym("ui_stopwatch"), "Activity"), body, f"Season ending {w.id}"
+        )
 
     @summary.command(name="best", description="Top performers this season across categories")
     @app_commands.choices(season=SEASON_CHOICES)
@@ -309,8 +368,8 @@ class Summary(BaseCog):
         cg = await stats.clan_games_players(self.db, tags, games.id, 5)
         sections.append(("Clan Games", [{"name": r["name"], "value": r["points"]} for r in cg]))
         for title, rows in sections:
-            value = "\n".join(f"`{r['value']:>7,}` {short(r['name'], 18)}" for r in rows) or "—"
-            e.add_field(name=title, value=value[:1024])
+            name, value = best_field(title, rows)
+            e.add_field(name=name, value=value)
         e.set_footer(text=f"Season ending {w.id}")
         await interaction.response.send_message(embed=e)
 

@@ -19,7 +19,7 @@ from clashhero.utils.checks import manager
 from clashhero.utils.fmt import make_embed
 from clashhero.utils.resolve import clan_autocomplete, resolve_clan
 from clashhero.utils.seasons import clan_games
-from clashhero.utils.style import SEP, ok_embed
+from clashhero.utils.style import ICONS, SEP, ok_embed
 
 log = logging.getLogger(__name__)
 
@@ -28,10 +28,29 @@ KIND_CHOICES = [app_commands.Choice(name=LIVE_KINDS[k], value=k) for k in OUR_KI
 WAR_DEBOUNCE_SECONDS = 60
 
 
-def live_line(r) -> str:
-    """One /live list row: ``📡 **Current war** · `#TAG` → #channel``."""
+# The game icon (ICONS key) shown beside each kind of live embed in /live list.
+KIND_ICONS = {
+    "war_embed": "war",
+    "cwl_embed": "cwl",
+    "clan_games": "games",
+    "last_seen": "time",
+    "clan_embed": "clan",
+    "legend_board": "legend",
+}
+
+
+def clan_label(name: str | None, tag: str | None) -> str:
+    """``**Name** (#TAG)``, or just the tag when the clan's name isn't known."""
+    if not tag:
+        return "this server"
+    return f"**{discord.utils.escape_markdown(name)}** ({tag})" if name and name != tag else tag
+
+
+def live_line(r, clan_name: str | None = None) -> str:
+    """One /live list row: ``⚔ **Current war** · **Clan** (#TAG) → #channel``."""
     kind = LIVE_KINDS.get(r["kind"], r["kind"])
-    return f"📡 **{kind}**{SEP}`{r['scope'] or 'server'}` → <#{r['channel_id']}>"
+    icon = ICONS[KIND_ICONS[r["kind"]]] if r["kind"] in KIND_ICONS else ICONS["clan"]
+    return f"{icon} **{kind}**{SEP}{clan_label(clan_name, r['scope'])} → <#{r['channel_id']}>"
 
 
 class Live(BaseCog):
@@ -56,6 +75,9 @@ class Live(BaseCog):
         return row["name"] if row else clan_tag
 
     async def render(self, kind: str, clan_tag: str, options: dict | None = None) -> discord.Embed:
+        clan = await self.db.get_clan_row(clan_tag)
+        name = clan["name"] if clan else clan_tag
+        badge = {"clan_tag": clan_tag, "badge_url": clan["badge_url"] if clan else None}
         if kind in ("war_embed", "cwl_embed"):
             sql = "SELECT * FROM wars WHERE clan_tag = ?"
             if kind == "cwl_embed":
@@ -66,7 +88,7 @@ class Live(BaseCog):
                 members = await self.db.fetchall("SELECT * FROM war_members WHERE war_id = ?", (war["id"],))
                 attacks = await self.db.fetchall("SELECT * FROM war_attacks WHERE war_id = ?", (war["id"],))
             names = {m["player_tag"]: m["name"] for m in members}
-            return L.war_embed(war, await self._clan_name(clan_tag), members, attacks, names)
+            return L.war_embed(war, name, members, attacks, names, **badge)
         if kind == "clan_games":
             window = clan_games()
             rows = await self.db.fetchall(
@@ -75,7 +97,7 @@ class Live(BaseCog):
                 "WHERE g.games_id = ? AND g.clan_tag = ?",
                 (window.id, clan_tag),
             )
-            return L.clan_games_embed(await self._clan_name(clan_tag), rows, window.end)
+            return L.clan_games_embed(name, rows, window.end, window_start=window.start, **badge)
         if kind == "last_seen":
             rows = await self.db.fetchall(
                 "SELECT p.name, p.last_seen, "
@@ -86,9 +108,8 @@ class Live(BaseCog):
                 "FROM players p WHERE p.clan_tag = ?",
                 (clan_tag,),
             )
-            return L.last_seen_embed(await self._clan_name(clan_tag), rows)
+            return L.last_seen_embed(name, rows, **badge)
         if kind == "clan_embed":
-            clan = await self.db.get_clan_row(clan_tag)
             members = await self.db.clan_member_rows(clan_tag)
             return L.clan_showcase_embed(clan, members, (options or {}).get("description"))
         raise ValueError(kind)
@@ -152,8 +173,7 @@ class Live(BaseCog):
             (interaction.guild_id, kind, tag),
         )
         await self.refresh_row(row)
-        name = await self._clan_name(tag)
-        label = f"**{name}** `{tag}`" if name != tag else f"`{tag}`"
+        label = clan_label(await self._clan_name(tag), tag)
         await interaction.followup.send(
             embed=ok_embed(f"Live **{LIVE_KINDS[kind]}** for {label} posted in {target.mention}.")
         )
@@ -228,8 +248,9 @@ class Live(BaseCog):
     ) -> None:
         tag = await resolve_clan(interaction, clan)
         await self.db.delete_live_message(interaction.guild_id, kind.value, tag)
+        label = clan_label(await self._clan_name(tag), tag)
         await interaction.response.send_message(
-            embed=ok_embed(f"Stopped **{kind.name}** for `{tag}`."), ephemeral=True
+            embed=ok_embed(f"Stopped **{kind.name}** for {label}."), ephemeral=True
         )
 
     @live.command(name="list", description="List live embeds in this server")
@@ -237,7 +258,11 @@ class Live(BaseCog):
         rows = await self.db.fetchall(
             "SELECT * FROM live_messages WHERE guild_id = ? ORDER BY kind, scope", (interaction.guild_id,)
         )
-        lines = [live_line(r) for r in rows]
+        names = {}
+        for tag in {r["scope"] for r in rows if r["scope"]}:
+            clan = await self.db.get_clan_row(tag)
+            names[tag] = clan["name"] if clan else None
+        lines = [live_line(r, names.get(r["scope"])) for r in rows]
         embed = await make_embed(
             self.bot,
             interaction.guild_id,

@@ -17,14 +17,17 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from clashhero.cogs._base import BaseCog
+from clashhero.cogs._log_embeds import arrow
+from clashhero.constants import ROLE_RANK
 from clashhero.events import WarStateChanged
 from clashhero.repos import autoroles as repo
 from clashhero.repos.autoroles import Account, Mapping
+from clashhero.services.emojis import EMOJIS
 from clashhero.utils.checks import manager, require
-from clashhero.utils.fmt import make_embed
+from clashhero.utils.fmt import make_embed, role_name
 from clashhero.utils.ranked import LEAGUE_TIERS
 from clashhero.utils.resolve import ResolveError, clan_autocomplete, resolve_clan
-from clashhero.utils.style import SEP, chip, fail_embed, ok_embed
+from clashhero.utils.style import ICONS, SEP, fail_embed, ok_embed
 
 log = logging.getLogger(__name__)
 
@@ -45,41 +48,98 @@ KIND_LABEL = {c.value: c.name for c in KIND_CHOICES}
 DEFAULT_LEAGUES = list(LEAGUE_TIERS)  # ranked tiers, from utils/ranked.py
 
 
+FAMILY_LABELS = {
+    "family": "Family",
+    "exclusive": "Family only (every account)",
+    "guest": "Guest",
+    "verified": "Verified",
+    "linked": "Account linked",
+    "leaders": "Family leaders",
+}
+
+
 def _onoff(value) -> str:
     return "✅" if value else "❌"
 
 
 def settings_text(s) -> str:
-    """The Settings field of /autorole list."""
+    """The Settings field of /autorole list: one setting a line."""
     return "\n".join(
         (
-            SEP.join(
-                (
-                    f"Auto update {_onoff(s['auto_update'])}",
-                    f"Removal delay {chip(str(s['removal_delay_hours']) + 'h')}",
-                    f"Allow not linked {_onoff(s['allow_not_linked'])}",
-                )
-            ),
-            SEP.join(
-                (
-                    f"Non-family accounts count {_onoff(s['allow_non_family'])}",
-                    f"Verified-only clan roles {_onoff(s['only_verified_clan_roles'])}",
-                )
-            ),
+            f"{_onoff(s['auto_update'])} Auto update",
+            f"{ICONS['time']} Removal delay **{s['removal_delay_hours']}h**",
+            f"{_onoff(s['allow_not_linked'])} Allow not linked",
+            f"{_onoff(s['allow_non_family'])} Non-family accounts count",
+            f"{_onoff(s['only_verified_clan_roles'])} Verified-only clan roles",
         )
     )
 
 
 def sync_text(added: int, removed: int, who: str | None = None, nick_changed: bool = False) -> str:
-    """``Roles synced for @user · `+2` added · `-1` removed · nickname updated``."""
-    parts = [
-        f"Roles synced for {who}" if who else "Roles synced",
-        f"{chip(f'+{added}')} added",
-        f"{chip(f'-{removed}')} removed",
-    ]
+    """``Roles synced for @user.`` then ``▲ **2** added · ▼ **1** removed · nickname updated``
+    (green and red arrows)."""
+    parts = [f"{arrow('up')} **{added}** added", f"{arrow('down')} **{removed}** removed"]
     if nick_changed:
         parts.append("nickname updated")
-    return SEP.join(parts) + "."
+    return (f"Roles synced for {who}." if who else "Roles synced.") + "\n" + SEP.join(parts)
+
+
+def _league_title(key: str) -> str:
+    """A stored (lowercased) league name as shown in game: ``crystal league ii`` -> ``Crystal League II``."""
+    return " ".join(w.upper() if set(w) <= set("ivx") else w.capitalize() for w in key.split())
+
+
+def th_label(level: int, prefix: str = "TH") -> str:
+    """``<th16>**16**`` with the Town Hall icon, else ``TH **16**``."""
+    icon = EMOJIS.town_hall(level) if prefix == "TH" else ""
+    return f"{icon}**{level}**" if icon else f"{prefix} **{level}**"
+
+
+def mapping_line(m: Mapping, clan_names: dict[str, str]) -> str:
+    """One /autorole list row: what gives the role (with its game icon) → the role."""
+    clan = f"**{clan_names.get(m.scope) or m.scope}**" if m.scope else ""
+    if m.kind in ("town_hall", "builder_hall") and m.key.isdigit():
+        label = th_label(int(m.key), "TH" if m.kind == "town_hall" else "BH")
+    elif m.kind == "league":
+        label = " ".join(x for x in (EMOJIS.league(_league_title(m.key)), f"**{_league_title(m.key)}**") if x)
+    elif m.kind == "builder_league":
+        label = f"**{_league_title(m.key)}**"
+    elif m.kind == "trophy_band" and (band := repo.parse_band(m.key)):
+        label = f"{ICONS['trophy']} **{band[0]:,}–{band[1]:,}**"
+    elif m.kind == "family":
+        label = f"**{FAMILY_LABELS.get(m.key, m.key)}**"
+    elif m.kind == "clan_role":
+        label = f"{clan}{SEP}{'Everyone' if m.key == 'everyone' else role_name(m.key)}"
+    elif m.kind == "war":
+        label = f"{ICONS['war']} {clan}"
+    else:
+        label = " ".join(x for x in (clan, m.key) if x)
+    return f"{label} → <@&{m.role_id}>"
+
+
+def _mapping_order(m: Mapping) -> tuple[str, int, str]:
+    """Highest first for levels and trophy bands; clan roles by clan, then rank."""
+    if m.key.isdigit():
+        rank = -int(m.key)
+    elif band := repo.parse_band(m.key):
+        rank = -band[0]
+    elif m.kind == "clan_role":
+        rank = -ROLE_RANK.get(m.key, 0)
+    elif m.kind == "family" and m.key in FAMILY_LABELS:
+        rank = list(FAMILY_LABELS).index(m.key)
+    else:
+        rank = 0
+    return (m.scope, rank, m.key)
+
+
+def _fit(lines: list[str], limit: int) -> str:
+    """Lines joined, the last ones replaced by "… N more" to stay within ``limit`` characters."""
+    for keep in range(len(lines), 0, -1):
+        rest = len(lines) - keep
+        text = "\n".join([*lines[:keep], *([f"… {rest} more"] if rest else [])])
+        if len(text) <= limit:
+            return text
+    return f"{len(lines)} roles"
 
 
 @dataclass
@@ -312,9 +372,16 @@ class Autoroles(BaseCog):
                 self.db, interaction.guild_id, only_verified_clan_roles=int(only_verified)
             )
         await interaction.response.send_message(
-            embed=ok_embed(f"Clan roles updated for `{tag}`. Run `/autorole refresh` to apply now."),
+            embed=ok_embed(
+                f"Clan roles updated for {await self._clan_label(tag)}. Run `/autorole refresh` to apply now."
+            ),
             ephemeral=True,
         )
+
+    async def _clan_label(self, tag: str) -> str:
+        """``**Clan** `#TAG```, or just the tag when the clan isn't stored yet."""
+        row = await self.db.get_clan_row(tag)
+        return f"**{row['name']}** `{tag}`" if row and row["name"] else f"`{tag}`"
 
     @autorole.command(name="town-hall", description="Role for a Town Hall level (omit role to remove)")
     @manager()
@@ -326,7 +393,7 @@ class Autoroles(BaseCog):
     ) -> None:
         await self._set(interaction, "town_hall", "", str(level), role)
         await interaction.response.send_message(
-            embed=ok_embed(f"TH{level} → {role.mention if role else 'removed'}."), ephemeral=True
+            embed=ok_embed(f"{th_label(level)} → {role.mention if role else 'removed'}."), ephemeral=True
         )
 
     @autorole.command(name="builder-hall", description="Role for a Builder Hall level")
@@ -442,22 +509,24 @@ class Autoroles(BaseCog):
         tag = await resolve_clan(interaction, clan)
         await self._set(interaction, "war", tag, "war", role)
         await interaction.response.send_message(
-            embed=ok_embed(f"War role for `{tag}` → {role.mention if role else 'removed'}."), ephemeral=True
+            embed=ok_embed(
+                f"War role for {await self._clan_label(tag)} → {role.mention if role else 'removed'}."
+            ),
+            ephemeral=True,
         )
 
     @autorole.command(name="list", description="Show autorole configuration")
     async def list_(self, interaction: discord.Interaction) -> None:
         ctx = await self.context(interaction.guild_id)
         embed = await make_embed(self.bot, interaction.guild_id, title="Autoroles")
-        groups: dict[str, list[str]] = {}
+        clan_names = {t: r["name"] or r["alias"] or t for t, r in ctx.family.items()}
+        groups: dict[str, list[Mapping]] = {}
         for m in ctx.mappings:
-            label = f"{m.scope} " if m.scope else ""
-            groups.setdefault(m.kind, []).append(f"{label}{m.key} → <@&{m.role_id}>")
-        for kind, lines in groups.items():
+            groups.setdefault(m.kind, []).append(m)
+        for kind, maps in groups.items():
+            lines = [mapping_line(m, clan_names) for m in sorted(maps, key=_mapping_order)]
             embed.add_field(
-                name=f"{KIND_LABEL.get(kind, kind)} ({len(lines)})",
-                value="\n".join(lines)[:1024],
-                inline=False,
+                name=f"{KIND_LABEL.get(kind, kind)} ({len(lines)})", value=_fit(lines, 1024), inline=False
             )
         embed.add_field(name="Settings", value=settings_text(ctx.settings), inline=False)
         if not groups:
@@ -478,8 +547,7 @@ class Autoroles(BaseCog):
         n = await repo.delete_kind(self.db, interaction.guild_id, kind.value, scope)
         await interaction.response.send_message(
             embed=ok_embed(
-                f"Removed {chip(n)} {kind.name.lower()} mapping(s). "
-                "Existing roles stay until you remove them."
+                f"Removed **{n}** {kind.name.lower()} mapping(s). Existing roles stay until you remove them."
             ),
             ephemeral=True,
         )

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from datetime import UTC, datetime
 
 import discord
 from discord import app_commands
 from discord.ext import tasks
+from discord.utils import escape_markdown
 
 from clashhero.cogs._base import BaseCog
 from clashhero.repos import reminders as R
@@ -27,7 +29,7 @@ TYPE_CHOICES = [
     app_commands.Choice(name="Clan Games", value="games"),
 ]
 TYPE_LABEL = {c.value: c.name for c in TYPE_CHOICES}
-TYPE_ICON = {"war": ICONS["war"], "cwl": ICONS["cwl"], "raid": ICONS["capital"], "games": ICONS["games"]}
+TYPE_ICON = {"war": "war", "cwl": "cwl", "raid": "capital", "games": "games"}  # keys into ICONS
 MODE_CHOICES = [
     app_commands.Choice(name="Opt-in: only ping members with the role", value="optin"),
     app_commands.Choice(name="Opt-out: don't ping members with the role", value="optout"),
@@ -56,15 +58,23 @@ def _dt(iso: str | None) -> datetime | None:
     return d if d.tzinfo else d.replace(tzinfo=UTC)
 
 
-def reminder_block(r) -> str:
-    """One reminder in /reminders list: header line, channel and clans, then the message and
-    any ping filters as quotes."""
+def type_icon(type_: str) -> str:
+    """The reminder type's game icon (war, CWL, Capital Gold, Clan Games)."""
+    return ICONS[TYPE_ICON[type_]] if type_ in TYPE_ICON else "⏰"
+
+
+def reminder_block(r, names: Mapping[str, str] | None = None) -> str:
+    """One reminder in /reminders list: header line, channel and clans (by name when ``names``
+    has them), then the message and any ping filters as quotes."""
     type_ = r["type"]
     head = (
-        f"`#{r['id']}` {TYPE_ICON.get(type_, '⏰')} **{TYPE_LABEL.get(type_, type_)}**"
-        f"{SEP}{chip(R.format_duration(r['duration_seconds']))} before the end"
+        f"`#{r['id']}` {type_icon(type_)} **{TYPE_LABEL.get(type_, type_)}**"
+        f"{SEP}{ICONS['time']} **{R.format_duration(r['duration_seconds'])}** before the end"
     )
-    clans = " ".join(chip(t) for t in (r["clans"] or "").split())
+    names = names or {}
+    clans = ", ".join(
+        f"**{escape_markdown(names[t])}**" if names.get(t) else chip(t) for t in (r["clans"] or "").split()
+    )
     lines = [head, SEP.join(x for x in (f"<#{r['channel_id']}>", clans) if x), f"> {r['message'][:80]}"]
     desc = R.Filters.from_row(r).describe()
     if desc:
@@ -79,9 +89,11 @@ def build_messages(
     include_list: bool,
     allowed_user: callable = lambda uid: True,
     limit: int = 1900,
+    icon: str = "",
 ) -> list[str]:
-    """Render reminder text. Each section is (clan name, pending players). Linked players are
-    mentioned (grouped per Discord user); unlinked ones are listed by name."""
+    """Render reminder text. Each section is (clan name, pending players), headed by the clan
+    with ``icon`` (the event's game icon). Linked players are mentioned (grouped per Discord
+    user); unlinked ones are listed by name."""
     head = message
     if not include_list:
         return [head]
@@ -89,7 +101,7 @@ def build_messages(
     for clan_name, pending in sections:
         if not pending:
             continue
-        body.append(f"\n**{clan_name}**: {len(pending)} remaining")
+        body.append(f"\n{icon + ' ' if icon else ''}**{clan_name}** · **{len(pending)}** remaining")
         by_user: dict[int, list[str]] = {}
         unlinked: list[str] = []
         for p in pending:
@@ -187,7 +199,12 @@ class Reminders(BaseCog):
         tags = [p.player_tag for _, pending in sections for p in pending]
         links = await self.db.links_for_tags(tags)
         msgs = build_messages(
-            message, sections, links, include_list, await self._role_filter(guild_id, type_)
+            message,
+            sections,
+            links,
+            include_list,
+            await self._role_filter(guild_id, type_),
+            icon=type_icon(type_),
         )
         for text in msgs:
             await send_to_channel(self.bot, channel_id, content=text)
@@ -340,9 +357,9 @@ class Reminders(BaseCog):
         desc = filters.describe()
         await interaction.response.send_message(
             embed=ok_embed(
-                f"Reminder `#{rid}` created: **{type.name}**, {chip(R.format_duration(seconds))} before "
-                f"the end, in {target.mention} for {len(tags)} clan(s)."
-                + (f"\nOnly pinging: {desc}" if desc else "")
+                f"Reminder `#{rid}` created: {type_icon(type.value)} **{type.name}**, "
+                f"**{R.format_duration(seconds)}** before the end, in {target.mention} for "
+                f"**{len(tags)}** clan(s)." + (f"\nOnly pinging: {desc}" if desc else "")
             ),
             ephemeral=True,
         )
@@ -353,12 +370,20 @@ class Reminders(BaseCog):
         self, interaction: discord.Interaction, type: app_commands.Choice[str] | None = None
     ) -> None:
         rows = await R.list_reminders(self.db, interaction.guild_id, type.value if type else None)
+        names = {
+            r["clan_tag"]: r["name"] or r["alias"]
+            for r in await self.db.get_guild_clan_rows(interaction.guild_id)
+        }
+        blocks = [reminder_block(r, names) for r in rows]
+        text = "\n\n".join(blocks)
+        while len(text) > 4000:  # whole reminders only
+            blocks.pop()
+            text = "\n\n".join(blocks) + f"\n\n-# … {len(rows) - len(blocks)} more"
         embed = await make_embed(
             self.bot,
             interaction.guild_id,
             title="Reminders",
-            description="\n\n".join(reminder_block(r) for r in rows)[:4000]
-            or "No reminders. Use `/reminders create`.",
+            description=text or "No reminders. Use `/reminders create`.",
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -462,7 +487,12 @@ class Reminders(BaseCog):
             return
         links = await self.db.links_for_tags([p.player_tag for _, ps in sections for p in ps])
         msgs = build_messages(
-            message, sections, links, True, await self._role_filter(interaction.guild_id, type.value)
+            message,
+            sections,
+            links,
+            True,
+            await self._role_filter(interaction.guild_id, type.value),
+            icon=type_icon(type.value),
         )
         if not msgs:
             await interaction.followup.send(embed=ok_embed("Everyone is done. 🎉"))

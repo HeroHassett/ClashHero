@@ -63,7 +63,7 @@ def code_blocks(text: str) -> list[list[str]]:
 def test_today_embed_layout():
     e = today_embed()
     assert e.author.name == "LEGEND I · TODAY"
-    assert e.title == f"STUTS {TAG}" and e.url.endswith("2PQ8VLYC0")
+    assert e.title == f"STUTS ({TAG})" and e.url.endswith("2PQ8VLYC0")
     first = e.description.split("\n")[0]
     assert first == "Town Hall 18 · **5,252** trophies"  # no emojis uploaded: plain text
     summary, attacks, defenses = code_blocks(e.description)
@@ -73,7 +73,8 @@ def test_today_embed_layout():
         "NET         +72",
         "TROPHIES   4945 → 5021",
     ]
-    assert "⚔️ **Attacks 4/8 (+137)**" in e.description and "🛡️ **Defenses 2/8 (-65)**" in e.description
+    assert "⚔️ **Attacks 4/8** · ▲ **+137**" in e.description  # the totals with coloured arrows
+    assert "🛡️ **Defenses 2/8** · ▼ **-65**" in e.description
     assert attacks[2] == "+29  ···   —    inferred from trophies"
     assert defenses[1] == "-25  ···   —    auto-filled (no defense received)"
     assert e.footer.text == "Nov 07 · Net +72 · some battles inferred from trophy changes"
@@ -94,7 +95,7 @@ def test_counts_with_and_without_a_cap():
     no_cap = today_embed(cap=None, start=None, author="Electro League 33 · Today")
     summary = code_blocks(no_cap.description)[0]
     assert summary[0].endswith("+137   4") and len(summary) == 3  # no trophies line without a start
-    assert "Attacks 4 (+137)" in no_cap.description
+    assert "**Attacks 4** · ▲ **+137**" in no_cap.description
 
 
 def test_empty_day():
@@ -128,8 +129,11 @@ def test_game_symbols_when_uploaded(monkeypatch):
     )
     e = today_embed()
     assert e.description.startswith("<:th18:4> Town Hall 18 · <:res_trophy:3> **5,252** trophies")
-    assert "<:ui_sword:1> **Attacks 4/8 (+137)**" in e.description
-    assert "<:ui_shield:2> **Defenses 2/8 (-65)**" in e.description
+    assert "<:ui_sword:1> **Attacks 4/8** · ▲ **+137**" in e.description
+    assert "<:ui_shield:2> **Defenses 2/8** · ▼ **-65**" in e.description
+    EMOJIS._by_name["lt_legend_i"] = "<:lt_legend_i:5>"
+    ranked = today_embed(league="Legend I")  # the trophies get the league's icon
+    assert ranked.description.startswith("<:th18:4> Town Hall 18 · <:lt_legend_i:5> **5,252** trophies")
 
 
 # ------------------------------------------------------------------ the buttons
@@ -268,9 +272,9 @@ def _current(edit) -> list[str]:
 async def test_refresh_shows_the_day(day):
     edit = await press(day, "day")
     e = edit["embed"]
-    assert e.author.name == "LEGEND I · TODAY" and e.title == f"Amy {TAG}"
+    assert e.author.name == "LEGEND I · TODAY" and e.title == f"Amy ({TAG})"
     assert e.description.startswith("Town Hall 18 · **5,252** trophies")
-    assert "Attacks 2/8 (+60)" in e.description and "TROPHIES   5200 → 5240" in e.description
+    assert "**Attacks 2/8** · ▲ **+60**" in e.description and "TROPHIES   5200 → 5240" in e.description
     [file] = edit["attachments"]
     assert file.filename == "legend-season.png" and e.image.url == "attachment://legend-season.png"
     assert _current(edit) == ["Refresh"]
@@ -285,10 +289,11 @@ async def test_historical_data(day):
     assert _current(edit) == ["View Historical Data"]
 
 
-@pytest.mark.parametrize(("view", "title"), [("def", "Amy · Defense armies"), ("att", "Amy · Attack armies")])
-async def test_armies(day, view, title):
+@pytest.mark.parametrize(("view", "head"), [("def", "🛡️ **Defense armies**"), ("att", "⚔️ **Attack armies**")])
+async def test_armies(day, view, head):
     edit = await press(day, view)
-    assert edit["embed"].title == title and edit["embed"].image.url == "attachment://armies.png"
+    assert edit["embed"].title == f"Amy ({TAG})" and edit["embed"].description.startswith(head)
+    assert edit["embed"].image.url == "attachment://armies.png"
     assert [f.filename for f in edit["attachments"]] == ["armies.png"]
     assert _current(edit) == [{"def": "Defense Armies", "att": "Attack Armies"}[view]]
 
@@ -305,7 +310,7 @@ async def test_weekly_tiers_list_the_week(day):
     edit = await press(day, "day")
     e = edit["embed"]
     assert e.author.name == "LEGEND II · WEEK NOV 2 – NOV 9"
-    assert "Attacks 3/30 (+91)" in e.description and e.footer.text.startswith("Nov 2 – Nov 9 · Net")
+    assert "**Attacks 3/30** · ▲ **+91**" in e.description and e.footer.text.startswith("Nov 2 – Nov 9 · Net")
 
 
 async def test_failures_answer_with_an_error(day, monkeypatch):

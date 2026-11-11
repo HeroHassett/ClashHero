@@ -15,6 +15,7 @@ from discord import app_commands
 from discord.ext import tasks
 
 from clashhero.cogs._base import BaseCog
+from clashhero.cogs._log_embeds import arrow, clan_author, star_icon
 from clashhero.db.database import Database
 from clashhero.repos import autoboards as repo
 from clashhero.repos import capital, legends, stats, war
@@ -49,6 +50,11 @@ def _season_line(w: Window) -> str:
     return f"Season {ts(w.start, 'D')} → {ts(w.end, 'D')}\n"
 
 
+def _heading(icon: str, text: str) -> str:
+    """A section heading above a table, with its game icon (``ICONS`` key or an emoji)."""
+    return f"{ICONS.get(icon, icon)} **{text}**\n"
+
+
 async def _donations(db: Database, tags: Sequence[str], names: dict[str, str], ref: datetime) -> str:
     w = game_season(ref)
     body = _season_line(w)
@@ -68,7 +74,7 @@ async def _donations(db: Database, tags: Sequence[str], names: dict[str, str], r
     top = await stats.top_season_players(db, tags, w.id, "donations", TOP)
     return (
         body
-        + "**Top donors**\n"
+        + _heading("troops", "Top donors")
         + table(
             [(i, f"{r['value']:,}", _short(r["name"])) for i, r in enumerate(top, 1)], ["#", "DON", "NAME"]
         )
@@ -94,7 +100,7 @@ async def _trophies(db: Database, tags: Sequence[str], names: dict[str, str], re
     top = await stats.top_trophy_players(db, tags, TOP)
     return (
         body
-        + "**Top players**\n"
+        + _heading("trophy", "Top players")
         + table(
             [(i, r["trophies"] or 0, r["town_hall"] or "?", _short(r["name"])) for i, r in enumerate(top, 1)],
             ["#", "CUPS", "TH", "NAME"],
@@ -105,13 +111,14 @@ async def _trophies(db: Database, tags: Sequence[str], names: dict[str, str], re
 async def _legends(db: Database, tags: Sequence[str], names: dict[str, str], ref: datetime) -> str:
     day = legend_day_id(ref)
     entries = await legends.board_entries(db, await legends.legend_members(db, tags), day)
+    head = _heading("legend", f"Legend day {day}")
     if not entries:
-        return f"Legend day {day}\nNo ranked players in these clans yet."
+        return head + "No ranked players in these clans yet."
     rows = [
         (i, e.trophies, signed(e.stats.offense), signed(e.stats.defense), signed(e.stats.net), _short(e.name))
         for i, e in enumerate(entries[:TOP], 1)
     ]
-    return f"Legend day {day}\n" + table(rows, ["#", "CUPS", "OFF", "DEF", "NET", "NAME"])
+    return head + table(rows, ["#", "CUPS", "OFF", "DEF", "NET", "NAME"])
 
 
 async def _war_stats(db: Database, tags: Sequence[str], names: dict[str, str], ref: datetime) -> str:
@@ -124,10 +131,9 @@ async def _war_stats(db: Database, tags: Sequence[str], names: dict[str, str], r
     body = _season_line(w)
     if not attacks and not missed:
         return body + "No war attacks recorded this season."
-    body += (
-        f"Hit rate **{_pct(triples / attacks if attacks else 0)}** "
-        f"({triples}/{attacks} triples) · {missed} missed\n"
-    )
+    parts = [f"Hit rate **{_pct(triples / attacks if attacks else 0)}**", f"**{triples}/{attacks}** triples"]
+    parts.append(f"{arrow('down')} **{missed}** missed" if missed else "none missed")
+    body += f"{ICONS['war']} {SEP.join(parts)}\n"
     player_names = await war.player_names(db, [t for t, _ in attackers[:TOP]])
     rows = [
         (
@@ -143,7 +149,20 @@ async def _war_stats(db: Database, tags: Sequence[str], names: dict[str, str], r
     return body + table(rows, ["#", "HIT%", "3★", "AVG★", "MISS", "NAME"])
 
 
-RESULT_ICONS = {"win": "✅", "lose": "❌", "tie": "➖"}
+def result_icon(result: str | None) -> str:
+    """Green ▲ for a win, red ▼ for a loss, ➖ for a tie."""
+    return {"win": arrow("up"), "lose": arrow("down"), "tie": "➖"}.get(result or "", "•")
+
+
+def recent_war_line(r, clan: str) -> str:
+    """``▲ **Alpha** vs Rivals · ★ **5**–3 · 90.0%–60.0%`` (and CWL or Friendly when it was)."""
+    kind = {"cwl": "CWL", "friendly": "Friendly"}.get(r["war_type"])
+    parts = [
+        f"{result_icon(r['result'])} **{clan}** vs {_short(r['opponent_name'], 20)}",
+        f"{star_icon()} **{r['clan_stars']}**–{r['opponent_stars']}",
+        f"{r['clan_destruction'] or 0:.1f}%–{r['opponent_destruction'] or 0:.1f}%",
+    ]
+    return SEP.join([*parts, kind] if kind else parts)
 
 
 async def _war_results(db: Database, tags: Sequence[str], names: dict[str, str], ref: datetime) -> str:
@@ -163,24 +182,17 @@ async def _war_results(db: Database, tags: Sequence[str], names: dict[str, str],
         ["CLAN", "W", "L", "T", "WIN%"],
     )
     ended = [r for r in await stats.wars_rows(db, tags, w.start, w.end) if r["state"] == "warEnded"]
-    recent = []
-    for r in reversed(ended[-10:]):
-        kind = "CWL" if r["war_type"] == "cwl" else r["war_type"].title()
-        icon = RESULT_ICONS.get(r["result"] or "", "•")
-        clan = _short(names.get(r["clan_tag"], r["clan_tag"]), 20)
-        recent.append(
-            f"{icon} **{clan}** vs {_short(r['opponent_name'], 20)} ({kind})"
-            f" · ⭐ {r['clan_stars']}–{r['opponent_stars']}"
-            f" · {r['clan_destruction'] or 0:.1f}%–{r['opponent_destruction'] or 0:.1f}%"
-        )
+    recent = [
+        recent_war_line(r, _short(names.get(r["clan_tag"], r["clan_tag"]), 20)) for r in reversed(ended[-10:])
+    ]
     if recent:
-        body += "**Recent wars**\n" + "\n".join(recent)
+        body += _heading("war", "Recent wars") + "\n".join(recent)
     return body
 
 
 async def _clan_games(db: Database, tags: Sequence[str], names: dict[str, str], ref: datetime) -> str:
     games = clan_games(ref)
-    body = f"Clan Games {ts(games.start, 'D')} → {ts(games.end, 'D')}\n"
+    body = f"{ICONS['games']} Clan Games {ts(games.start, 'D')} → {ts(games.end, 'D')}\n"
     per_clan = []
     for t in tags:
         rows = await capital.clan_games_rows(db, t, games.id)
@@ -196,7 +208,7 @@ async def _clan_games(db: Database, tags: Sequence[str], names: dict[str, str], 
     top = await stats.clan_games_players(db, tags, games.id, TOP)
     return (
         body
-        + "**Top scorers**\n"
+        + _heading("games", "Top scorers")
         + table(
             [(i, f"{r['points']:,}", _short(r["name"])) for i, r in enumerate(top, 1)], ["#", "PTS", "NAME"]
         )
@@ -218,7 +230,7 @@ async def _capital(db: Database, tags: Sequence[str], names: dict[str, str], ref
     top = await stats.top_season_players(db, tags, w.id, "capital_gold", TOP)
     return (
         body
-        + "**Top contributors**\n"
+        + _heading("capital", "Top contributors")
         + table(
             [(i, f"{r['value']:,}", _short(r["name"])) for i, r in enumerate(top, 1)], ["#", "GOLD", "NAME"]
         )
@@ -240,7 +252,7 @@ async def _activity(db: Database, tags: Sequence[str], names: dict[str, str], re
     top = await stats.top_season_players(db, tags, w.id, "activity", TOP)
     return (
         body
-        + "**Most active**\n"
+        + _heading("📈", "Most active")
         + table([(i, r["value"], _short(r["name"])) for i, r in enumerate(top, 1)], ["#", "SCORE", "NAME"])
     )
 
@@ -305,10 +317,8 @@ class Autoboards(BaseCog):
         tags = await self._clan_tags(row)
         if not tags:
             return None
-        names = {
-            r["clan_tag"]: r["name"] or r["clan_tag"]
-            for r in await self.db.get_guild_clan_rows(row["guild_id"])
-        }
+        clan_rows = {r["clan_tag"]: r for r in await self.db.get_guild_clan_rows(row["guild_id"])}
+        names = {t: r["name"] or t for t, r in clan_rows.items()}
         body = await render_body(self.db, row["board_type"], tags, names, ref)
         e = await make_embed(
             self.bot,
@@ -317,6 +327,9 @@ class Autoboards(BaseCog):
             description=body,
             timestamp=now,
         )
+        if len(tags) == 1 and e.author.name is None:  # one clan: its badge beside its name
+            badge = clan_rows[tags[0]]["badge_url"] if tags[0] in clan_rows else None
+            clan_author(e, names.get(tags[0]), tags[0], badge)
         clan_label = ", ".join(names.get(t, t) for t in tags)
         e.set_footer(text=f"{clan_label[:1900]} · {repo.Schedule.from_row(row).describe()}")
         return e

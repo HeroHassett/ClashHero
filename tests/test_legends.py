@@ -3,6 +3,8 @@ from types import SimpleNamespace as NS
 
 from clashhero.cogs import _legend_embeds as E
 from clashhero.repos import legends as repo
+from clashhero.services.emojis import EMOJIS
+from clashhero.utils.fmt import clan_link, player_link
 
 DAY = "2026-11-07"
 SEASON = "2026-11-30"
@@ -75,13 +77,14 @@ def test_alert_embed():
         stats=stats,
         occurred_at=datetime(2026, 11, 7, tzinfo=UTC),
     )
-    assert "Attack" in e.title and "+25" in e.description and "5055" in e.description
+    assert e.title == "Amy (#A)" and "**Attack**" in e.description
+    assert "+25" in e.description and "5,055" in e.description
     fields = {f.name: f.value for f in e.fields}
-    assert fields["Attacks"] == "2/8 (+65)"
-    assert fields["Defenses"] == "1/8 (-10)"
-    assert fields["Net today"] == "+55"
+    assert fields["Attacks"] == "**2/8** · ▲ **+65**"
+    assert fields["Defenses"] == "**1/8** · ▼ **-10**"
+    assert fields["Net today"] == "▲ **+55**"
     d = E.alert_embed(name="Amy", tag="#A", kind="defense", trophies=-10, trophies_after=5045, stats=stats)
-    assert "Defense" in d.title
+    assert "**Defense**" in d.description and d.color == E.DEFENSE_COLOR
 
 
 def test_top_players_embed_highlight():
@@ -137,8 +140,14 @@ async def test_board_entries_and_clan_day(db):
     assert entries[1].stats.net == 30
     rows = await repo.clan_day_rows(db, "#C", DAY)
     assert [(r["player_tag"], r["offense"], r["defense"]) for r in rows] == [("#B", 0, 0), ("#A", 40, -10)]
-    e = E.clan_day_embed(clan_name="Clan", clan_tag="#C", day=DAY, rows=rows)
-    assert "Amy" in e.description
+    e = E.clan_day_embed(clan_name="Clan", clan_tag="#C", day=DAY, rows=rows, badge_url="https://b/x.png")
+    assert "Amy" in e.description and e.title == "Legend day summary · Nov 7"
+    assert (e.author.name, e.author.url, e.author.icon_url) == ("Clan", clan_link("#C"), "https://b/x.png")
+    fields = {f.name: f.value for f in e.fields}
+    assert fields == {"Clan offense": "▲ **+40**", "Clan defense": "▼ **-10**", "Net": "▲ **+30**"}
+    assert e.footer.text is None  # the clan is the author
+    empty = E.clan_day_embed(clan_name="Clan", clan_tag="#C", day=DAY, rows=[])
+    assert empty.description == "No legend activity recorded." and empty.author.icon_url is None
     summary = await repo.season_summary(db, "#A", SEASON)
     assert summary.days[0].start == 5000
     hist = await repo.player_seasons(db, "#A")
@@ -170,6 +179,77 @@ async def test_top_today_and_daily_posted(db):
 def test_alert_line():
     from clashhero.cogs.legends import alert_line
 
-    sub = {"id": 12, "name": "Amy", "player_tag": "#P", "attacks": 1, "defenses": 0}
-    assert alert_line(sub, "DM") == "`#12` **Amy** `#P` → DM · ⚔️ on · 🛡️ off"
-    assert alert_line({**sub, "name": None}, "<#5>").startswith("`#12` **?** `#P` → <#5>")
+    sub = {"id": 12, "name": "Amy", "player_tag": "#P", "attacks": 1, "defenses": 0, "ping_role_id": None}
+    assert alert_line(sub, "DM") == f"[Amy]({player_link('#P')}) `#P` → DM · ⚔️ on · 🛡️ off"
+    assert alert_line({**sub, "name": None}, "<#5>").startswith("`#P` → <#5>")
+    assert alert_line({**sub, "ping_role_id": 7}, "<#5>").endswith(" · 🛡️ off · pings <@&7>")
+
+
+def test_alert_line_game_icons(monkeypatch):
+    from clashhero.cogs.legends import alert_line
+
+    monkeypatch.setattr(EMOJIS, "_by_name", {"ui_sword": "<:ui_sword:1>", "ui_shield": "<:ui_shield:2>"})
+    sub = {"name": "Amy", "player_tag": "#P", "attacks": 0, "defenses": 1, "ping_role_id": None}
+    assert alert_line(sub, "DM").endswith("→ DM · <:ui_sword:1> off · <:ui_shield:2> on")
+
+
+def test_fit_lines_cuts_long_lists():
+    from clashhero.cogs.legends import fit_lines
+
+    lines = [f"line {i:03d}" for i in range(100)]
+    text = fit_lines(lines, 200)
+    assert len(text) <= 200 and text.endswith(" more") and text.startswith("line 000")
+    assert fit_lines(lines[:2], 200) == "line 000\nline 001"
+
+
+def _week(**kw):
+    days = [
+        repo.WeekDay(f"2026-11-0{2 + i}", 3000, 3040, repo.DayStats("#P", [40], [-10], cap=None))
+        for i in range(7)
+    ]
+    args = dict(name="P*", tag="#P", league="Legend II", week_id="2026-11-02", days=days, weekly_cap=30)
+    return E.week_embed(**{**args, **kw})
+
+
+def test_week_embed_layout():
+    e = _week()
+    assert e.title == "P\\* (#P)" and e.url == player_link("#P")  # the name markdown-escaped
+    assert e.description.startswith("**Legend II** · Week of Nov 2 – Nov 9\n```")
+    fields = {f.name: f.value for f in e.fields}
+    assert fields == {
+        "Attacks": "**7/30** · ▲ **+280**",
+        "Defenses": "**7** · ▼ **-70**",
+        "Net": "▲ **+210**",
+    }
+    assert e.footer.text == "battles are inferred from trophy changes · days reset 05:00 UTC"
+    assert _week(league=None, weekly_cap=None).description.startswith("**Ranked week of Nov 2 – Nov 9**")
+
+
+def test_week_embed_league_icon(monkeypatch):
+    monkeypatch.setattr(EMOJIS, "_by_name", {"lt_legend_ii": "<:lt_legend_ii:1>"})
+    assert _week().description.startswith("<:lt_legend_ii:1> **Legend II** · Week of")
+
+
+def test_history_embed():
+    seasons = [
+        {"season_id": "2026-11-02", "final_trophies": 5300, "peak_trophies": 5400, "days": 20, "attacks": 160}
+    ]
+    e = E.history_embed(name="Amy", tag="#A", seasons=seasons, best_trophies=6123, names=["Old_1", "Amy"])
+    assert e.title == "Amy (#A)" and e.url == player_link("#A")
+    assert e.description.startswith("**Legend history**\n```") and "5300" in e.description
+    fields = {f.name: f.value for f in e.fields}
+    assert fields == {"All-time best": "🏆 **6,123**", "Name history": "Old\\_1 → Amy"}
+    assert e.footer.text is None
+    empty = E.history_embed(name="Amy", tag="#A", seasons=[], best_trophies=None, names=["Amy"])
+    assert empty.description == "**Legend history**\nNo seasons recorded yet." and not empty.fields
+    many = [{**seasons[0], "season_id": f"S{i:04d}"} for i in range(300)]
+    long = E.history_embed(name="Amy", tag="#A", seasons=many, best_trophies=None, names=[])
+    assert len(long.description) <= 4000 and long.description.endswith("\n```")  # the code block closes
+
+
+def test_board_embed_clan_author():
+    entries = [repo.BoardEntry("#A", "Amy", 17, 5100, repo.DayStats("#A", [40]))]
+    e = E.board_embed(title="Legends today", entries=entries, clan_name="Clan", clan_tag="#C", badge_url="b")
+    assert (e.author.name, e.author.url, e.author.icon_url) == ("Clan", clan_link("#C"), "b")
+    assert "Amy" in e.description
+    assert E.board_embed(title="t", entries=entries).author.name is None  # no clan, no author

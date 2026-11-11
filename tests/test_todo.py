@@ -1,7 +1,8 @@
 from datetime import UTC, datetime, timedelta
 
-from clashhero.cogs.todo import account_field, item_line, ping_lines
+from clashhero.cogs.todo import account_block, item_line, ping_lines, todo_pages
 from clashhero.repos import todo as T
+from clashhero.services.emojis import EMOJIS
 
 NOW = datetime(2026, 11, 7, 12, tzinfo=UTC)  # Saturday: raid weekend on, Clan Games off
 GAMES_NOW = datetime(2026, 11, 24, 12, tzinfo=UTC)  # Clan Games running, war/raid above are over
@@ -164,30 +165,105 @@ def test_item_lines():
     stamp = f"<t:{int(end.timestamp())}:R>"
     assert (
         item_line(T.TodoItem("war", "Main", 1, 2, end))
-        == f"**War** · Main: 1 of 2 attacks left · ends {stamp}"
+        == f"⚔️ **1** of 2 war attacks left in **Main** · ends {stamp}"
     )
     assert (
         item_line(T.TodoItem("cwl", "Main", 0, 1, end))
-        == f"**CWL** · Main: 1 of 1 attack left · ends {stamp}"
+        == f"🏆 **1** of 1 CWL attack left in **Main** · ends {stamp}"
     )
     assert (
         item_line(T.TodoItem("ranked", "Legend I", 3, 8, end, "today"))
-        == f"**Ranked** · Legend I: 5 of 8 attacks left today · resets {stamp}"
+        == f"🏆 **5** of 8 attacks left today in **Legend I** · resets {stamp}"
     )
     assert item_line(T.TodoItem("ranked", "Electro League 32", 1, None, end, "today")) == (
-        "**Ranked** · Electro League 32: 1 attack today"
+        "🏆 **1** attack today in **Electro League 32**"
+    )
+    assert (
+        item_line(T.TodoItem("raid", "Main", 2, 5, end))
+        == f"🏰 **3** of 5 raid attacks left in **Main** · ends {stamp}"
     )
     assert (
         item_line(T.TodoItem("games", "", 1200, 4000, end))
-        == f"**Clan Games**: 1,200/4,000 points · ends {stamp}"
+        == f"🎯 **1,200**/4,000 Clan Games points · ends {stamp}"
     )
-    name, value = account_field(T.AccountTodo("#A", "Alice", 16, []))
-    assert (name, value) == ("Alice · TH16 (#A)", "All done ✅")
-    _, value = account_field(T.AccountTodo("#A", "Alice", None, [T.TodoItem("war", "Main", 1, 2, end)]))
-    assert value.startswith("**War**")
+
+
+def test_item_lines_use_game_icons(monkeypatch):
+    end = datetime(2026, 11, 8, tzinfo=UTC)
+    monkeypatch.setattr(
+        EMOJIS,
+        "_by_name",
+        {"ui_sword": "<:ui_sword:1>", "lt_legend_i": "<:lt_legend_i:2>", "th16": "<:th16:3>"},
+    )
+    assert item_line(T.TodoItem("war", "Main", 1, 2, end)).startswith("<:ui_sword:1> **1** of 2")
+    assert item_line(T.TodoItem("ranked", "Legend I", 3, 8, end, "today")).startswith(
+        "<:lt_legend_i:2> **5**"
+    )
+    [head] = account_block(T.AccountTodo("#A", "Alice", 16, []))
+    assert head.startswith("<:th16:3> **[Alice](")
+
+
+def test_account_blocks():
+    end = datetime(2026, 11, 8, tzinfo=UTC)
+    link = "https://link.clashofclans.com/?action=OpenPlayerProfile&tag=A"
+    assert account_block(T.AccountTodo("#A", "Alice", 16, [])) == [
+        f"TH16 **[Alice]({link})** (#A) · ✅ All done"
+    ]
+    war = T.TodoItem("war", "Main", 1, 2, end)
+    block = account_block(T.AccountTodo("#A", "Al_ice", None, [war]))
+    assert block[0] == "**[Al\\_ice](" + link + ")** (#A)"
+    assert block[1].startswith("⚔️ **1** of 2 war attacks")
+
+
+def test_todo_pages_put_pending_accounts_first_and_split():
+    end = datetime(2026, 11, 8, tzinfo=UTC)
+    done = T.AccountTodo("#D", "Done", 15, [])
+    busy = T.AccountTodo("#B", "Busy", 16, [T.TodoItem("war", "Main", 0, 2, end)])
+    [page] = todo_pages([done, busy])
+    assert page.index("Busy") < page.index("Done") and "\n\n" in page
+    many = [
+        T.AccountTodo(f"#{i}", f"Player {i}", 16, [T.TodoItem("war", "Main", 0, 2, end)]) for i in range(40)
+    ]
+    pages = todo_pages(many, 1000)
+    assert len(pages) > 1 and all(len(p) <= 1000 for p in pages)
+    assert sum(p.count("**[Player") for p in pages) == 40
 
 
 def test_ping_lines():
     rows = [{"player_tag": t, "name": n} for t, n in [("#A", "a_1"), ("#B", "b"), ("#C", "c")]]
     lines, unlinked = ping_lines(rows, {"#A": 1, "#B": 1})
     assert lines == ["<@1> a\\_1, b"] and unlinked == 1
+
+
+class Sent:
+    def __init__(self):
+        self.messages = []
+
+    async def send_message(self, *args, **kwargs):
+        self.messages.append(kwargs)
+
+    async def send(self, *args, **kwargs):
+        self.messages.append(kwargs)
+
+
+async def test_todo_command(db, monkeypatch):
+    from types import SimpleNamespace as NS
+
+    from clashhero.cogs import todo as todo_mod
+
+    await seed(db)
+    for tag in ("#A", "#E"):
+        await db.link_player(tag, 7)
+    monkeypatch.setattr(todo_mod, "utcnow", lambda: NOW)
+    sent = Sent()
+    bot = NS(db=db)
+    user = NS(id=7, display_name="Al", mention="<@7>")
+    inter = NS(client=bot, guild_id=None, user=user, response=sent, followup=sent)
+    await todo_mod.Todo.todo.callback(todo_mod.Todo(bot), inter, None)
+    [msg] = sent.messages
+    e = msg["embed"]
+    assert e.title == "To-do · Al"
+    summary, alice, eve = e.description.split("\n\n")
+    assert summary == "**1** of 2 accounts with something left to do."
+    assert alice.startswith("TH16 **[Alice](") and "war attacks left in **Main**" in alice
+    assert eve.startswith("TH10 **[Eve](") and eve.endswith("· ✅ All done")

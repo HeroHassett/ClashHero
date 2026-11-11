@@ -172,10 +172,25 @@ def test_rush_report_percentages():
     assert (r.overall.done, r.overall.total) == (17, 41 + 95)
     assert r.skipped == 1  # Brand New Troop: previous-TH max unknown
     top = rushed_blocks(sample(), 17)[0]
-    assert top[1] == "🧪 Lab `4.9%` · 👑 Heroes `15.8%` · 📊 Overall `12.5%`"
-    assert "Equipment isn't counted" in top[2]
+    # One short line each, the percentage in bold (no inline-code chips in prose lines).
+    assert top[1:4] == ["🧪 Lab **4.9%**", "👑 Heroes **15.8%**", "📊 Overall **12.5%**"]
+    assert "Equipment isn't counted" in top[4]
     fine = rushed_blocks([UnitLevel("Barbarian", "troops", 12, 13, 12)], 17)
     assert fine[0][0] == "✅ **Not rushed** 🎉" and len(fine) == 1
+
+
+def test_page_headers_use_town_hall_icon(monkeypatch):
+    from clashhero.services.emojis import EMOJIS
+
+    assert units_blocks(sample(), 17)[0][0] == "📊 **Units** at TH17"  # standard emoji until uploaded
+    monkeypatch.setattr(EMOJIS, "_by_name", {"th17": "<:th17:1>", "ui_heroes": "<:ui_heroes:2>"})
+    assert units_blocks(sample(), 17)[0][0] == "<:th17:1> **Units** at TH17"
+    upgrades = upgrades_blocks(sample(), 17)[0]
+    assert upgrades == ["<:th17:1> **Upgrades left** at TH17", "**5** upgrades · **49** levels"]
+    assert rushed_blocks(sample(), 17)[0][2:4] == [
+        "<:ui_heroes:2> Heroes **15.8%**",
+        "<:th17:1> Overall **12.5%**",
+    ]
 
 
 def test_rushed_grids_show_previous_max():
@@ -288,9 +303,13 @@ def test_profile_one_stat_per_line():
         "🏰 **Capital Gold Looted** 3,910,515",
         "🏰 **Capital Gold Contributed** 5,160,621",
         "🔗 **Discord** <@42> ✅",
+        "⚔️ **War** ▲ Opted in",  # green ▲ in, red ▼ out, as in the war preference log
+        "Archer Queen **95**",  # hero levels in bold
         "**Previous Names** Old\\_one",
     ):
         assert expected in lines, expected
+    opted_out = profile_parts(profile_player(war_opted_in=False))[0].splitlines()
+    assert "⚔️ **War** ▼ Opted out" in opted_out
     assert "[Best\\_Clan](" in desc and "(Elder)" in desc
     assert len(desc) <= 4096
     # No line long enough to wrap on a phone (emoji markup aside).
@@ -303,7 +322,7 @@ def test_profile_uses_game_symbols_once_uploaded(monkeypatch):
 
     icons = (
         "ui_donate_troops ui_donate_spells ui_donate_sieges ui_sword ui_shield ui_war_star ui_cwl_star"
-        " res_capital_gold ui_xp ui_clan_games res_trophy res_gold ui_stopwatch"
+        " res_capital_gold ui_xp ui_clan_games res_trophy res_gold ui_stopwatch ui_arrow_up archer_queen"
     ).split()
     monkeypatch.setattr(EMOJIS, "_by_name", {n: f"<:{n}:1>" for n in icons})
     desc, _ = profile_parts(profile_player(), season=(4, 0), last_seen="2026-11-08T03:26:07+00:00")
@@ -318,6 +337,8 @@ def test_profile_uses_game_symbols_once_uploaded(monkeypatch):
         "<:ui_shield:1> **Defense Won** 746",
         "<:ui_cwl_star:1> **CWL War Stars** 1,150",
         "<:res_capital_gold:1> **Capital Gold Contributed** 5,160,621",
+        "<:ui_war_star:1> **War** <:ui_arrow_up:1> Opted in",
+        "<:archer_queen:1> **95**",
     ):
         assert expected in lines, expected
     assert any(line.startswith("<:ui_stopwatch:1> **Last Seen** <t:") for line in lines)
@@ -338,3 +359,45 @@ def test_profile_best_finish():
     desc, _ = profile_parts(profile_player(), best_finish=Finish(9013, 4980, "v2-2026-10-26T05:00:00Z"))
     assert "🏆 **Best Finish** #9,013 (4,980)" in desc.splitlines()
     assert "Best Finish" not in profile_parts(profile_player())[0]
+
+
+# ------------------------------------------------------------------ the whole card
+
+
+def fake_client(player, collector=None):
+    async def get_player(tag):
+        return player
+
+    return NS(coc=NS(get_player=get_player), collector=collector)
+
+
+async def test_player_page_shows_clan_with_badge():
+    from clashhero.cogs.info import render_player_page
+    from clashhero.utils.fmt import clan_link, player_link
+
+    clan = NS(name="Best_Clan", tag="#2QQ", badge=NS(url="https://badge/b.png"))
+    player = profile_player(name="Al_ex", clan=clan, _raw_data={"troops": [], "heroes": []})
+    embeds, view = await render_player_page(fake_client(player), None, "#2PP", "units")
+    e = embeds[0]
+    assert (e.title, e.url) == ("Al\\_ex (#2PP)", player_link("#2PP"))
+    assert (e.author.name, e.author.url, e.author.icon_url) == (
+        "Best_Clan (#2QQ)",
+        clan_link("#2QQ"),
+        "https://badge/b.png",
+    )
+    assert e.footer.text == "Units · TH18" and len(view.children) == 5
+    clanless, _ = await render_player_page(
+        fake_client(profile_player(clan=None, _raw_data={})), None, "#2PP", "units"
+    )
+    assert clanless[0].author.name is None
+
+
+async def test_player_page_keeps_maintenance_notice():
+    from clashhero.cogs.info import render_player_page
+
+    clan = NS(name="Best", tag="#2QQ", badge=None)
+    player = profile_player(clan=clan, _raw_data={"troops": []})
+    collector = NS(in_maintenance=True, maintenance_since=None)
+    [e], _ = await render_player_page(fake_client(player, collector), None, "#2PP", "units")
+    assert e.author.name == "Best (#2QQ)" and e.author.icon_url is None  # no badge: no icon
+    assert e.description.startswith("-# 🛠️ Clash of Clans API maintenance")  # moved, not lost

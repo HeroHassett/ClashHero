@@ -3,9 +3,10 @@ so they're easy to test. Colors may be overridden per subscription by outbox.sen
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import discord
@@ -14,8 +15,8 @@ from discord.utils import escape_markdown
 from clashhero.cogs._info_embeds import rush_report, unit_levels
 from clashhero.constants import CLAN_TYPE_LABELS, WAR_FREQUENCY_LABELS
 from clashhero.services.emojis import EMOJIS
-from clashhero.utils.fmt import chunk_lines, clan_link, duration, player_link, role_name, stars, table, ts
-from clashhero.utils.ranked import league_name
+from clashhero.utils.fmt import chunk_lines, clan_link, duration, player_link, role_name, ts
+from clashhero.utils.ranked import league_name, tier_number
 from clashhero.utils.style import ICONS
 
 GREEN = discord.Color.green()
@@ -72,6 +73,43 @@ def _arrow(direction: str, color: str = "") -> str:
     return EMOJIS.get(name, "▲" if direction == "up" else "▼")
 
 
+arrow = _arrow  # public: other embed modules colour their arrows the same way
+
+
+def th_icon(level: int | None) -> str:
+    """The Town Hall's game icon, else "TH18"; empty when unknown."""
+    if not level:
+        return ""
+    return EMOJIS.town_hall(level) or f"TH{level}"
+
+
+def player_ref(name: str, tag: str) -> str:
+    """The player's name as a link to their in-game profile."""
+    return f"[{escape_markdown(name)}]({player_link(tag)})"
+
+
+def war_stars(stars: int, new: int | None = None) -> str:
+    """Three star icons: silver for stars an earlier attack already took, gold for new ones,
+    empty for the rest (all gold when ``new`` isn't known)."""
+    stars = max(0, min(3, stars))
+    new = stars if new is None else max(0, min(stars, new))
+    old_star = EMOJIS.get("ui_star_old", "★")
+    new_star = EMOJIS.get("ui_star_new", "★")
+    empty = EMOJIS.get("ui_star_empty", "☆")
+    return old_star * (stars - new) + new_star * new + empty * (3 - stars)
+
+
+def star_icon() -> str:
+    return EMOJIS.get("ui_war_star", "★")
+
+
+def clan_author(e: discord.Embed, name: str | None, tag: str | None, badge_url: str | None) -> discord.Embed:
+    """The clan as the embed's author line: its badge beside its name, linked to it in game."""
+    if name or tag:
+        e.set_author(name=name or tag or "", url=clan_link(tag) if tag else None, icon_url=badge_url or None)
+    return e
+
+
 def profile_view(tag: str) -> discord.ui.View:
     """Link-only view with a "Profile" button that opens the player in game. Link buttons need
     no persistence, so this can be attached to any log post."""
@@ -83,15 +121,49 @@ def profile_view(tag: str) -> discord.ui.View:
 # ------------------------------------------------------------------ clan / members
 
 
-def clan_attribute_embed(clan_name: str, clan_tag: str, attribute: str, old: Any, new: Any) -> discord.Embed:
+# War leagues lowest first, for telling a promotion from a drop.
+WAR_LEAGUES = tuple(
+    f"{metal} League {n}"
+    for metal in ("Bronze", "Silver", "Gold", "Crystal", "Master", "Champion")
+    for n in ("III", "II", "I")
+)
+
+
+def _war_league_icon(name: Any) -> str:
+    return EMOJIS.get(f"cwl_{str(name).lower().replace(' league', '').replace(' ', '_')}") if name else ""
+
+
+def clan_attribute_embed(
+    clan_name: str,
+    clan_tag: str,
+    attribute: str,
+    old: Any,
+    new: Any,
+    *,
+    badge_url: str | None = None,
+    at: datetime | None = None,
+) -> discord.Embed:
+    """A clan milestone (level, war or capital league, Capital Hall): the clan as the author,
+    what it is now with an up or down arrow, and what it was."""
     label = ATTRIBUTE_LABELS.get(attribute, attribute)
     if isinstance(old, int) and isinstance(new, int):
-        verb = "increased" if new > old else "decreased"
-        desc = f"**{label}** {verb}: {old} → **{new}**"
+        up = new > old
+    elif attribute == "war_league" and old in WAR_LEAGUES and new in WAR_LEAGUES:
+        up = WAR_LEAGUES.index(new) > WAR_LEAGUES.index(old)
     else:
-        desc = f"**{label}** changed: {old} → **{new}**"
-    e = discord.Embed(title=f"{clan_name} achievement", description=desc, color=GOLD)
-    e.set_footer(text=clan_tag)
+        up = None
+    arrow = "" if up is None else _arrow("up" if up else "down")
+    icon_new = _war_league_icon(new) if attribute == "war_league" else ""
+    icon_old = _war_league_icon(old) if attribute == "war_league" else ""
+    value_new = f"{new:,}" if isinstance(new, int) else str(new or "None")
+    value_old = f"{old:,}" if isinstance(old, int) else str(old or "None")
+    lines = [
+        " ".join(x for x in (arrow, f"{label}:", icon_new, f"**{value_new}**") if x),
+        " ".join(x for x in ("was", icon_old, value_old) if x),
+    ]
+    e = discord.Embed(description="\n".join(lines), color=GREEN if up else RED if up is False else GOLD)
+    clan_author(e, clan_name, clan_tag, badge_url)
+    e.timestamp = at
     return e
 
 
@@ -144,12 +216,22 @@ def _member_head(town_hall: int, league: str | None, trophies: int) -> list[str]
 
 
 def _member_embed(member: Any, lines: Sequence[str], color: discord.Color) -> discord.Embed:
+    return player_embed(member.name, member.tag, lines, color)
+
+
+def player_embed(name: str, tag: str, lines: Sequence[str], color: discord.Color) -> discord.Embed:
+    """A post about one player: "Name (#TAG)" as the title, linked to their in-game profile."""
     return discord.Embed(
-        title=f"{escape_markdown(member.name)} ({member.tag})",
-        url=player_link(member.tag),
-        description="\n".join(lines),
+        title=_truncate(f"{escape_markdown(name)} ({tag})", 256),
+        url=player_link(tag),
+        description="\n".join(x for x in lines if x),
         color=color,
     )
+
+
+def _profile_line(town_hall: int | None, league: str | None, trophies: int | None) -> str:
+    """Town Hall and trophies with their game icons, when the bot has the player's profile."""
+    return " ".join(_member_head(town_hall, league, trophies or 0)) if town_hall else ""
 
 
 def _clan_footer(e: discord.Embed, text: str, badge_url: str | None, at: datetime | None) -> discord.Embed:
@@ -219,14 +301,16 @@ def clan_move_embed(
     new_clan_name: str | None,
     new_clan_tag: str,
     own_clan: bool = False,
+    *,
+    at: datetime | None = None,
 ) -> discord.Embed:
     """Follow-up to a leave: where the player went. ``own_clan`` marks one of the server's clans."""
-    new = f"[{new_clan_name or new_clan_tag}]({clan_link(new_clan_tag)})"
-    desc = f"**{name}** (left {old_clan_name}) is now in **{new}** ({new_clan_tag})"
+    new = f"[{escape_markdown(new_clan_name or new_clan_tag)}]({clan_link(new_clan_tag)})"
+    lines = [f"Left **{escape_markdown(old_clan_name)}** · now in **{new}** `{new_clan_tag}`"]
     if own_clan:
-        desc += "\nThat's one of this server's clans."
-    e = discord.Embed(description=desc, color=GREEN if own_clan else GREY)
-    e.set_footer(text=tag)
+        lines.append(f"{_arrow('up')} That's one of this server's clans.")
+    e = player_embed(name, tag, lines, GREEN if own_clan else GREY)
+    e.timestamp = at
     return e
 
 
@@ -263,38 +347,71 @@ def role_change_embed(
     return _clan_footer(e, clan_name, badge_url, at)
 
 
-def name_change_embed(tag: str, old: str, new: str) -> discord.Embed:
-    e = discord.Embed(description=f"**{old}** changed name to **{new}**", color=BLUE)
-    e.set_footer(text=tag)
+@dataclass(frozen=True)
+class PlayerContext:
+    """What a player post shows besides the change itself: the player's stored Town Hall, league
+    and trophies, and their clan (badge and name, in the footer)."""
+
+    town_hall: int | None = None
+    league: str | None = None
+    trophies: int | None = None
+    clan_name: str | None = None
+    badge_url: str | None = None
+    at: datetime | None = None
+
+
+def _player_post(
+    name: str, tag: str, lines: Sequence[str], color: discord.Color, ctx: PlayerContext | None
+) -> discord.Embed:
+    ctx = ctx or PlayerContext()
+    e = player_embed(name, tag, [*lines, _profile_line(ctx.town_hall, ctx.league, ctx.trophies)], color)
+    if ctx.clan_name:
+        e.set_footer(text=ctx.clan_name, icon_url=ctx.badge_url or None)
+    e.timestamp = ctx.at
     return e
 
 
-def town_hall_embed(name: str, tag: str, old: int, new: int) -> discord.Embed:
-    e = discord.Embed(
-        description=f"**{name}** upgraded Town Hall {old} → **{new}** 🎉",
-        url=player_link(tag),
-        color=GOLD,
-    )
-    e.set_footer(text=tag)
-    return e
+def name_change_embed(tag: str, old: str, new: str, ctx: PlayerContext | None = None) -> discord.Embed:
+    return _player_post(new, tag, [f"Changed their name from **{escape_markdown(old)}**"], BLUE, ctx)
 
 
-def war_preference_embed(name: str, tag: str, opted_in: bool) -> discord.Embed:
-    state = "opted **in** to" if opted_in else "opted **out** of"
-    e = discord.Embed(description=f"**{name}** {state} war", color=GREEN if opted_in else RED)
-    e.set_footer(text=tag)
-    return e
+def town_hall_embed(
+    name: str, tag: str, old: int, new: int, ctx: PlayerContext | None = None
+) -> discord.Embed:
+    line = f"{_arrow('up')} Upgraded to **Town Hall {new}** · was {old}"
+    icons = f"{th_icon(old)} → {th_icon(new)}" if EMOJIS.town_hall(new) else ""
+    ctx = dataclasses.replace(ctx or PlayerContext(), town_hall=None)  # the icons above say it
+    return _player_post(name, tag, [line, icons], GOLD, ctx)
+
+
+def war_preference_embed(
+    name: str, tag: str, opted_in: bool, ctx: PlayerContext | None = None
+) -> discord.Embed:
+    line = f"{_arrow('up')} Opted **in** to war" if opted_in else f"{_arrow('down')} Opted **out** of war"
+    return _player_post(name, tag, [line], GREEN if opted_in else RED, ctx)
 
 
 def league_change_embed(
-    name: str, tag: str, old: str | None, new: str | None, trophies: int
+    name: str,
+    tag: str,
+    old: str | None,
+    new: str | None,
+    trophies: int,
+    ctx: PlayerContext | None = None,
 ) -> discord.Embed:
-    e = discord.Embed(
-        description=f"**{name}**: {old or 'Unranked'} → **{new or 'Unranked'}** ({trophies} trophies)",
-        color=BLUE,
-    )
-    e.set_footer(text=tag)
-    return e
+    """A new league tier: up (green) or down (red) when the tiers' order is known."""
+    before, after = tier_number(old), tier_number(new)
+    up = before is not None and after is not None and after > before
+    down = before is not None and after is not None and after < before
+    arrow = _arrow("up") if up else _arrow("down") if down else ""
+    verb = "Promoted to" if up else "Dropped to" if down else "Now in"
+    old_icon, new_icon = EMOJIS.league(old), EMOJIS.league(new)
+    lines = [
+        " ".join(x for x in (arrow, verb, new_icon, f"**{new or 'Unranked'}**") if x),
+        " ".join(x for x in ("was", old_icon, old or "Unranked") if x),
+    ]
+    ctx = dataclasses.replace(ctx or PlayerContext(), league=new, trophies=trophies)
+    return _player_post(name, tag, lines, GREEN if up else RED if down else BLUE, ctx)
 
 
 @dataclass(frozen=True)
@@ -369,12 +486,49 @@ def _fit_sections(sections: Sequence[tuple[str, list[str]]], limit: int) -> str:
     return text
 
 
-def clan_games_progress_embed(clan_name: str, entries: Sequence[tuple[str, int, int]]) -> discord.Embed:
-    """entries: (name, points gained in batch, total)."""
-    lines = [f"`+{p:>4}` **{n}** ({total}/4000)" for n, p, total in sorted(entries, key=lambda x: -x[1])]
-    return discord.Embed(
-        title=f"{clan_name} Clan Games progress", description="\n".join(lines)[:4000], color=GOLD
+@dataclass(frozen=True)
+class GamesProgress:
+    """One player's Clan Games points over a batch window and their total so far."""
+
+    name: str
+    tag: str
+    points: int
+    total: int
+    town_hall: int | None = None
+
+
+CLAN_GAMES_MAX = 4000  # points one player can earn
+
+
+def clan_games_progress_embed(
+    clan_name: str,
+    entries: Sequence[GamesProgress],
+    *,
+    clan_tag: str | None = None,
+    badge_url: str | None = None,
+    at: datetime | None = None,
+) -> discord.Embed:
+    """Who earned Clan Games points, most first: Town Hall icon, points gained, linked name and
+    their total so far (a check once they've maxed)."""
+    icon = EMOJIS.get("ui_clan_games")
+    lines = []
+    for p in sorted(entries, key=lambda x: (-x.points, x.name.lower())):
+        total = f"{p.total:,}/{CLAN_GAMES_MAX:,}" + (f" {_arrow('up')}" if p.total >= CLAN_GAMES_MAX else "")
+        lines.append(
+            " ".join(
+                x
+                for x in (th_icon(p.town_hall), f"**+{p.points:,}**", player_ref(p.name, p.tag), f"· {total}")
+                if x
+            )
+        )
+    e = discord.Embed(
+        title=" ".join(x for x in (icon, "Clan Games progress") if x),
+        description=_fit_lines(lines, 4000),
+        color=GOLD,
     )
+    clan_author(e, clan_name, clan_tag, badge_url)
+    e.timestamp = at
+    return e
 
 
 # ------------------------------------------------------------------ upgrades / boosts / settings
@@ -384,6 +538,11 @@ def unit_change_text(unit: str, old: int | None, new: int) -> str:
     if old is None:
         return f"{unit} unlocked" if new <= 1 else f"{unit} unlocked (level {new})"
     return f"{unit} {old} → **{new}**"
+
+
+def _unit_line(unit: str, old: int | None, new: int) -> str:
+    """An upgrade with the unit's game icon (a bullet when it has none)."""
+    return f"{EMOJIS.unit(unit) or '•'} {unit_change_text(unit, old, new)}"
 
 
 def _pack(blocks: Sequence[Sequence[str]], limit: int, gap: str = "\n\n") -> list[str]:
@@ -407,12 +566,25 @@ def _pack(blocks: Sequence[Sequence[str]], limit: int, gap: str = "\n\n") -> lis
     return out
 
 
-def _titled(title: str, pages: Sequence[str], color: discord.Color, footer: str) -> list[discord.Embed]:
+def _titled(
+    title: str,
+    pages: Sequence[str],
+    color: discord.Color,
+    footer: str,
+    *,
+    clan: tuple[str | None, str | None, str | None] | None = None,
+    at: datetime | None = None,
+) -> list[discord.Embed]:
+    """``pages`` as embeds titled ``title`` ("(2/3)" when split), the clan (name, tag, badge) as
+    the author and the time on each."""
     embeds = []
     for i, page in enumerate(pages, 1):
         suffix = f" ({i}/{len(pages)})" if len(pages) > 1 else ""
         e = discord.Embed(title=f"{title}{suffix}", description=page, color=color)
+        if clan is not None:
+            clan_author(e, *clan)
         e.set_footer(text=footer)
+        e.timestamp = at
         embeds.append(e)
     return embeds
 
@@ -421,37 +593,56 @@ def upgrades_embeds(
     clan_name: str,
     entries: Sequence[tuple[str, str, int, Sequence[UnitChange]]],
     limit: int = 4000,
+    *,
+    clan_tag: str | None = None,
+    badge_url: str | None = None,
+    at: datetime | None = None,
 ) -> list[discord.Embed]:
     """entries: (player name, tag, town hall, unit changes) aggregated over the batch window.
-    One block per player; split across several embeds when long."""
+    One block per player (linked name and Town Hall icon, then each unit with its icon); split
+    across several embeds when long."""
     entries = [x for x in entries if x[3]]
     if not entries:
         return []
     blocks = []
     for name, tag, th, changes in sorted(entries, key=lambda x: (-len(x[3]), x[0].lower())):
         ordered = sorted(changes, key=lambda c: (UNIT_KIND_ORDER.get(c[0], 9), c[1]))
-        head = f"**[{name}]({player_link(tag)})** · TH{th}"
-        blocks.append([head, *(f"• {unit_change_text(u, old, new)}" for _, u, old, new in ordered)])
+        head = " ".join(x for x in (th_icon(th), f"**{player_ref(name, tag)}**") if x)
+        blocks.append([head, *(_unit_line(u, old, new) for _, u, old, new in ordered)])
     total = sum(len(x[3]) for x in entries)
     footer = f"{total} upgrade{'s' * (total != 1)} by {len(entries)} player{'s' * (len(entries) != 1)}"
-    return _titled(f"{clan_name} upgrades", _pack(blocks, limit), GOLD, footer)
+    return _titled(
+        "Upgrades", _pack(blocks, limit), GOLD, footer, clan=(clan_name, clan_tag, badge_url), at=at
+    )
 
 
 def super_troops_embeds(
-    clan_name: str, entries: Sequence[tuple[str, str, Sequence[str]]], limit: int = 4000
+    clan_name: str,
+    entries: Sequence[tuple[str, str, Sequence[str]]],
+    limit: int = 4000,
+    *,
+    clan_tag: str | None = None,
+    badge_url: str | None = None,
+    at: datetime | None = None,
 ) -> list[discord.Embed]:
     """entries: (player name, tag, super troops newly boosted in the batch window)."""
     entries = [x for x in entries if x[2]]
     if not entries:
         return []
     lines = [
-        f"**{name}** boosted {', '.join(f'**{t}**' for t in troops)}"
-        for name, _, troops in sorted(entries, key=lambda x: x[0].lower())
+        f"**{player_ref(name, tag)}** boosted "
+        + ", ".join(" ".join(x for x in (EMOJIS.unit(t), f"**{t}**") if x) for t in troops)
+        for name, tag, troops in sorted(entries, key=lambda x: x[0].lower())
     ]
     total = sum(len(x[2]) for x in entries)
     footer = f"{total} boost{'s' * (total != 1)}"
     return _titled(
-        f"{clan_name} super troop boosts", _pack([[ln] for ln in lines], limit, "\n"), BLUE, footer
+        "Super troop boosts",
+        _pack([[ln] for ln in lines], limit, "\n"),
+        BLUE,
+        footer,
+        clan=(clan_name, clan_tag, badge_url),
+        at=at,
     )
 
 
@@ -480,10 +671,17 @@ def _quoted_description(text: Any, limit: int = 400) -> str:
 
 
 def clan_settings_embed(
-    clan_name: str, clan_tag: str, changes: Sequence[tuple[str, Any, Any]]
+    clan_name: str,
+    clan_tag: str,
+    changes: Sequence[tuple[str, Any, Any]],
+    *,
+    badge_url: str | None = None,
+    at: datetime | None = None,
 ) -> discord.Embed:
     """changes: (setting, old, new); setting keys come from services.snapshots.clan_settings."""
-    e = discord.Embed(title=f"{clan_name} settings changed", url=clan_link(clan_tag), color=BLUE)
+    e = discord.Embed(title="Clan settings changed", color=BLUE)
+    clan_author(e, clan_name, clan_tag, badge_url)
+    e.timestamp = at
     lines = []
     for setting, old, new in changes:
         label = SETTING_LABELS.get(setting, setting.replace("_", " ").capitalize())
@@ -502,64 +700,122 @@ def clan_settings_embed(
             lines.append(f"**{label}**: {setting_value(setting, old)} → **{setting_value(setting, new)}**")
     if lines:
         e.description = "\n".join(lines)[:4000]
-    e.set_footer(text=clan_tag)
     return e
 
 
 # ------------------------------------------------------------------ war
 
 
-def war_attack_embed(
-    war: Mapping[str, Any], attack: Mapping[str, Any], attacker: str, defender: str
-) -> discord.Embed:
-    ours = not attack["is_opponent"]
-    icon = "⚔️" if ours else "🛡️"
-    pos_a = f"#{attack['attacker_pos']}" if attack.get("attacker_pos") else ""
-    pos_d = f"#{attack['defender_pos']}" if attack.get("defender_pos") else ""
-    th_a = f"TH{attack['attacker_th']}" if attack.get("attacker_th") else ""
-    th_d = f"TH{attack['defender_th']}" if attack.get("defender_th") else ""
-    extras = []
-    if attack.get("new_stars"):
-        extras.append(f"+{attack['new_stars']} new ★")
-    if attack.get("is_fresh"):
-        extras.append("fresh")
-    desc = (
-        f"{icon} **{attacker}** {pos_a} {th_a} → **{defender}** {pos_d} {th_d}\n"
-        f"{stars(attack['stars'])} **{attack['destruction']:.0f}%**"
-        + (f" · {' · '.join(extras)}" if extras else "")
-    )
-    kind = "CWL" if war.get("war_type") == "cwl" else "War"
-    rnd = f" round {war['cwl_round']}" if war.get("cwl_round") else ""
-    e = discord.Embed(description=desc, color=GREEN if ours else RED)
-    e.set_footer(
-        text=f"{kind}{rnd} vs {war.get('opponent_name') or '?'} · "
-        f"{war.get('clan_stars', 0)}★ – {war.get('opponent_stars', 0)}★"
-    )
+def war_label(war: Mapping[str, Any]) -> str:
+    """ "CWL round 7", "Friendly war" or "War"."""
+    if war.get("war_type") == "cwl":
+        return f"CWL round {war['cwl_round']}" if war.get("cwl_round") else "CWL"
+    return "Friendly war" if war.get("war_type") == "friendly" else "War"
+
+
+def _war_scores(e: discord.Embed, war: Mapping[str, Any]) -> None:
+    """Both clans' stars and destruction, side by side, ours first."""
+    star = star_icon()
+    for side, prefix in (("clan", "clan"), ("opponent", "opponent")):
+        name = war.get(f"{side}_name") or ("Us" if side == "clan" else "Opponent")
+        stars = war.get(f"{prefix}_stars") or 0
+        destruction = war.get(f"{prefix}_destruction") or 0
+        e.add_field(name=_truncate(name, 100), value=f"{star} **{stars}** · {destruction:.2f}%")
+
+
+def _war_footer(e: discord.Embed, war: Mapping[str, Any], text: str, at: datetime | None) -> discord.Embed:
+    """The opponent's badge with "vs <opponent>" and ``text``, and the time."""
+    vs = f"vs {war.get('opponent_name') or '?'}"
+    e.set_footer(text=" · ".join(x for x in (vs, text) if x), icon_url=war.get("opponent_badge_url") or None)
+    e.timestamp = at
     return e
 
 
-def war_state_embed(war: Mapping[str, Any], new_state: str) -> discord.Embed:
-    kind = "CWL" if war.get("war_type") == "cwl" else "War"
-    rnd = f" (round {war['cwl_round']})" if war.get("cwl_round") else ""
+def war_attack_embed(
+    war: Mapping[str, Any],
+    attack: Mapping[str, Any],
+    attacker: str,
+    defender: str,
+    *,
+    at: datetime | None = None,
+) -> discord.Embed:
+    """One war attack: our clan (badge) as the author; who attacked whom, each with their map
+    position, linked name and Town Hall; the stars (silver = already taken, gold = new) and
+    destruction; then both clans' totals, and the opponent in the footer. Green for our attack,
+    red for theirs."""
+    ours = not attack["is_opponent"]
+    icon = EMOJIS.get("ui_sword", "⚔️") if ours else EMOJIS.get("ui_shield", "🛡️")
+
+    def side(name: str, tag: str | None, pos: Any, th: Any) -> str:
+        who = player_ref(name, tag) if tag else f"**{escape_markdown(name)}**"
+        return " ".join(x for x in (f"**{pos}.**" if pos else "", who, th_icon(th)) if x)
+
+    hitter = side(attacker, attack.get("attacker_tag"), attack.get("attacker_pos"), attack.get("attacker_th"))
+    target = side(defender, attack.get("defender_tag"), attack.get("defender_pos"), attack.get("defender_th"))
+    line = f"{icon} {hitter}  →  {target}"
+    result = f"{war_stars(attack['stars'], attack.get('new_stars'))} **{attack['destruction']:.0f}%**"
+    if attack.get("is_fresh"):
+        result += " · first hit on this base"
+    e = discord.Embed(description=f"{line}\n{result}", color=GREEN if ours else RED)
+    clan_author(e, war.get("clan_name"), war.get("clan_tag"), war.get("clan_badge_url"))
+    _war_scores(e, war)
+    total = (war.get("team_size") or 0) * (war.get("attacks_per_member") or 0)
+    used = war.get("clan_attacks" if ours else "opponent_attacks") or 0
+    attacks = f"{used}/{total} attacks" if total else ""
+    return _war_footer(e, war, " · ".join(x for x in (war_label(war), attacks) if x), at)
+
+
+def war_state_embed(war: Mapping[str, Any], new_state: str, *, at: datetime | None = None) -> discord.Embed:
+    """A war's preparation day, battle day or result: our clan as the author, the opponent
+    (linked, its badge as the thumbnail) in the title, the times, and the score once it's on."""
     opp = war.get("opponent_name") or "?"
     size = war.get("team_size") or "?"
+    label = war_label(war)
     if new_state == "preparation":
-        title = f"{kind} declared vs {opp}{rnd}"
-        desc = f"{size}v{size} · battle day starts {ts(war.get('start_time'))}"
+        title = f"{label} vs {opp}"
+        desc = f"**Preparation day** · {size} vs {size}\nBattle day starts {ts(war.get('start_time'), 'F')}"
         color = BLUE
     elif new_state == "inWar":
-        title = f"{kind} battle day started vs {opp}{rnd}"
-        desc = f"{size}v{size} · ends {ts(war.get('end_time'))}"
+        title = f"{label} vs {opp}"
+        desc = f"**Battle day** · {size} vs {size}\nEnds {ts(war.get('end_time'), 'R')}"
         color = GOLD
     else:
-        result = (war.get("result") or "ended").upper()
-        title = f"{kind} vs {opp}{rnd}: {result}"
-        desc = (
-            f"{war.get('clan_stars', 0)}★ {war.get('clan_destruction', 0):.2f}% — "
-            f"{war.get('opponent_stars', 0)}★ {war.get('opponent_destruction', 0):.2f}%"
-        )
-        color = {"win": GREEN, "lose": RED}.get(war.get("result"), GREY)
-    return discord.Embed(title=title, description=desc, color=color)
+        result = war.get("result")
+        word = {"win": "Victory", "lose": "Defeat", "tie": "Tie"}.get(result, "War ended")
+        arrow = _arrow("up") if result == "win" else _arrow("down") if result == "lose" else ""
+        title = f"{label} vs {opp}"
+        desc = " ".join(x for x in (arrow, f"**{word}**", f"· {size} vs {size}") if x)
+        color = {"win": GREEN, "lose": RED}.get(result, GREY)
+    e = discord.Embed(
+        title=_truncate(title, 256),
+        url=clan_link(war["opponent_tag"]) if war.get("opponent_tag") else None,
+        description=desc,
+        color=color,
+    )
+    clan_author(e, war.get("clan_name"), war.get("clan_tag"), war.get("clan_badge_url"))
+    if war.get("opponent_badge_url"):
+        e.set_thumbnail(url=war["opponent_badge_url"])
+    if new_state != "preparation":
+        _war_scores(e, war)
+    e.set_footer(text=label)
+    e.timestamp = at
+    return e
+
+
+# How long after a war changes state its announcement still counts as news. A change the bot only
+# notices later (it was down) isn't announced as if it had just happened.
+STATE_NEWS_WINDOW = timedelta(minutes=30)
+
+
+def state_is_news(war: Mapping[str, Any], new_state: str, now: datetime) -> bool:
+    """Whether a preparation or battle day start is recent enough to announce; results always are."""
+    key = {"preparation": "preparation_start", "inWar": "start_time"}.get(new_state)
+    if key is None or not war.get(key):
+        return True
+    started = datetime.fromisoformat(war[key])
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    return now - started <= STATE_NEWS_WINDOW
 
 
 def missed_attacks(
@@ -580,66 +836,147 @@ def missed_attacks(
 
 
 def missed_attacks_embed(
-    war: Mapping[str, Any], missed: Sequence[tuple[Mapping[str, Any], int]], per_member: int
+    war: Mapping[str, Any],
+    missed: Sequence[tuple[Mapping[str, Any], int]],
+    per_member: int,
+    *,
+    at: datetime | None = None,
 ) -> discord.Embed:
-    kind = "CWL" if war.get("war_type") == "cwl" else "War"
-    e = discord.Embed(title=f"{kind} vs {war.get('opponent_name') or '?'}: missed attacks", color=RED)
+    """Who didn't use all their attacks, grouped by how many they missed: map position, linked
+    name and Town Hall."""
+    e = discord.Embed(title="Missed attacks", color=RED)
+    clan_author(e, war.get("clan_name"), war.get("clan_tag"), war.get("clan_badge_url"))
     by_missing: dict[int, list[str]] = {}
     for m, used in missed:
-        by_missing.setdefault(per_member - used, []).append(f"#{m['map_position']} {m['name']}")
+        who = player_ref(m["name"], m["player_tag"]) if m.get("player_tag") else escape_markdown(m["name"])
+        line = " ".join(x for x in (f"**{m['map_position']}.**", th_icon(m.get("town_hall")), who) if x)
+        by_missing.setdefault(per_member - used, []).append(line)
     for n in sorted(by_missing, reverse=True):
-        e.add_field(name=f"{n} missed", value="\n".join(by_missing[n])[:1024], inline=False)
+        noun = "attack" if n == 1 else "attacks"
+        e.add_field(
+            name=f"{_arrow('down')} {n} {noun} missed", value=_fit_lines(by_missing[n], 1024), inline=False
+        )
     if not missed:
-        e.description = "Everyone used all attacks. 🎉"
+        e.description = f"{_arrow('up')} Everyone used all their attacks."
         e.color = GREEN
-    return e
+    return _war_footer(e, war, war_label(war), at)
 
 
-def cwl_lineup_embed(season: str, added: Sequence[str], removed: Sequence[str]) -> discord.Embed:
+def _fit_lines(lines: Sequence[str], limit: int) -> str:
+    """Lines joined, cut with "… and N more" to stay within ``limit`` characters."""
+    for keep in range(len(lines), -1, -1):
+        rest = len(lines) - keep
+        text = "\n".join([*lines[:keep], *([f"… and {rest} more"] if rest else [])])
+        if len(text) <= limit:
+            return text
+    return f"{len(lines)} players"
+
+
+@dataclass(frozen=True)
+class LineupPlayer:
+    name: str
+    tag: str
+    town_hall: int | None = None
+
+
+def cwl_lineup_embed(
+    season: str,
+    added: Sequence[LineupPlayer],
+    removed: Sequence[LineupPlayer],
+    *,
+    clan_name: str | None = None,
+    clan_tag: str | None = None,
+    badge_url: str | None = None,
+    at: datetime | None = None,
+) -> discord.Embed:
+    """Players added to and removed from the clan's CWL roster: Town Hall icon and linked name."""
     e = discord.Embed(title=f"CWL {season} lineup changed", color=BLUE)
-    if added:
-        e.add_field(name="Added", value="\n".join(added)[:1024])
-    if removed:
-        e.add_field(name="Removed", value="\n".join(removed)[:1024])
+    clan_author(e, clan_name, clan_tag, badge_url)
+    for label, arrow, players in (("Added", _arrow("up"), added), ("Removed", _arrow("down"), removed)):
+        if players:
+            lines = [
+                " ".join(x for x in (th_icon(p.town_hall), player_ref(p.name, p.tag)) if x) for p in players
+            ]
+            e.add_field(name=f"{arrow} {label}", value=_fit_lines(lines, 1024))
+    e.timestamp = at
     return e
 
 
 # ------------------------------------------------------------------ capital
 
 
-def capital_contribution_embed(name: str, tag: str, amount: int) -> discord.Embed:
-    e = discord.Embed(description=f"**{name}** contributed **{amount:,}** capital gold", color=GOLD)
-    e.set_footer(text=tag)
-    return e
+def capital_contribution_embed(
+    name: str, tag: str, amount: int, ctx: PlayerContext | None = None
+) -> discord.Embed:
+    gold = EMOJIS.get("res_capital_gold")
+    line = " ".join(x for x in ("Contributed", gold, f"**{amount:,}**", "Capital Gold") if x)
+    return _player_post(name, tag, [line], GOLD, ctx)
 
 
-def raid_attack_embed(name: str, attacks: int, loot: int, total: int, limit: int) -> discord.Embed:
-    return discord.Embed(
-        description=f"**{name}** raided {attacks}x for **{loot:,}** loot ({total}/{limit} attacks)",
-        color=BLUE,
-    )
+def raid_attack_embed(
+    name: str,
+    attacks: int,
+    loot: int,
+    total: int,
+    limit: int,
+    *,
+    tag: str | None = None,
+    ctx: PlayerContext | None = None,
+) -> discord.Embed:
+    gold = EMOJIS.get("res_capital_gold")
+    noun = "attack" if attacks == 1 else "attacks"
+    lines = [
+        " ".join(
+            x for x in (EMOJIS.get("ui_sword"), f"**{attacks}** {noun} ·", gold, f"**{loot:,}** looted") if x
+        ),
+        f"{total}/{limit} attacks used this raid weekend",
+    ]
+    if tag:
+        return _player_post(name, tag, lines, BLUE, ctx)
+    return discord.Embed(title=escape_markdown(name), description="\n".join(lines), color=BLUE)
 
 
 def raid_summary_embed(
-    clan_name: str, season: Mapping[str, Any], members: Sequence[Mapping[str, Any]]
+    clan_name: str,
+    season: Mapping[str, Any],
+    members: Sequence[Mapping[str, Any]],
+    *,
+    clan_tag: str | None = None,
+    badge_url: str | None = None,
+    at: datetime | None = None,
 ) -> discord.Embed:
-    e = discord.Embed(title=f"{clan_name} raid weekend summary", color=GOLD)
-    e.description = (
-        f"Loot: **{_get(season, 'total_loot', 0):,}** · Attacks: {_get(season, 'attack_count', 0)} · "
-        f"Districts destroyed: {_get(season, 'districts_destroyed', 0)}\n"
-        f"Raid medals: offense {_get(season, 'offensive_reward', '?')} · "
-        f"defense {_get(season, 'defensive_reward', '?')}"
-    )
-    top = sorted(members, key=lambda m: -m["loot"])[:30]
-    if top:
+    """A raid weekend's totals with their icons, then the raiders by loot."""
+    gold, medal = EMOJIS.get("res_capital_gold"), EMOJIS.get("res_raid_medal")
+    sword = EMOJIS.get("ui_sword")
+
+    def stat(icon: str, value: Any, label: str) -> str:
+        shown = f"{value:,}" if isinstance(value, int) else str(value)
+        return " ".join(x for x in (icon, f"**{shown}**", label) if x)
+
+    lines = [
+        stat(gold, _get(season, "total_loot", 0), "Capital Gold looted"),
+        " · ".join(
+            (
+                stat(sword, _get(season, "attack_count", 0), "attacks"),
+                stat("", _get(season, "districts_destroyed", 0), "districts destroyed"),
+            )
+        ),
+        stat(medal, _get(season, "offensive_reward", "?"), "offense medals")
+        + " · "
+        + stat("", _get(season, "defensive_reward", "?"), "defense medals"),
+    ]
+    raiders = [
+        " ".join(x for x in (f"**{i}.**", escape_markdown(m["name"]), "·", gold, f"**{m['loot']:,}**") if x)
+        + f" · {m['attacks']}/{m['attack_limit']}"
+        for i, m in enumerate(sorted(members, key=lambda m: -m["loot"])[:30], 1)
+    ]
+    e = discord.Embed(title="Raid weekend summary", description="\n".join(lines), color=GOLD)
+    clan_author(e, clan_name, clan_tag, badge_url)
+    if raiders:
         e.add_field(
-            name="Raiders",
-            value=table(
-                [(m["name"][:15], f"{m['attacks']}/{m['attack_limit']}", f"{m['loot']:,}") for m in top],
-                ["Name", "Atk", "Loot"],
-            )[:1024],
-            inline=False,
+            name="Raiders", value=_fit_lines([r.replace("  ", " ") for r in raiders], 1024), inline=False
         )
+    e.timestamp = at
     return e
 
 

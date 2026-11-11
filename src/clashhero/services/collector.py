@@ -114,6 +114,12 @@ def crossing_between(prev: datetime | None, now: datetime) -> Crossing:
     return Crossing(True, ranked_week(prev).id != ranked_week(now).id, prev_day if adjacent else None)
 
 
+def _badge_url(side: Any) -> str | None:
+    badge = getattr(side, "badge", None)
+    url = getattr(badge, "url", None) or getattr(badge, "medium", None)
+    return url if isinstance(url, str) else None
+
+
 def _sides(war: Any, clan_tag: str) -> tuple[Any, Any]:
     """(our side, their side); coc.py may orient a war from either clan."""
     if getattr(war.clan, "tag", None) == clan_tag:
@@ -985,6 +991,9 @@ class Collector:
                 if war.war_tag in rnd:
                     cwl_round = i + 1
         values = dict(
+            clan_name=getattr(clan, "name", None),
+            clan_badge_url=_badge_url(clan),
+            opponent_badge_url=_badge_url(opp),
             opponent_tag=opp.tag,
             opponent_name=opp.name,
             war_type=war_type,

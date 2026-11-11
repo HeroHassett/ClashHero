@@ -376,8 +376,14 @@ def counts_as_rushed(u: UnitLevel) -> bool:
     return u.is_rushed and u.category in RUSH_CATEGORIES
 
 
-def plural(n: int, word: str) -> str:
-    return f"{n} {word}{'' if n == 1 else 's'}"
+def plural(n: int, word: str, *, bold: bool = False) -> str:
+    number = f"**{n:,}**" if bold else str(n)
+    return f"{number} {word}{'' if n == 1 else 's'}"
+
+
+def th_header_icon(town_hall: int, fallback: str) -> str:
+    """The Town Hall's game icon for a page header, else ``fallback`` (a standard emoji)."""
+    return EMOJIS.town_hall(town_hall) or fallback
 
 
 def percent(part: int, total: int, *, digits: int = 1, round_up: bool = False, empty: float = 0.0) -> str:
@@ -473,7 +479,7 @@ def units_blocks(units: Sequence[UnitLevel], town_hall: int) -> list[list[str]]:
     maxed = sum(is_maxed(u) for u in units)
     blocks = [
         [
-            header("Units", "📊", f"at TH{town_hall}"),
+            header("Units", th_header_icon(town_hall, "📊"), f"at TH{town_hall}"),
             f"{progress_bar(prog.done, prog.total)} **{percent(prog.done, prog.total, empty=100)}**"
             f" of max levels{SEP}{maxed}/{len(units)} maxed",
         ]
@@ -493,13 +499,14 @@ def units_blocks(units: Sequence[UnitLevel], town_hall: int) -> list[list[str]]:
 def upgrades_blocks(units: Sequence[UnitLevel], town_hall: int) -> list[list[str]]:
     """/player upgrades: units below their max at the player's Town Hall, per section."""
     pending, prog = upgrade_progress(units)
+    icon = th_header_icon(town_hall, "⬆️")
     if not pending:
-        return [[header("Upgrades", "⬆️", f"at TH{town_hall}"), f"Everything is maxed for TH{town_hall}. 🎉"]]
+        return [[header("Upgrades", icon, f"at TH{town_hall}"), f"Everything is maxed for TH{town_hall}. 🎉"]]
     levels_left = sum(u.remaining for u in pending)
     blocks = [
         [
-            header("Upgrades left", "⬆️", f"at TH{town_hall}"),
-            f"{plural(len(pending), 'upgrade')}{SEP}{plural(levels_left, 'level')}",
+            header("Upgrades left", icon, f"at TH{town_hall}"),
+            f"{plural(len(pending), 'upgrade', bold=True)}{SEP}{plural(levels_left, 'level', bold=True)}",
         ]
     ]
     for group, members in group_units(units):
@@ -568,14 +575,15 @@ def rushed_blocks(units: Sequence[UnitLevel], town_hall: int) -> list[list[str]]
     r = rush_report(units)
     prev = town_hall - 1
     if r.rushed:
+        # One short line each, the percentage in bold beside its icon.
         top = [
             header("Rushed", "rushed", f"vs TH{prev} max"),
-            SEP.join(
-                f"{icon} {name} {chip(percent(p.done, p.total, round_up=True))}"
+            *(
+                f"{icon} {name} **{percent(p.done, p.total, round_up=True)}**"
                 for icon, name, p in (
                     ("🧪", "Lab", r.lab),
                     (ICONS["heroes"], "Heroes", r.heroes),
-                    ("📊", "Overall", r.overall),
+                    (th_header_icon(town_hall, "📊"), "Overall", r.overall),
                 )
             ),
         ]
@@ -710,8 +718,13 @@ def profile_parts(
     else:
         clan_text = "Not in a clan"
     lines.append(_stat(ICONS["clan"], "Clan", clan_text))
+    # _log_embeds imports this module, so its helpers are imported where they're used.
+    from clashhero.cogs._log_embeds import arrow
+
     pref = getattr(p, "war_opted_in", None)
-    war_pref = "Opted in" if pref else "Opted out" if pref is False else "Unknown"
+    war_pref = "Unknown"
+    if pref is not None:  # green ▲ in, red ▼ out, as in the war preference log
+        war_pref = f"{arrow('up')} Opted in" if pref else f"{arrow('down')} Opted out"
     lines.append(_stat(sym("ui_war_star", "⚔️"), "War", war_pref))
     if last_seen:
         lines.append(_stat(sym("ui_stopwatch", "⏱️"), "Last Seen", ts(last_seen)))
@@ -756,7 +769,7 @@ def profile_parts(
         lines += [
             "",
             "**Heroes**",
-            " ".join(f"{unit_icon(n) or escape_markdown(n)} {lvl}" for n, lvl in heroes),
+            " ".join(f"{unit_icon(n) or escape_markdown(n)} **{lvl}**" for n, lvl in heroes),
         ]
     if names:
         lines += ["", f"**Previous Names** {escape_markdown(', '.join(names[-5:]))}"]

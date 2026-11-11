@@ -10,4 +10,8 @@ COLUMNS = [
     ("legend_events", "destruction", "INTEGER"),
     ("legend_events", "army_share_code", "TEXT"),
     ("legend_events", "battle_time", "TEXT"),
+    # Both clans' names and badges, for the war logs.
+    ("wars", "clan_name", "TEXT"),
+    ("wars", "clan_badge_url", "TEXT"),
+    ("wars", "opponent_badge_url", "TEXT"),
 ]

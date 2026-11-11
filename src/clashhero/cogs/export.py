@@ -228,7 +228,7 @@ class Exports(BaseCog, name="Export"):
             filename, data = await fn(self.db, tags, window)
         lines = data.count(b"\n") - 1
         await interaction.followup.send(
-            f"{DESCRIPTIONS[kind]} · {max(lines, 0)} rows",
+            f"{DESCRIPTIONS[kind]} · **{max(lines, 0):,}** rows",
             file=discord.File(io.BytesIO(data), filename=filename),
             ephemeral=True,
         )

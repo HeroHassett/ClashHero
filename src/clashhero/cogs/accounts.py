@@ -6,13 +6,22 @@ autoroles/nicknames update immediately, and posts the "welcome" server log.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from typing import Any
+
 import discord
 from discord import app_commands
+from discord.utils import escape_markdown
 
 from clashhero.cogs._base import BaseCog
+from clashhero.cogs._info_embeds import fit
+from clashhero.cogs._log_embeds import player_ref, th_icon
+from clashhero.cogs.info import badge_of, clan_heading
+from clashhero.services.emojis import EMOJIS
 from clashhero.services.outbox import send_server_log
 from clashhero.utils.checks import has_permission, require
 from clashhero.utils.fmt import chunk_lines, make_embed, player_link, role_name, ts
+from clashhero.utils.ranked import league_name
 from clashhero.utils.resolve import (
     ResolveError,
     clan_autocomplete,
@@ -20,43 +29,102 @@ from clashhero.utils.resolve import (
     player_autocomplete,
     resolve_clan,
 )
-from clashhero.utils.style import SEP, chip, header, ok_embed
+from clashhero.utils.style import SEP, header, ok_embed
 
 MAX_ACCOUNTS = 25
 
 
+def _field(row: Any, key: str) -> Any:
+    """``row[key]`` for a dict or sqlite Row, None when it has no such column."""
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return None
+
+
+def town_hall_stat(level: int | None) -> str:
+    """``<th18>**18**`` (``TH **18**`` until the icon is uploaded); "" when unknown."""
+    if not level:
+        return ""
+    icon = EMOJIS.town_hall(level)
+    return f"{icon}**{level}**" if icon else f"TH **{level}**"
+
+
+def trophy_stat(trophies: int | None, league: str | None = None) -> str:
+    """Trophies in bold beside the league's icon (the trophy icon when it has none)."""
+    if trophies is None:
+        return ""
+    return f"{EMOJIS.league(league) or EMOJIS.get('res_trophy', '🏆')}**{trophies:,}**"
+
+
 def account_line(r, clan_names: dict[str, str]) -> str:
+    """/profile: ⭐ default and ✅ verified, then the Town Hall's icon, the name linked to the
+    in-game profile with its tag, trophies and clan."""
     marks = ("⭐ " if r["is_default"] else "") + ("✅ " if r["verified"] else "")
-    name = r["name"] or "?"
-    th = f"TH{r['town_hall']}" if r["town_hall"] else "TH?"
-    clan = clan_names.get(r["clan_tag"] or "", r["clan_tag"] or "no clan")
-    trophies = f"🏆 {r['trophies']:,}" if r["trophies"] is not None else None
-    facts = SEP.join(x for x in (chip(th), trophies, clan) if x)
-    return f"{marks}[{name}]({player_link(r['player_tag'])}) `{r['player_tag']}` · {facts}"
+    th = th_icon(r["town_hall"]) or "TH?"
+    name = f"**{player_ref(r['name'] or '?', r['player_tag'])}** ({r['player_tag']})"
+    clan = escape_markdown(clan_names.get(r["clan_tag"] or "", r["clan_tag"] or "no clan"))
+    facts = SEP.join(x for x in (trophy_stat(r["trophies"]), clan) if x)
+    return f"{marks}{th} {name} · {facts}"
 
 
 def account_label(name: str, tag: str, town_hall: int | None = None) -> str:
-    """``**dev** `#20LGL8GV0` (TH18)`` for result messages."""
-    th = f" (TH{town_hall})" if town_hall else ""
-    return f"**{name}** `{tag}`{th}"
+    """``<th18> **[dev](link)** (#20LGL8GV0)`` for result messages: the Town Hall's icon (TH18
+    until it's uploaded), then the name linked to the in-game profile."""
+    return " ".join(x for x in (th_icon(town_hall), f"**{player_ref(name, tag)}** ({tag})") if x)
 
 
 def link_list_lines(members, links: dict[str, int]) -> list[str]:
-    """Clan members with their linked user under a "Linked" header; unlinked members last,
-    under their own header."""
+    """Clan members (Town Hall icon, name and tag) with their linked user under a "Linked"
+    header; unlinked members last, under their own header."""
     linked, unlinked = [], []
     for m in members:
+        who = " ".join(
+            x
+            for x in (th_icon(_field(m, "town_hall")), f"{escape_markdown(m['name'])} ({m['player_tag']})")
+            if x
+        )
         uid = links.get(m["player_tag"])
         if uid:
-            linked.append(f"{m['name']} `{m['player_tag']}` → <@{uid}>")
+            linked.append(f"{who} → <@{uid}>")
         else:
-            unlinked.append(f"{m['name']} `{m['player_tag']}`")
+            unlinked.append(who)
     lines = []
     if linked:
-        lines += [header("Linked", "✅", chip(len(linked))), *linked]
+        lines += [header("Linked", "✅", f"({len(linked)})"), *linked]
     if unlinked:
-        lines += ([""] if linked else []) + [header("Not linked", "❌", chip(len(unlinked))), *unlinked]
+        lines += ([""] if linked else []) + [header("Not linked", "❌", f"({len(unlinked)})"), *unlinked]
     return lines
+
+
+def whois_fields(link: Any, player: Any, history: Any) -> list[tuple[str, str, bool]]:
+    """(name, value, inline) fields for /whois: who the account is linked to and since when; its
+    Town Hall, trophies (with their game icons) and clan role; and its earlier names."""
+    if link:
+        verified = " ✅ verified" if link["verified"] else ""
+        since = ts(link["linked_at"], "D")
+        fields = [("Linked to", f"<@{link['discord_user_id']}>{verified}\nsince {since}", False)]
+    else:
+        fields = [("Linked to", "Nobody", False)]
+    if player:
+        fields += [
+            ("Town Hall", town_hall_stat(player["town_hall"]) or "?", True),
+            ("Trophies", trophy_stat(player["trophies"], _field(player, "league")) or "—", True),
+            ("Role", role_name(player["clan_role"]), True),
+        ]
+    if history:
+        names = [f"{escape_markdown(h['name'])} · {ts(h['first_seen'], 'd')}" for h in history[-15:]]
+        fields.append(("Name history", fit("\n".join(names), 1024, "\n"), False))
+    return fields
+
+
+def linked_post(player: Any, user_mention: str) -> tuple[str, list[str]]:
+    """(title, description lines) for the "Account linked" server log: the player as "Name (#TAG)",
+    who linked it, and their Town Hall and trophies with their game icons."""
+    stats = " ".join(
+        x for x in (town_hall_stat(player.town_hall), trophy_stat(player.trophies, league_name(player))) if x
+    )
+    return f"{escape_markdown(player.name)} ({player.tag})", [f"🔗 Linked to {user_mention}", stats]
 
 
 class Accounts(BaseCog):
@@ -70,16 +138,20 @@ class Accounts(BaseCog):
         if interaction.guild_id is None:
             return
         self.bot.dispatch("clashhero_account_linked", interaction.guild_id, user.id, player.tag)
+        title, lines = linked_post(player, user.mention)
         embed = await make_embed(
             self.bot,
             interaction.guild_id,
-            title="Account linked",
-            description=f"{user.mention} linked **{player.name}** (`{player.tag}`)",
+            title=title,
+            url=player_link(player.tag),
+            description="\n".join(x for x in lines if x),
         )
-        embed.add_field(name="Town Hall", value=str(player.town_hall))
-        embed.add_field(name="Trophies", value=str(player.trophies))
         clan = getattr(player, "clan", None)
-        embed.add_field(name="Clan", value=f"{clan.name} ({clan.tag})" if clan else "—")
+        # The player's clan with its badge in the footer, as on the clan log's player posts.
+        embed.set_footer(
+            text=clan.name if clan else "Not in a clan", icon_url=badge_of(clan) if clan else None
+        )
+        embed.timestamp = datetime.now(UTC)
         await send_server_log(self.bot, interaction.guild_id, "welcome", embed)
 
     # ------------------------------------------------------------------ /link
@@ -166,14 +238,20 @@ class Accounts(BaseCog):
         members = await self.db.clan_member_rows(tag)
         links = await self.db.links_for_tags(m["player_tag"] for m in members)
         clan_row = await self.db.get_clan_row(tag)
-        title = f"Links · {clan_row['name'] if clan_row else tag}"
         lines = link_list_lines(members, links)
         if members:
-            lines.insert(0, f"🔗 {chip(f'{len(links)}/{len(members)}')} linked\n")
+            lines.insert(0, f"🔗 **{len(links)}**/{len(members)} linked\n")
         embeds = []
         for i, chunk in enumerate(chunk_lines(lines or ["No members known yet."])):
-            e = await make_embed(self.bot, interaction.guild_id, title=title if i == 0 else None)
+            e = await make_embed(self.bot, interaction.guild_id, title="Linked accounts" if i == 0 else None)
             e.description = chunk
+            if i == 0:  # the clan with its badge above the list
+                clan_heading(
+                    e,
+                    clan_row["name"] if clan_row else None,
+                    tag,
+                    clan_row["badge_url"] if clan_row else None,
+                )
             embeds.append(e)
         await interaction.response.send_message(embeds=embeds[:10], ephemeral=True)
 
@@ -208,7 +286,8 @@ class Accounts(BaseCog):
         names = await self._clan_names()
         embed = await make_embed(self.bot, interaction.guild_id, title=f"{target.display_name}'s accounts")
         embed.set_thumbnail(url=target.display_avatar.url)
-        embed.description = ("\n".join(account_line(r, names) for r in rows) or "No linked accounts.")[:4096]
+        lines = [account_line(r, names) for r in rows]
+        embed.description = fit("\n".join(lines), 4096, "\n") if lines else "No linked accounts."
         embed.set_footer(text="⭐ default · ✅ verified")
         await interaction.response.send_message(embed=embed)
 
@@ -219,29 +298,16 @@ class Accounts(BaseCog):
         link = await self.db.get_link(tag)
         player = await self.db.get_player_row(tag)
         history = await self.db.name_history(tag)
-        name = player["name"] if player else tag
+        name = escape_markdown(player["name"]) if player else tag
         embed = await make_embed(
             self.bot, interaction.guild_id, title=f"{name} ({tag})", url=player_link(tag)
         )
-        if link:
-            embed.add_field(
-                name="Linked to",
-                value=f"<@{link['discord_user_id']}> {'✅ verified' if link['verified'] else ''}\n"
-                f"since {ts(link['linked_at'], 'D')}",
-                inline=False,
-            )
-        else:
-            embed.add_field(name="Linked to", value="Nobody", inline=False)
-        if player:
-            embed.add_field(name="Town Hall", value=str(player["town_hall"] or "?"))
-            embed.add_field(name="Clan", value=player["clan_tag"] or "—")
-            embed.add_field(name="Role", value=role_name(player["clan_role"]))
-        if history:
-            embed.add_field(
-                name="Name history",
-                value="\n".join(f"{h['name']} · {ts(h['first_seen'], 'd')}" for h in history[-15:]),
-                inline=False,
-            )
+        for field_name, value, inline in whois_fields(link, player, history):
+            embed.add_field(name=field_name, value=value, inline=inline)
+        clan_tag = player["clan_tag"] if player else None
+        if clan_tag:  # the player's clan with its badge above their name
+            clan = await self.db.get_clan_row(clan_tag)
+            clan_heading(embed, clan["name"] if clan else None, clan_tag, clan["badge_url"] if clan else None)
         await interaction.response.send_message(embed=embed)
 
 

@@ -215,10 +215,32 @@ async def test_render_war_boards(db):
     )
     names = {"#C1": "Alpha", "#C2": "Beta"}
     stats_body = await cog.render_body(db, "war_stats", ["#C1"], names, now)
-    assert "67%" in stats_body and "2/3 triples" in stats_body and "1 missed" in stats_body
+    assert "⚔️ Hit rate **67%** · **2/3** triples · ▼ **1** missed\n" in stats_body
     assert stats_body.index("Bob") < stats_body.index("Ann")  # 100% before 50%
     results = await cog.render_body(db, "war_results", ["#C1"], names, now)
-    assert "Rivals" in results and "✅" in results and "100%" in results
+    assert "⚔️ **Recent wars**\n▲ **Alpha** vs Rivals · ★ **5**–3 · 90.0%–60.0%" in results
+    assert "100%" in results
+
+
+def test_recent_war_line_marks_result_and_kind(monkeypatch):
+    from clashhero.services.emojis import EMOJIS
+
+    monkeypatch.setattr(
+        EMOJIS, "_by_name", {"ui_arrow_down": "<:ui_arrow_down:2>", "ui_war_star": "<:ui_war_star:3>"}
+    )
+    war = {
+        "war_type": "cwl",
+        "result": "lose",
+        "opponent_name": "Rivals",
+        "clan_stars": 20,
+        "opponent_stars": 25,
+        "clan_destruction": 80.0,
+        "opponent_destruction": 90.5,
+    }
+    assert cog.recent_war_line(war, "Alpha") == (
+        "<:ui_arrow_down:2> **Alpha** vs Rivals · <:ui_war_star:3> **20**–25 · 80.0%–90.5% · CWL"
+    )
+    assert cog.recent_war_line({**war, "result": "tie", "war_type": "random"}, "A").startswith("➖ **A**")
 
 
 # ------------------------------------------------------------------ posting
@@ -276,6 +298,8 @@ async def test_run_fixed_board_posts_once(db):
     assert len(ch.sent) == 1
     embed = ch.sent[0]["embed"]
     assert embed.title == repo.BOARD_TYPES["donations"] and "Alpha, Beta" in embed.footer.text
+    assert embed.author.name is None  # several clans: no single badge
+    assert "**Top donors**" in embed.description
 
 
 async def test_run_live_board_edits_and_reposts(db):
@@ -288,6 +312,7 @@ async def test_run_live_board_edits_and_reposts(db):
     row = await repo.get_board(db, 1, bid)
     assert row["message_id"] == 1001 and len(ch.sent) == 1
     assert "Beta" not in ch.sent[0]["embed"].footer.text
+    assert ch.sent[0]["embed"].author.name == "Alpha"  # one clan: shown with its badge
     assert await boards.run_board(row, at(7, 12, 5)) is None
     assert await boards.run_board(row, at(7, 12, 10)) == "ok"
     assert ch.edits and ch.edits[0][0] == 1001 and len(ch.sent) == 1

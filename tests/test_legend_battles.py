@@ -11,6 +11,7 @@ from clashhero.cogs import legends as cog
 from clashhero.events import LegendBattle
 from clashhero.repos import legends as repo
 from clashhero.services.battlelog import army_link
+from clashhero.utils.fmt import player_link
 from clashhero.utils.style import FAILURE
 
 DAY = "2026-11-07"
@@ -81,13 +82,14 @@ def test_alert_embed_with_battle_log_details():
         destruction=85,
         battle_type="legend",
     )
-    assert "+32" in e.description and "5032" in e.description
-    assert "★★☆" in e.description and "85%" in e.description
-    assert "vs [Opp\\_1]" in e.description  # name is markdown-escaped and links to the profile
-    assert "TH17" in e.description and "`#OPP`" in e.description
+    assert e.title == "Amy (#A)" and e.url.endswith("tag=A")
+    first, second = e.description.split("\n")
+    assert first == "⚔️ **Attack** · ▲ **+32** → 🏆 **5,032**"
+    assert second.startswith("★★☆ **85%** vs [Opp\\_1](")  # name markdown-escaped, linked to the profile
+    assert second.endswith(" TH17")
     fields = {f.name: f.value for f in e.fields}
-    assert fields["Attacks"] == "1/8 (+32)" and fields["Net today"] == "+32"
-    assert e.footer.text == "#A · Legend I battle"
+    assert fields["Attacks"] == "**1/8** · ▲ **+32**" and fields["Net today"] == "▲ **+32**"
+    assert e.footer.text == "Legend I battle"
 
     d = E.alert_embed(
         name="Amy",
@@ -103,15 +105,25 @@ def test_alert_embed_with_battle_log_details():
         destruction=100,
         battle_type="ranked",
     )
+    assert d.description.startswith("🛡️ **Defense** · ▼ **-40** → 🏆 **4,992**")
     assert "★★★ **100%** by [Opp]" in d.description
-    assert d.footer.text == "#A · Ranked battle"
+    assert d.footer.text == "Ranked battle"
 
 
 def test_alert_embed_inferred_battle_has_no_battle_details():
     stats = repo.DayStats("#A", [40])
-    e = E.alert_embed(name="Amy", tag="#A", kind="attack", trophies=40, trophies_after=5040, stats=stats)
-    assert e.description == "**+40** trophies → **5040**"
-    assert e.footer.text == "#A"
+    e = E.alert_embed(
+        name="Amy",
+        tag="#A",
+        kind="attack",
+        trophies=40,
+        trophies_after=5040,
+        stats=stats,
+        clan_name="Aurora",
+        badge_url="b",
+    )
+    assert e.description == "⚔️ **Attack** · ▲ **+40** → 🏆 **5,040**"
+    assert (e.footer.text, e.footer.icon_url) == ("Aurora", "b")
 
 
 def _event(**kw):
@@ -220,7 +232,12 @@ async def test_view_army_button(db):
     (msg,) = inter.response.sent
     assert msg.ephemeral
     assert msg.embed.title == "Raider's army"  # on a defense the army is the attacker's
-    assert "★★☆" in msg.embed.description and "Amy" in msg.embed.description
+    assert msg.embed.url == player_link("#OPP")
+    assert msg.embed.description.split("\n") == [
+        "🛡️ **Defense** · ▼ **-30**",  # from the tracked player's side, as in the alerts
+        f"★★☆ **80%** by [Raider]({player_link('#OPP')}) TH17",
+    ]
+    assert msg.embed.footer.text == "Amy (#A)"
     names = [f.name for f in msg.embed.fields]
     assert names == ["Troops (20 space)", "Spells (7 space)"]
     assert "Barbarian" in msg.embed.fields[0].value
@@ -264,20 +281,30 @@ def test_day_embed_mixed_rows():
     ]
     stats = repo.aggregate_day(rows)["#A"]
     e = E.day_embed(name="Amy", tag="#A", day=DAY, stats=stats, start=5000, end=5050)
+    assert e.title == "Amy (#A)" and e.url == player_link("#A")
+    assert e.description.split("\n") == ["**Legend day · Nov 7**", "🏆 **5,000** → **5,050** · ▲ **+50**"]
     fields = {f.name: f.value for f in e.fields}
-    assert fields["Attacks 2/8 (+70)"].split("\n") == ["` +40` ★★★ 100% · vs Bob\\* TH17", "` +30`"]
-    assert fields["Defenses 1/8 (-20)"] == "-20"  # no battle-log defenses: compact trophy list
-    assert fields["3★"] == "1/2"
-    assert "some battles inferred" in e.footer.text
+    assert fields["⚔️ Attacks 2/8 · ▲ +70"].split("\n") == ["` +40` ★★★ 100% vs Bob\\* TH17", "` +30`"]
+    assert fields["🛡️ Defenses 1/8 · ▼ -20"] == "-20"  # no battle-log defenses: compact trophy list
+    assert fields["Triples"] == "**1/2**" and fields["Attacks left"] == "**6**"
+    assert e.footer.text == "some battles inferred from trophy changes"
 
 
 def test_day_embed_inferred_only_is_unchanged():
     stats = repo.aggregate_day([row("attack", 40), row("attack", 30), row("defense", -20)])["#A"]
     e = E.day_embed(name="Amy", tag="#A", day=DAY, stats=stats, start=5000, end=5050)
     fields = {f.name: f.value for f in e.fields}
-    assert fields["Attacks 2/8 (+70)"] == "+40 +30"
-    assert "3★" not in fields
-    assert e.footer.text == "#A · battles are inferred from trophy changes"
+    assert fields["⚔️ Attacks 2/8 · ▲ +70"] == "+40 +30"
+    assert "Triples" not in fields
+    assert e.footer.text == "battles are inferred from trophy changes"
+
+
+def test_day_embed_without_a_start_and_zero_totals():
+    stats = repo.aggregate_day([row("defense", 0)])["#A"]
+    e = E.day_embed(name="#A", tag="#A", day=DAY, stats=stats, start=None, end=None)
+    assert e.title == "#A"  # no stored name: just the tag
+    assert e.description.split("\n") == ["**Legend day · Nov 7**", "Net **0**"]
+    assert [f.name for f in e.fields][:2] == ["⚔️ Attacks 0/8 · +0", "🛡️ Defenses 1/8 · +0"]
 
 
 def test_day_embed_battle_log_only_and_long_lists():
@@ -285,11 +312,39 @@ def test_day_embed_battle_log_only_and_long_lists():
     stats = repo.aggregate_day(rows)["#A"]
     stats.cap = None
     e = E.day_embed(name="Amy", tag="#A", day=DAY, stats=stats, start=5000, end=5300)
-    attack_fields = [f for f in e.fields if f.name.startswith("Attacks")]
-    assert len(attack_fields) > 1 and attack_fields[1].name.endswith("(cont.)")
-    assert all(len(f.value) <= 1024 for f in e.fields)
+    attack_fields = [f for f in e.fields if "Attacks" in f.name and "left" not in f.name]
+    assert len(attack_fields) > 1 and attack_fields[1].name == "Attacks (cont.)"
+    assert all(len(f.value) <= 1024 for f in e.fields) and len(e) <= 6000
     assert sum(f.value.count("\n") + 1 for f in attack_fields) == 30
-    assert e.footer.text == "#A · from the battle log"
+    assert e.footer.text == "from the battle log"
+
+
+def test_day_embed_with_game_icons_stays_within_discord_limits(monkeypatch):
+    """With the app emojis loaded a battle line is ~150 characters; a busy day below Legend I keeps
+    the newest battles that fit and says how many earlier ones are left out."""
+    from clashhero.services.emojis import EMOJIS
+
+    names = ["ui_star_new", "ui_star_empty", "ui_star_old", "th17", "res_trophy", "ui_sword", "ui_shield"]
+    names += ["ui_arrow_up", "ui_arrow_down"]
+    monkeypatch.setattr(EMOJIS, "_by_name", {n: f"<:{n}:{1234567890123456789}>" for n in names})
+    rows = [logged("attack", 10, 2, 90, opp=f"Opponent{i:02d}") for i in range(40)]
+    rows += [logged("defense", -10, 2, 90, opp=f"Raider{i:02d}") for i in range(40)]
+    stats = repo.aggregate_day(rows)["#A"]
+    stats.cap = None
+    e = E.day_embed(name="Amy", tag="#A", day=DAY, stats=stats, start=5000, end=5000)
+    assert len(e) <= 6000 and all(len(f.value) <= 1024 for f in e.fields)
+    attacks = [f for f in e.fields if "Attacks" in f.name]
+    assert len(attacks) == 2 and attacks[0].name.startswith("<:ui_sword:")
+    lines = "\n".join(f.value for f in attacks).split("\n")
+    assert lines[0].startswith("… ") and lines[0].endswith(" earlier")
+    assert int(lines[0].split()[1]) + len(lines) - 1 == 40
+    assert lines[-1].endswith("Opponent39 <:th17:1234567890123456789>")  # the newest is kept
+    assert "<:ui_star_new:" in lines[-1]
+
+    side = E.armies_embed(
+        name="Amy", tag="#A", day=DAY, kind="defense", hits=stats.hits("defense"), cap=None, trophies=5000
+    )
+    assert len(side) <= 6000 and len(side.fields) <= 4
 
 
 def test_hits_built_from_bare_lists_fall_back_to_trophies():
@@ -359,9 +414,9 @@ async def test_board_and_clan_views_with_battles(db):
     assert "3★" in e.description.split("\n")[1]
     latest = next(f.value for f in e.fields if f.name == "Latest battles").split("\n")
     assert len(latest) == 3
-    assert "**Bob**" in latest[0] and latest[0].endswith("` +25`")  # newest first, trophies only
-    assert "**Amy**" in latest[1] and "★☆☆ 55% · by Raider TH17" in latest[1]
-    assert "★★★ 100% · vs Zed TH17" in latest[2]
+    assert "⚔️ **Bob**" in latest[0] and latest[0].endswith("` +25`")  # newest first, trophies only
+    assert "🛡️ **Amy**" in latest[1] and "★☆☆ 55% by Raider TH17" in latest[1]
+    assert "★★★ 100% vs Zed TH17" in latest[2]
     assert not [f for f in E.board_embed(title="t", entries=entries).fields if f.name == "Latest battles"]
 
     rows = await repo.clan_day_rows(db, "#C", DAY)

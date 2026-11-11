@@ -2,20 +2,88 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+from typing import Any
+
 import discord
 from discord import app_commands
 
 from clashhero.cogs._base import BaseCog
+from clashhero.cogs._live_embeds import clan_row_header, fit_names, fit_table, icon_text
+from clashhero.cogs._log_embeds import arrow
 from clashhero.cogs._war_embeds import resolve_player_tags
 from clashhero.repos import capital as cap_repo
-from clashhero.utils.fmt import make_embed, table, ts
+from clashhero.services.emojis import EMOJIS
+from clashhero.utils.fmt import make_embed, player_link, ts
 from clashhero.utils.resolve import clan_autocomplete, player_autocomplete, resolve_clan
-from clashhero.utils.seasons import game_season, previous_game_season
+from clashhero.utils.seasons import game_season, previous_game_season, utcnow
 
 SEASON_CHOICES = [
     app_commands.Choice(name="This season", value="current"),
     app_commands.Choice(name="Last season", value="last"),
 ]
+
+
+def _stat(icon: str, value: Any, label: str) -> str:
+    """``{icon} **12,345** label`` (no icon when it isn't uploaded)."""
+    shown = f"{value:,}" if isinstance(value, int) else str(value)
+    return icon_text(icon, f"**{shown}**", label)
+
+
+def raid_weekend_lines(summary: Mapping[str, Any]) -> list[str]:
+    """When the raid weekend ran, then its loot, attacks, districts and (once paid) medals."""
+    gold, medal, sword = EMOJIS.get("res_capital_gold"), EMOJIS.get("res_raid_medal"), EMOJIS.get("ui_sword")
+    if summary.get("state") == "ongoing":
+        when = icon_text(EMOJIS.get("ui_stopwatch"), f"**Ongoing** · ends {ts(summary['end_time'])}")
+    else:
+        when = f"**Ended** · {ts(summary['start_time'], 'd')} – {ts(summary['end_time'], 'd')}"
+    lines = [
+        when,
+        _stat(gold, summary.get("total_loot") or 0, "Capital Gold looted"),
+        _stat(sword, summary.get("attack_count") or 0, "attacks")
+        + " · "
+        + _stat("", summary.get("districts_destroyed") or 0, "districts destroyed"),
+    ]
+    offense, defense = summary.get("offensive_reward") or 0, summary.get("defensive_reward") or 0
+    if offense or defense:
+        lines.append(_stat(medal, offense, "offense medals") + " · " + _stat("", defense, "defense medals"))
+    return lines
+
+
+def raid_weekend_text(summary: Mapping[str, Any], members: Sequence[Mapping[str, Any]]) -> str:
+    """The weekend's totals, then every raider by loot in a table."""
+    head = "\n".join(raid_weekend_lines(summary))
+    if not members:
+        return f"{head}\n\nNobody has raided yet."
+    data = [
+        (i, m["name"][:14], f"{m['attacks']}/{m['attack_limit']}", f"{m['loot']:,}")
+        for i, m in enumerate(members, 1)
+    ]
+    return f"{head}\n\n{fit_table(data, ['#', 'PLAYER', 'HITS', 'LOOT'], 4090 - len(head))}"
+
+
+def history_text(rows: Sequence[Mapping[str, Any]], one_player: bool) -> str:
+    """Totals over the weekends shown, then one row per weekend (the player column only when
+    several accounts are listed)."""
+    if not rows:
+        return "No raids recorded yet."
+    gold, sword = EMOJIS.get("res_capital_gold"), EMOJIS.get("ui_sword")
+    weekends = len({r["start_time"] for r in rows})
+    head = (
+        _stat(gold, sum(r["loot"] for r in rows), "Capital Gold looted")
+        + f" in **{weekends}** raid weekend{'s' * (weekends != 1)}\n"
+        + _stat(sword, sum(r["attacks"] for r in rows), "attacks")
+    )
+    if one_player:
+        data = [(r["start_time"][:10], f"{r['attacks']}/{r['attack_limit']}", f"{r['loot']:,}") for r in rows]
+        headers = ["WEEKEND", "HITS", "LOOT"]
+    else:
+        data = [
+            (r["start_time"][:10], r["name"][:12], f"{r['attacks']}/{r['attack_limit']}", f"{r['loot']:,}")
+            for r in rows
+        ]
+        headers = ["WEEKEND", "PLAYER", "HITS", "LOOT"]
+    return f"{head}\n\n{fit_table(data, headers, 4090 - len(head))}"
 
 
 class Capital(BaseCog):
@@ -71,25 +139,14 @@ class Capital(BaseCog):
         e = await make_embed(
             self.bot,
             interaction.guild_id,
-            title=f"Raid weekend · {clan_row['name'] if clan_row else tag}",
+            title=icon_text(EMOJIS.get("res_capital_gold"), "Raid weekend"),
+            description=raid_weekend_text(summary, members),
         )
-        state = "ongoing" if summary["state"] == "ongoing" else "ended"
-        e.description = (
-            f"{ts(summary['start_time'], 'd')} – {ts(summary['end_time'], 'd')} · **{state}**\n"
-            f"Loot: **{summary['total_loot'] or 0:,}** · Attacks: {summary['attack_count'] or 0} · "
-            f"Districts destroyed: {summary['districts_destroyed'] or 0}\n"
-            f"Raid medals: offense {summary.get('offensive_reward') or 0}, "
-            f"defense {summary.get('defensive_reward') or 0}\n"
-        )
-        data = [
-            (i + 1, m["name"][:14], f"{m['attacks']}/{m['attack_limit']}", f"{m['loot']:,}")
-            for i, m in enumerate(members)
-        ]
-        e.description += table(data, ["#", "Player", "Hits", "Loot"])
-        e.description = e.description[:4096]
+        clan_row_header(e, clan_row, tag)
         if missing:
-            names = ", ".join(discord.utils.escape_markdown(m["name"]) for m in missing)
-            e.add_field(name=f"Didn't raid ({len(missing)})", value=names[:1024], inline=False)
+            names = [discord.utils.escape_markdown(m["name"]) for m in missing]
+            label = f"{arrow('down')} Didn't raid ({len(missing)})"
+            e.add_field(name=label, value=fit_names(names), inline=False)
         await interaction.followup.send(embed=e)
 
     @capital.command(name="contributions", description="Capital gold contributed per member this season")
@@ -106,15 +163,24 @@ class Capital(BaseCog):
         rows = await cap_repo.capital_contributions(self.db, tag, s.id)
         data = [(i + 1, r["name"][:16], f"{r['capital_gold']:,}") for i, r in enumerate(rows[:50])]
         total = sum(r["capital_gold"] for r in rows)
+        gold = EMOJIS.get("res_capital_gold")
+        ended = s.end <= utcnow()
+        givers = f"**{len(rows)}** member{'s' * (len(rows) != 1)}"
+        head = "\n".join(
+            [
+                _stat(gold, total, f"Capital Gold contributed by {givers}"),
+                icon_text(EMOJIS.get("ui_stopwatch"), f"Season {'ended' if ended else 'ends'} {ts(s.end)}"),
+            ]
+        )
+        body = fit_table(data, ["#", "PLAYER", "GOLD"], 4090 - len(head)) if data else ""
+        clan_row = await self.db.get_clan_row(tag)
         e = await make_embed(
             self.bot,
             interaction.guild_id,
-            title="Capital gold contributions",
-            description=(
-                f"Season ending {ts(s.end, 'd')} · total **{total:,}**\n"
-                + (table(data, ["#", "Player", "Gold"]) if data else "No contributions recorded yet.")
-            )[:4096],
+            title=icon_text(gold, "Capital Gold contributions"),
+            description=f"{head}\n\n{body or 'No contributions recorded yet.'}",
         )
+        clan_row_header(e, clan_row, tag)
         await interaction.response.send_message(embed=e)
 
     @capital.command(name="history", description="A player's raid weekends (attacks and loot)")
@@ -124,18 +190,17 @@ class Capital(BaseCog):
     ) -> None:
         tags = await resolve_player_tags(interaction, player, user)
         rows = await cap_repo.player_raid_history(self.db, tags)
-        data = [
-            (r["start_time"][:10], r["name"][:12], f"{r['attacks']}/{r['attack_limit']}", f"{r['loot']:,}")
-            for r in rows
-        ]
+        one = len({r["player_tag"] for r in rows}) == 1
+        if one:  # one player: "Name (#TAG)" linked to their profile
+            name, tag = rows[0]["name"], rows[0]["player_tag"]
+            title, url = f"{discord.utils.escape_markdown(name)} ({tag})", player_link(tag)
+        else:
+            title, url = "Raid history", None
         e = await make_embed(
-            self.bot,
-            interaction.guild_id,
-            title="Raid history",
-            description=table(data, ["Weekend", "Player", "Hits", "Loot"])
-            if data
-            else "No raids recorded yet.",
+            self.bot, interaction.guild_id, title=title, url=url, description=history_text(rows, one)
         )
+        if one:
+            e.set_footer(text="Raid history")
         await interaction.response.send_message(embed=e)
 
 

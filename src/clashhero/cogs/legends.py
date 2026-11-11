@@ -24,6 +24,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from clashhero.cogs import _legend_embeds as E
+from clashhero.cogs import _log_embeds as L
 from clashhero.cogs._base import BaseCog, send_error
 from clashhero.cogs._info_embeds import summarize_army
 from clashhero.cogs.army import army_embed_fields
@@ -37,7 +38,7 @@ from clashhero.services.battlelog import army_link, estimate_legend_result
 from clashhero.services.emojis import EMOJIS
 from clashhero.services.outbox import send_clan_log, send_dm, send_to_channel, update_live_message
 from clashhero.utils.checks import has_permission, manager
-from clashhero.utils.fmt import guild_color, signed, table
+from clashhero.utils.fmt import clan_link, guild_color, signed, table, ts
 from clashhero.utils.ranked import (
     daily_attack_cap,
     is_legend_one,
@@ -64,7 +65,7 @@ from clashhero.utils.seasons import (
     season_for_date,
     season_label,
 )
-from clashhero.utils.style import SEP, chip, fail_embed, header, ok_embed
+from clashhero.utils.style import SEP, fail_embed, ok_embed
 
 log = logging.getLogger(__name__)
 
@@ -83,16 +84,36 @@ async def _player_name(bot, tag: str) -> str:
     return row["name"] if row else tag
 
 
+def _who(name: str | None, tag: str) -> str:
+    """A player in a reply: their name linked to their profile, and the tag."""
+    return f"{L.player_ref(name, tag)} `{tag}`" if name else f"`{tag}`"
+
+
+def _alerts(n: int) -> str:
+    return f"**{n}** alert{'s' if n != 1 else ''}"
+
+
 def alert_line(sub, where: str) -> str:
-    """One /track list row: ``` `#12` **Name** `#TAG` → DM · ⚔️ on · 🛡️ off```."""
-    name = sub["name"] or "?"
-    return SEP.join(
-        (
-            f"`#{sub['id']}` **{name}** `{sub['player_tag']}` → {where}",
-            f"⚔️ {'on' if sub['attacks'] else 'off'}",
-            f"🛡️ {'on' if sub['defenses'] else 'off'}",
-        )
-    )
+    """One /track list row: the player (linked) and tag, where the alerts go, which battles alert
+    (``[Name](…) `#TAG` → DM · ⚔️ on · 🛡️ off``, game icons) and the role pinged on defenses."""
+    parts = [
+        f"{_who(sub['name'], sub['player_tag'])} → {where}",
+        f"{E.kind_icon('attack')} {'on' if sub['attacks'] else 'off'}",
+        f"{E.kind_icon('defense')} {'on' if sub['defenses'] else 'off'}",
+    ]
+    if sub["ping_role_id"]:
+        parts.append(f"pings <@&{sub['ping_role_id']}>")
+    return SEP.join(parts)
+
+
+def fit_lines(lines: Sequence[str], limit: int) -> str:
+    """Lines joined, cut with "… and N more" to stay within ``limit`` characters."""
+    for keep in range(len(lines), -1, -1):
+        rest = len(lines) - keep
+        text = "\n".join([*lines[:keep], *([f"… and {rest} more"] if rest else [])])
+        if len(text) <= limit:
+            return text
+    return f"{len(lines)} alerts"
 
 
 async def _can_manage_sub(interaction: discord.Interaction, sub) -> bool:
@@ -582,7 +603,12 @@ async def _logs_day_view(bot, tag: str, day: str, guild_id: int | None) -> disco
     league = await repo.player_league(bot.db, tag)
     color = await guild_color(bot, guild_id)
     common = dict(
-        name=name, tag=tag, town_hall=player["town_hall"] if player else None, now=_now(), color=color
+        name=name,
+        tag=tag,
+        town_hall=player["town_hall"] if player else None,
+        league=league,
+        now=_now(),
+        color=color,
     )
     if league and not is_legend_one(league):
         week = ranked_week(datetime.fromisoformat(f"{day}T12:00:00+00:00"))
@@ -961,6 +987,7 @@ class Legends(BaseCog):
             stars=event.stars,
             destruction=event.destruction,
             battle_type=event.battle_type,
+            **await self._clan_footer(event.clan_tag),
         )
         if event.clan_tag:
             await send_clan_log(self.bot, event.clan_tag, "legend_battles", embed, view=alert_view(event))
@@ -968,6 +995,13 @@ class Legends(BaseCog):
             if not (sub["attacks"] if event.kind == "attack" else sub["defenses"]):
                 continue
             await self._deliver(sub, embed, event)
+
+    async def _clan_footer(self, clan_tag: str | None) -> dict[str, Any]:
+        """The clan's name and badge for an alert's footer (nothing without a clan)."""
+        row = await self.db.get_clan_row(clan_tag) if clan_tag else None
+        if row is None:
+            return {}
+        return {"clan_name": row["name"], "badge_url": row["badge_url"]}
 
     async def _deliver(self, sub, embed: discord.Embed, event: LegendBattle) -> None:
         kind = event.kind
@@ -993,7 +1027,7 @@ class Legends(BaseCog):
         tags = await repo.board_tags(self.db, gid)
         entries = await repo.board_entries(self.db, tags, legend_day_id())
         embed = E.board_embed(
-            title="🏆 Legend leaderboard",
+            title="Legend leaderboard",
             entries=entries,
             updated=_now(),
             color=await guild_color(self.bot, gid),
@@ -1021,6 +1055,7 @@ class Legends(BaseCog):
                 day=prev_day,
                 rows=rows,
                 color=discord.Color.gold(),
+                badge_url=clan["badge_url"] if clan else None,
             )
             await send_clan_log(self.bot, clan_tag, "legend_daily", embed)
             await repo.mark_daily_posted(self.db, clan_tag, prev_day)
@@ -1109,7 +1144,7 @@ class Legends(BaseCog):
         if not is_tracked_ranked(league_name(p)):
             note = "\nℹ️ Alerts start once the player reaches Dragon League 28 or higher."
         await interaction.followup.send(
-            embed=ok_embed(f"Tracking **{p.name}** `{p.tag}`: {what} → {where}.{note}"), ephemeral=True
+            embed=ok_embed(f"Tracking {_who(p.name, p.tag)}: {what} → {where}.{note}"), ephemeral=True
         )
 
     @track.command(name="remove", description="Stop alerts for a player")
@@ -1122,20 +1157,23 @@ class Legends(BaseCog):
         for s in subs:
             await repo.delete_subscription(self.db, s["id"])
         await interaction.response.send_message(
-            embed=ok_embed(f"Removed {chip(len(subs))} alert(s) for `{tag}`."), ephemeral=True
+            embed=ok_embed(f"Removed {_alerts(len(subs))} for {await self._stored_who(tag)}."), ephemeral=True
         )
+
+    async def _stored_who(self, tag: str) -> str:
+        """A stored player in a reply: their name linked to their profile, and the tag."""
+        row = await self.db.get_player_row(tag)
+        return _who(row["name"] if row else None, tag)
 
     @track.command(name="list", description="List your alerts (managers also see this server's)")
     async def track_list(self, interaction: discord.Interaction) -> None:
         gid = interaction.guild_id if await has_permission(interaction) else None
         subs = await repo.list_subscriptions(self.db, user_id=interaction.user.id, guild_id=gid)
         lines = [alert_line(s, "DM" if s["channel_id"] == 0 else f"<#{s['channel_id']}>") for s in subs]
-        if lines:
-            lines.insert(0, header("Alerts", "🔔", chip(len(subs))))
         embed = discord.Embed(
-            title="Legend alerts",
+            title=f"Legend alerts ({len(subs)})" if subs else "Legend alerts",
             color=await guild_color(self.bot, interaction.guild_id),
-            description="\n".join(lines)[:4000] or "No alerts set up. Use `/track add`.",
+            description=fit_lines(lines, 4000) if lines else "No alerts set up. Use `/track add`.",
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -1177,7 +1215,7 @@ class Legends(BaseCog):
             except sqlite3.IntegrityError as e:  # would duplicate an existing alert
                 raise ResolveError("That would duplicate an existing alert.") from e
         await interaction.response.send_message(
-            embed=ok_embed(f"Updated {chip(len(subs))} alert(s) for `{tag}`."), ephemeral=True
+            embed=ok_embed(f"Updated {_alerts(len(subs))} for {await self._stored_who(tag)}."), ephemeral=True
         )
 
     # -------------------------------------------------------------- /legends
@@ -1350,10 +1388,13 @@ class Legends(BaseCog):
         tags = await repo.legend_members(self.db, [tag])
         entries = await repo.board_entries(self.db, tags, legend_day_id())
         embed = E.board_embed(
-            title=f"{row['name'] if row else tag} · Legends today",
+            title="Legends today",
             entries=entries,
             color=await guild_color(self.bot, interaction.guild_id),
             latest=E.LATEST_BATTLES,
+            clan_name=row["name"] if row else tag,
+            clan_tag=tag,
+            badge_url=row["badge_url"] if row else None,
         )
         await interaction.response.send_message(embed=embed)
 
@@ -1370,7 +1411,8 @@ class Legends(BaseCog):
             color=await guild_color(self.bot, interaction.guild_id),
             latest=E.LATEST_BATTLES,
         )
-        embed.set_footer(text=f"Season ends {game_season().end:%Y-%m-%d}")
+        end = game_season().end
+        embed.add_field(name="Season ends", value=f"{ts(end, 'D')} · {ts(end, 'R')}")
         await interaction.response.send_message(embed=embed)
 
     # -------------------------------------------------------------- /legendboard
@@ -1412,12 +1454,11 @@ class Legends(BaseCog):
         await interaction.response.defer(ephemeral=True)
         p = await self.coc.get_player(tag)
         added = await repo.board_add(self.db, interaction.guild_id, [p.tag])
+        who = _who(p.name, p.tag)
         embed = (
-            ok_embed(f"Added **{p.name}** `{p.tag}` to the leaderboard.")
+            ok_embed(f"Added {who} to the leaderboard.")
             if added
-            else fail_embed(
-                f"Not added: **{p.name}** is already listed, or the board is full ({repo.BOARD_LIMIT})."
-            )
+            else fail_embed(f"Not added: {who} is already listed, or the board is full ({repo.BOARD_LIMIT}).")
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -1444,10 +1485,9 @@ class Legends(BaseCog):
         if mode and mode.value == "replace":
             await repo.board_clear(self.db, interaction.guild_id)
         added = await repo.board_add(self.db, interaction.guild_id, tags)
+        clan_ref = f"[{discord.utils.escape_markdown(c.name)}]({clan_link(c.tag)})"
         await interaction.followup.send(
-            embed=ok_embed(
-                f"Imported {chip(f'{added}/{len(tags)}')} ranked members (Dragon 28+) from **{c.name}**."
-            ),
+            embed=ok_embed(f"Imported **{added}/{len(tags)}** ranked members (Dragon 28+) from {clan_ref}."),
             ephemeral=True,
         )
 
@@ -1457,10 +1497,11 @@ class Legends(BaseCog):
     async def board_remove(self, interaction: discord.Interaction, player: str) -> None:
         tag = parse_tag(player)
         ok = await repo.board_remove(self.db, interaction.guild_id, tag)
+        who = await self._stored_who(tag)
         await interaction.response.send_message(
-            embed=ok_embed(f"Removed `{tag}` from the leaderboard.")
+            embed=ok_embed(f"Removed {who} from the leaderboard.")
             if ok
-            else fail_embed(f"`{tag}` isn't on the leaderboard."),
+            else fail_embed(f"{who} isn't on the leaderboard."),
             ephemeral=True,
         )
 

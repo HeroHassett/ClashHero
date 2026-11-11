@@ -5,6 +5,7 @@ from PIL import Image
 
 from clashhero.cogs.cwl import CWL, current_round, cwl_movement, season_title
 from clashhero.services import cards
+from clashhero.utils.fmt import clan_link, player_link
 
 SIZE = 5
 A, B, C, D = "#2PP", "#2YY", "#2LL", "#2QQ"
@@ -102,6 +103,7 @@ class FakeCoc:
                     tag=t,
                     name=f"Clan {t}",
                     badge=NS(medium=f"https://api-assets.clashofclans.com/b/{t[1:]}.png"),
+                    members=[NS(town_hall=th) for th in (17, 16, 16)],
                 )
                 for t in (A, B, C, D)
             ],
@@ -127,14 +129,31 @@ class FakeFollowup:
 
 
 class FakeResponse:
+    def __init__(self):
+        self.sent = []
+
     async def defer(self, **kwargs):
         pass
 
+    async def send_message(self, *args, **kwargs):
+        self.sent.append(kwargs)
+
+
+def fake_interaction(db):
+    bot = NS(db=db, coc=FakeCoc())
+    return NS(
+        client=bot,
+        guild_id=1,
+        channel_id=10,
+        user=NS(id=99, display_name="Ann"),
+        response=FakeResponse(),
+        followup=FakeFollowup(),
+    )
+
 
 async def run_stats(db):
-    bot = NS(db=db, coc=FakeCoc())
-    interaction = NS(client=bot, guild_id=1, channel_id=10, response=FakeResponse(), followup=FakeFollowup())
-    await CWL.stats.callback(CWL(bot), interaction, A)
+    interaction = fake_interaction(db)
+    await CWL.stats.callback(CWL(interaction.client), interaction, A)
     [msg] = interaction.followup.sent
     return msg
 
@@ -161,7 +180,15 @@ async def test_stats_attaches_the_card(db, monkeypatch):
     assert msg["file"].filename == "cwl.png"
     im = Image.open(io.BytesIO(msg["file"].fp.read()))
     assert im.size == (1000, cards.card_height(4))
-    assert "Round 3/7" in msg["embed"].description  # round 3 is on its battle day
+    e = msg["embed"]
+    assert e.title == "CWL standings · November 2026"
+    assert (e.author.name, e.author.icon_url) == (
+        f"Clan {A}",
+        "https://api-assets.clashofclans.com/b/2PP.png",
+    )
+    head, ours = e.description.split("\n")[:2]
+    assert head == "**Crystal League I** · Round **3**/7"  # round 3 is on its battle day
+    assert ours == f"▼ **Clan {A}** · **2nd** of 4 · ★ **17** stars"  # dropped from 1st after round 2
     assert seen["urls"] == [f"https://api-assets.clashofclans.com/b/{t[1:]}.png" for t in (A, B, C, D)]
 
     kw = seen["render"]
@@ -187,5 +214,69 @@ async def test_stats_falls_back_to_text_when_the_card_fails(db, monkeypatch, cap
 
     assert "file" not in msg
     assert msg["embed"].image.url is None
-    assert "Round 3/7" in msg["embed"].description
+    assert "Round **3**/7" in msg["embed"].description
     assert any("standings card" in r.message for r in caplog.records)
+
+
+async def test_members_lists_each_clans_town_halls_ours_first(db):
+    interaction = fake_interaction(db)
+    await CWL.members.callback(CWL(interaction.client), interaction, C)
+    [msg] = interaction.followup.sent
+    e = msg["embed"]
+    assert e.title == "CWL group · November 2026"
+    assert (e.author.name, e.author.url) == (f"Clan {C}", clan_link(C))
+    assert [f.name for f in e.fields][:2] == [f"★ Clan {C} · 3 players", f"Clan {A} · 3 players"]
+    assert e.fields[0].value == "TH17 **1**  TH16 **2**"
+
+
+async def add_cwl_season(db):
+    await db.add_guild_clan(1, A)
+    await db.execute(
+        "INSERT INTO clans (clan_tag, name, badge_url, updated_at) "
+        "VALUES (?, 'Heroes', 'https://b/h.png', 'x')",
+        (A,),
+    )
+    for rnd in (1, 2):
+        w = await db.execute(
+            "INSERT INTO wars (clan_tag, opponent_tag, opponent_name, war_type, cwl_season, cwl_round, "
+            "state, team_size, attacks_per_member, preparation_start) "
+            "VALUES (?, ?, 'Opp', 'cwl', '2026-11', ?, 'warEnded', 1, 1, ?)",
+            (A, B, rnd, f"2026-11-0{rnd}T00:00:00+00:00"),
+        )
+        await db.execute(
+            "INSERT INTO war_members (war_id, player_tag, name, town_hall, map_position, is_opponent) "
+            "VALUES (?, '#2PQ', 'Pat', 17, 1, 0), (?, '#2EE', 'Enemy', 17, 1, 1)",
+            (w, w),
+        )
+        if rnd == 1:
+            await db.execute(
+                "INSERT INTO war_attacks (war_id, attack_order, attacker_tag, defender_tag, stars, "
+                "destruction, is_fresh, new_stars, attacker_th, defender_th, is_opponent, seen_at) "
+                "VALUES (?, 1, '#2PQ', '#2EE', 3, 100.0, 1, 3, 17, 17, 0, 'x')",
+                (w,),
+            )
+
+
+async def test_season_tables_show_the_clan_and_a_summary(db):
+    await add_cwl_season(db)
+    interaction = fake_interaction(db)
+    cog = CWL(interaction.client)
+    await CWL.attacks.callback(cog, interaction, A, "2026-11")
+    await CWL.stars_.callback(cog, interaction, A, "2026-11")
+    attacks, stars = (m["embed"] for m in interaction.response.sent)
+    assert attacks.title == "CWL attacks · November 2026" and stars.title == "CWL stars · November 2026"
+    for e in (attacks, stars):
+        assert (e.author.name, e.author.icon_url) == ("Heroes", "https://b/h.png")
+    assert attacks.description.startswith("⚔️ **1**/2 attacks used · ▼ **1** missed\n```")
+    assert stars.description.startswith("★ **3** stars · ★★★ **1** triples · **100%** destruction\n```")
+
+
+async def test_history_titles_the_player(db):
+    await add_cwl_season(db)
+    interaction = fake_interaction(db)
+    await CWL.history.callback(CWL(interaction.client), interaction, "#2PQ", None, "2026-11")
+    [msg] = interaction.response.sent
+    e = msg["embed"]
+    assert (e.title, e.url) == ("Pat (#2PQ)", player_link("#2PQ"))
+    assert e.description == "🏆 **CWL history** · November 2026"
+    assert e.fields[0].value.split("\n")[:2] == ["🏆 **Nov 2026**", "Heroes · TH17 · map position **1**"]

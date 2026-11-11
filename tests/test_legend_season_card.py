@@ -353,7 +353,7 @@ async def test_logs_attach_the_season_card(season_db, monkeypatch):
     card = seen["card"]
     assert open_png(file.fp.read()).size == (1000, cards.season_height(card))
     assert embed.author.name == "LEGEND I · TODAY"  # the day at a glance, with the season card
-    assert "ATTACK" in embed.description and "Attacks 2/8 (+72)" in embed.description
+    assert "ATTACK" in embed.description and "**Attacks 2/8** · ▲ **+72**" in embed.description
     assert [b.item.label for b in msg["view"].children][0] == "Refresh"
 
     assert (card.player_name, card.today, card.trophies, card.league) == ("Amy", 1, 5104, "Legend I")
