@@ -100,7 +100,7 @@ settings need **Manage Server** or the matching manager role set with `/config r
 | `/legends day [player] [user] [day_offset]` | A player's ranked attacks and defenses for a legend day |
 | `/legends history [player] [user]` | A player's legend results across seasons |
 | `/legends leaderboard [clans]` | Family-wide legend ranking across this server's clans |
-| `/legends logs [player] [user] [season]` | Day-by-day legend stats for a season |
+| `/legends logs [player] [user] [season] [details]` | Day-by-day legend stats for a season |
 | `/legends week [player] [user] [weeks_ago]` | A player's ranked week (weekly tournaments) |
 | `/top clans [location]` | Top clans globally or in a country |
 | `/top players [location]` | Top players globally or in a country |

@@ -32,7 +32,7 @@ from clashhero.repos import legends as repo
 from clashhero.repos import ranks
 from clashhero.services import cards, country_flags
 from clashhero.services import icons as unit_icons
-from clashhero.services.army import parse_army
+from clashhero.services.army import common_army, hero_usage, parse_army
 from clashhero.services.battlelog import army_link, estimate_legend_result
 from clashhero.services.emojis import EMOJIS
 from clashhero.services.outbox import send_clan_log, send_to_channel, update_live_message
@@ -196,6 +196,34 @@ def season_card(
     )
 
 
+def season_details(
+    summary: repo.SeasonSummary, now: datetime, *, daily_cap: bool = True
+) -> cards.SeasonDetails:
+    """The detailed card's extra panels: the latest legend days, and hero, equipment and army
+    usage over the season's attacks that have an army code (battles read from the battle log).
+    ``daily_cap``: show battles against the day's cap (Legend I); other tiers have a weekly one."""
+    today = legend_day_id(now)
+    days = tuple(
+        cards.DetailDay(
+            day=date.fromisoformat(d.day),
+            offense=d.stats.offense,
+            defense=d.stats.defense,
+            attacks=len(d.stats.attacks),
+            defenses=len(d.stats.defenses),
+            cap=d.stats.cap if daily_cap else None,
+            today=d.day == today,
+        )
+        for d in summary.days
+    )
+    armies = [a for h in summary.attack_hits if h.army_share_code and (a := parse_army(h.army_share_code))]
+    return cards.SeasonDetails(
+        days=days[-cards.MAX_DETAIL_DAYS :],
+        attacks=len(armies),
+        heroes=tuple(hero_usage(armies)),
+        army=common_army(armies),
+    )
+
+
 async def _player_clan(bot, player) -> tuple[str | None, bytes | None]:
     """The player's clan name and badge image: the stored clan, else one API call. (None, None)
     when they have no clan; the badge is None when it can't be fetched. Never raises."""
@@ -221,22 +249,29 @@ async def _player_clan(bot, player) -> tuple[str | None, bytes | None]:
 
 
 async def _season_image(
-    bot, tag: str, name: str, season_id: str, summary: repo.SeasonSummary
+    bot, tag: str, name: str, season_id: str, summary: repo.SeasonSummary, *, details: bool = False
 ) -> discord.File | None:
-    """The season card for /legends logs, or None (logged) if it can't be drawn."""
+    """The season card for /legends logs (with ``details``, the taller one with the day strip,
+    heroes and army), or None (logged) if it can't be drawn."""
     try:
         player = await bot.db.get_player_row(tag)
+        now = _now()
         card = season_card(
             name=name,
             tag=tag,
             window=season_by_id(season_id),
             summary=summary,
-            now=_now(),
+            now=now,
             trophies_now=player["trophies"] if player else None,
         )
         clan_name, clan_badge = await _player_clan(bot, player)
         if clan_name:
             card = dataclasses.replace(card, clan_name=clan_name, clan_badge=clan_badge)
+        if details:
+            league = await repo.player_league(bot.db, tag)
+            extra = season_details(summary, now, daily_cap=league is None or is_legend_one(league))
+            extra = dataclasses.replace(extra, icons=await unit_icons.fetch_icons(extra.icon_names()))
+            card = dataclasses.replace(card, details=extra)
         png = await asyncio.to_thread(cards.render_legend_season, card)
     except Exception:
         log.exception("Couldn't draw the legend season card for %s in %s", tag, season_id)
@@ -433,21 +468,23 @@ VIEW_EMOJIS = {
 }
 LEGEND_VIEW_TEMPLATE = (
     r"lg:v:(?P<view>day|season|def|att):(?P<tag>[0289PYLQGRJCUV]{3,15}):(?P<day>\d{4}-\d{2}-\d{2})"
+    r"(?::(?P<details>d))?"
 )
 _LEGEND_VIEW_RE = re.compile(LEGEND_VIEW_TEMPLATE)
 
 
-def legend_view_id(view: str, tag: str, day: str) -> str:
-    """custom_id of a view button: ``lg:v:season:2PQ8VLYC0:2026-11-07``."""
+def legend_view_id(view: str, tag: str, day: str, *, details: bool = False) -> str:
+    """custom_id of a view button: ``lg:v:season:2PQ8VLYC0:2026-11-07``, plus ``:d`` when the
+    message shows the detailed season card (so every button keeps it)."""
     if view not in LEGEND_VIEWS:
         raise ValueError(f"unknown legend view {view!r}")
-    return f"lg:v:{view}:{tag.lstrip('#').upper()}:{day}"
+    return f"lg:v:{view}:{tag.lstrip('#').upper()}:{day}" + (":d" if details else "")
 
 
-def parse_legend_view_id(custom_id: str) -> tuple[str, str, str] | None:
-    """(view, "#TAG", "YYYY-MM-DD") from a view button's custom_id, or None."""
+def parse_legend_view_id(custom_id: str) -> tuple[str, str, str, bool] | None:
+    """(view, "#TAG", "YYYY-MM-DD", details) from a view button's custom_id, or None."""
     m = _LEGEND_VIEW_RE.fullmatch(custom_id)
-    return (m["view"], f"#{m['tag']}", m["day"]) if m else None
+    return (m["view"], f"#{m['tag']}", m["day"], bool(m["details"])) if m else None
 
 
 def _view_emoji(view: str) -> discord.PartialEmoji | str:
@@ -463,42 +500,50 @@ class LegendViewButton(discord.ui.DynamicItem[discord.ui.Button], template=LEGEN
     """Switches a /legends logs or /legends armies message to another view of the player's day,
     editing it in place. Persistent: works on old messages after a restart. Anyone may click."""
 
-    def __init__(self, view: str, tag: str, day: str, *, current: bool = False) -> None:
+    def __init__(
+        self, view: str, tag: str, day: str, *, current: bool = False, details: bool = False
+    ) -> None:
         super().__init__(
             discord.ui.Button(
                 label=VIEW_LABELS[view],
                 style=discord.ButtonStyle.primary if current else discord.ButtonStyle.secondary,
                 disabled=current and view != "day",  # Refresh always works
                 emoji=_view_emoji(view),
-                custom_id=legend_view_id(view, tag, day),
+                custom_id=legend_view_id(view, tag, day, details=details),
             )
         )
-        self.target, self.tag, self.day = view, f"#{tag.lstrip('#')}", day
+        self.target, self.tag, self.day, self.details = view, f"#{tag.lstrip('#')}", day, details
 
     @classmethod
     async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match):
-        return cls(match["view"], match["tag"], match["day"])
+        return cls(match["view"], match["tag"], match["day"], details=bool(match["details"]))
 
     async def callback(self, interaction: discord.Interaction) -> None:
         try:
             await interaction.response.defer()
             embed, file = await render_legend_view(
-                interaction.client, interaction.guild_id, self.target, self.tag, self.day
+                interaction.client,
+                interaction.guild_id,
+                self.target,
+                self.tag,
+                self.day,
+                details=self.details,
             )
             await interaction.edit_original_response(
                 embed=embed,
                 attachments=[file] if file else [],
-                view=legend_view_row(self.target, self.tag, self.day),
+                view=legend_view_row(self.target, self.tag, self.day, details=self.details),
             )
         except Exception as e:  # buttons have no command error handler
             await send_error(interaction, e)
 
 
-def legend_view_row(current: str, tag: str, day: str) -> discord.ui.View:
-    """Refresh · View Historical Data · Defense Armies · Attack Armies; ``current`` highlighted."""
+def legend_view_row(current: str, tag: str, day: str, *, details: bool = False) -> discord.ui.View:
+    """Refresh · View Historical Data · Defense Armies · Attack Armies; ``current`` highlighted.
+    ``details``: the buttons keep the detailed season card."""
     view = discord.ui.View(timeout=None)
     for name in LEGEND_VIEWS:
-        view.add_item(LegendViewButton(name, tag, day, current=name == current))
+        view.add_item(LegendViewButton(name, tag, day, current=name == current, details=details))
     return view
 
 
@@ -584,9 +629,10 @@ async def _logs_season_view(
 
 
 async def render_legend_view(
-    bot, guild_id: int | None, view: str, tag: str, day: str
+    bot, guild_id: int | None, view: str, tag: str, day: str, *, details: bool = False
 ) -> tuple[discord.Embed, discord.File | None]:
-    """(embed, image file or None) for one of the four views of a player's day."""
+    """(embed, image file or None) for one of the four views of a player's day. ``details``:
+    the day and season views get the detailed season card."""
     if view in ("def", "att"):
         embed, card = await _armies_card(bot, tag, day, "defense" if view == "def" else "attack", guild_id)
         if card is None:
@@ -600,16 +646,20 @@ async def render_legend_view(
         embed = await _logs_day_view(bot, tag, day, guild_id)
     else:
         embed = await _logs_season_view(bot, tag, name, season_id, summary, guild_id)
-    file = await _season_image(bot, tag, name, season_id, summary)
+    file = await _season_image(bot, tag, name, season_id, summary, details=details)
     if file is not None:
         embed.set_image(url="attachment://legend-season.png")
     return embed, file
 
 
-async def _send_view(interaction: discord.Interaction, view: str, tag: str, day: str) -> None:
+async def _send_view(
+    interaction: discord.Interaction, view: str, tag: str, day: str, *, details: bool = False
+) -> None:
     """Send a view (after the command deferred) with the row of view buttons under it."""
-    embed, file = await render_legend_view(interaction.client, interaction.guild_id, view, tag, day)
-    reply: dict[str, Any] = {"embed": embed, "view": legend_view_row(view, tag, day)}
+    embed, file = await render_legend_view(
+        interaction.client, interaction.guild_id, view, tag, day, details=details
+    )
+    reply: dict[str, Any] = {"embed": embed, "view": legend_view_row(view, tag, day, details=details)}
     if file is not None:
         reply["file"] = file
     await interaction.followup.send(**reply)
@@ -1228,13 +1278,17 @@ class Legends(BaseCog):
 
     @legends.command(name="logs", description="Day-by-day legend stats for a season")
     @app_commands.autocomplete(player=player_autocomplete, season=_season_autocomplete)
-    @app_commands.describe(season="Pick a season, or type any date in it (YYYY-MM-DD); default: current")
+    @app_commands.describe(
+        season="Pick a season, or type any date in it (YYYY-MM-DD); default: current",
+        details="Add the day-by-day strip, heroes and equipment, and the most-used army to the card",
+    )
     async def legends_logs(
         self,
         interaction: discord.Interaction,
         player: str | None = None,
         user: discord.User | None = None,
         season: str | None = None,
+        details: bool = False,
     ) -> None:
         tag = await self._resolve_player(interaction, player, user)
         target, day = "day", legend_day_id(_now())
@@ -1245,7 +1299,7 @@ class Legends(BaseCog):
             if not window.contains(_now()):  # another season: open on its day-by-day history
                 target, day = "season", legend_day_id(min(window.end, _now()) - timedelta(seconds=1))
         await interaction.response.defer()
-        await _send_view(interaction, target, tag, day)
+        await _send_view(interaction, target, tag, day, details=details)
 
     @legends.command(name="history", description="A player's legend results across seasons")
     @app_commands.autocomplete(player=player_autocomplete)

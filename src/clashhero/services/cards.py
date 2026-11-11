@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
 
-from clashhero.services.army import Army, HeroLoadout, Unit
+from clashhero.services.army import Army, ArmyUsage, HeroLoadout, HeroUsage, Unit
 from clashhero.services.icons import font_dir
 
 log = logging.getLogger(__name__)
@@ -2139,6 +2139,51 @@ class SeasonPoint:
     net: int | None = None
 
 
+MAX_DETAIL_DAYS = 10
+MAX_DETAIL_HEROES = 4
+
+
+@dataclass(frozen=True)
+class DetailDay:
+    """One legend day in the detailed card's day strip: trophies won and lost, battles fought
+    and the day's battle cap (None for tiers without one)."""
+
+    day: date
+    offense: int = 0
+    defense: int = 0
+    attacks: int = 0
+    defenses: int = 0
+    cap: int | None = 8
+    today: bool = False
+
+    @property
+    def played(self) -> bool:
+        return bool(self.attacks or self.defenses)
+
+
+@dataclass(frozen=True)
+class SeasonDetails:
+    """The extra panels of the detailed season card (/legends logs details). ``days``: the
+    latest legend days, chronological (the strip shows the last MAX_DETAIL_DAYS); ``attacks``:
+    attacks with a recorded army, which the hero and army shares are of; ``icons``: unit name
+    -> image bytes."""
+
+    days: tuple[DetailDay, ...] = ()
+    attacks: int = 0
+    heroes: tuple[HeroUsage, ...] = ()
+    army: ArmyUsage | None = None
+    icons: Mapping[str, bytes] = field(default_factory=dict)
+
+    def icon_names(self) -> set[str]:
+        """Units drawn on the card, for fetching their icons."""
+        names: set[str] = set()
+        for h in self.heroes[:MAX_DETAIL_HEROES]:
+            names |= {u.name for u in (h.hero, *h.equipment, *([h.pet] if h.pet else [])) if u.name}
+        if self.army is not None:
+            names |= self.army.army.names()
+        return names
+
+
 @dataclass(frozen=True)
 class SeasonCard:
     """What the season card shows. ``days``: every legend day of the season window, in order;
@@ -2163,6 +2208,7 @@ class SeasonCard:
     defense_stars: StarCounts = StarCounts()
     clan_name: str | None = None  # the player's clan, shown top right with its badge
     clan_badge: bytes | None = None
+    details: SeasonDetails | None = None  # the extra panels under the star breakdowns
 
     @property
     def played_days(self) -> int:
@@ -2204,7 +2250,8 @@ def render_legend_season(card: SeasonCard) -> bytes:
 
 
 def _render_season(card: SeasonCard) -> Image.Image:
-    canvas = Image.new("RGB", (_px(WIDTH), _px(SEASON_H)), BG)
+    height = season_height(card)
+    canvas = Image.new("RGB", (_px(WIDTH), _px(height)), BG)
     draw = ImageDraw.Draw(canvas, "RGBA")
     _backdrop(canvas)
     _season_header(canvas, draw, card)
@@ -2222,7 +2269,9 @@ def _render_season(card: SeasonCard) -> Image.Image:
         card.defense_stars,
         DEFENSE_RAMP,
     )
-    return canvas.resize((WIDTH, SEASON_H), Image.Resampling.LANCZOS)
+    if card.details is not None:
+        _season_details(canvas, draw, card.details)
+    return canvas.resize((WIDTH, height), Image.Resampling.LANCZOS)
 
 
 def _gradient_runs(canvas: Image.Image, x: int, baseline: int, runs: Sequence[Run]) -> None:
@@ -2664,6 +2713,201 @@ def _stars_panel(
         noun = "battle" if stars.missing == 1 else "battles"
         note = f"{stars.missing} {noun} without star data (inferred from trophy changes)"
         draw.text((_px(bx0), _px(y0 + 132)), note, font=_inter(12, 500), fill=DIM, anchor="ls")
+
+
+# ------------------------------------------------------------------ season details (/legends logs details)
+
+DETAILS_GAP = 14
+DAYS_H = 152
+DAY_GUTTER = 96  # row labels left of the day columns
+MIN_DAY_COLS = 7  # a short strip keeps columns this narrow rather than stretching
+HEROES_H = 216
+HEROES_EMPTY_H = 92
+HERO_GAP = 10
+ARMY_HEAD = 54  # panel top to the first icon line
+ARMY_FOOT = 18
+
+
+def _heroes_height(details: SeasonDetails) -> int:
+    return HEROES_H if details.heroes else HEROES_EMPTY_H
+
+
+def _army_height(details: SeasonDetails) -> int:
+    if details.army is None:
+        return 0
+    lines = army_lines(details.army.army)
+    if not lines:
+        return 0
+    return ARMY_HEAD + len(lines) * LINE_H + (len(lines) - 1) * LINE_GAP + ARMY_FOOT
+
+
+def season_height(card: SeasonCard) -> int:
+    """The season card's height: SEASON_H, plus the detail panels when there are any."""
+    if card.details is None:
+        return SEASON_H
+    d = card.details
+    height = SEASON_H + DETAILS_GAP + DAYS_H + DETAILS_GAP + _heroes_height(d)
+    if army := _army_height(d):
+        height += DETAILS_GAP + army
+    return height
+
+
+def _season_details(canvas: Image.Image, draw: ImageDraw.ImageDraw, details: SeasonDetails) -> None:
+    """Under the star breakdowns: the latest days one by one, each hero's share of attacks with
+    its most-used equipment and pet, and the most-used army."""
+    images = _IconImages(details.icons)
+    top = STARS_Y + STARS_H + DETAILS_GAP
+    _details_days(canvas, draw, details, top)
+    top += DAYS_H + DETAILS_GAP
+    _details_heroes(canvas, draw, details, top, images)
+    top += _heroes_height(details) + DETAILS_GAP
+    if _army_height(details):
+        _details_army(canvas, draw, details, top, images)
+
+
+def _panel_title(draw: ImageDraw.ImageDraw, top: float, title: str) -> None:
+    _tracked(draw, _px(PAD + 22), _px(top + 30), title, _inter(12, 700), DIM, _px(1.6), "left")
+
+
+def _panel_rate(draw: ImageDraw.ImageDraw, top: float, value: str, label: str) -> None:
+    """A panel's figure top right: ``value`` big, ``label`` small after it (as the star panels)."""
+    small = _inter(13, 500)
+    right = _px(WIDTH - PAD - 22)
+    draw.text((right, _px(top + 30)), label, font=small, fill=MUTED, anchor="rs")
+    if value:
+        x = right - small.getlength(label) - _px(8)
+        draw.text((x, _px(top + 31)), value, font=_inter(20, 700), fill=TEXT, anchor="rs")
+
+
+def _centered_message(draw: ImageDraw.ImageDraw, top: float, height: float, text: str) -> None:
+    f = _inter(15, 500)
+    cy = top + 30 + (height - 30) / 2
+    draw.text((_px(WIDTH / 2), _baseline(f, _px(cy))), text, font=f, fill=MUTED, anchor="ms")
+
+
+def _details_days(canvas: Image.Image, draw: ImageDraw.ImageDraw, details: SeasonDetails, top: float) -> None:
+    """The latest legend days left to right (today highlighted): net trophies, trophies won and
+    lost (gained, below Legend I), and attacks and defenses against the day's cap."""
+    _card_panel(canvas, top, DAYS_H)
+    _panel_title(draw, top, "DAY BY DAY")
+    days = details.days[-MAX_DETAIL_DAYS:]
+    if not days:
+        _centered_message(draw, top, DAYS_H, "No legend days recorded yet")
+        return
+    noun = "day" if len(days) == 1 else "days"
+    _panel_rate(draw, top, "", f"latest {len(days)} legend {noun}")
+
+    date_y, net_y, won_y, fought_y = top + 64, top + 92, top + 119, top + 140
+    label_font = _inter(10, 700)
+    for text, y in (("NET", net_y), ("OFF / DEF", won_y), ("BATTLES", fought_y)):
+        base = _baseline(label_font, _px(y)) if y == net_y else _px(y)
+        _tracked(draw, _px(PAD + 22), base, text, label_font, DIM, _px(1.2), "left")
+
+    x0 = PAD + 22 + DAY_GUTTER
+    col = (WIDTH - PAD - 22 - x0) / max(len(days), MIN_DAY_COLS)
+    date_font = _inter(11, 700)
+    net_font = _inter(20, 700)
+    small = _inter(12, 600)
+    for i, d in enumerate(days):
+        cx = x0 + (i + 0.5) * col
+        if d.today:
+            box = (_px(cx - col / 2 + 3), _px(top + 44), _px(cx + col / 2 - 3), _px(top + DAYS_H - 8))
+            draw.rounded_rectangle(box, radius=_px(10), fill=(*GOLD, 18), outline=(*GOLD, 120), width=_px(1))
+        label = "TODAY" if d.today else f"{d.day:%b} {d.day.day}".upper()
+        _tracked(draw, _px(cx), _px(date_y), label, date_font, GOLD if d.today else MUTED, _px(1.1), "center")
+        if not d.played:
+            draw.text((_px(cx), _baseline(net_font, _px(net_y))), "—", font=net_font, fill=DIM, anchor="ms")
+            continue
+        net = d.offense + d.defense
+        color = GAIN_TEXT if net > 0 else LOSS_TEXT if net < 0 else TEXT
+        draw.text(
+            (_px(cx), _baseline(net_font, _px(net_y))), _signed(net), font=net_font, fill=color, anchor="ms"
+        )
+        won, lost, sep = f"+{d.offense}", _signed(d.defense), " / "
+        width = small.getlength(won) + small.getlength(sep) + small.getlength(lost)
+        x = _px(cx) - width / 2
+        for text, fill in ((won, TEXT), (sep, DIM), (lost, TEXT)):
+            draw.text((x, _px(won_y)), text, font=small, fill=fill, anchor="ls")
+            x += small.getlength(text)
+        cap = f"/{d.cap}" if d.cap is not None else ""
+        fought = f"{d.attacks}{cap} · {d.defenses}{cap}"
+        draw.text((_px(cx), _px(fought_y)), fought, font=_inter(12, 500), fill=DIM, anchor="ms")
+
+
+def _details_heroes(
+    canvas: Image.Image, draw: ImageDraw.ImageDraw, details: SeasonDetails, top: float, images: _IconImages
+) -> None:
+    """Up to four heroes, most used first: icon, name and share of attacks, then the most-used
+    equipment pair and pet with how often exactly those were brought."""
+    height = _heroes_height(details)
+    _card_panel(canvas, top, height)
+    _panel_title(draw, top, "HEROES & EQUIPMENT")
+    if not details.heroes:
+        _centered_message(draw, top, height, "No attack armies recorded this season yet")
+        return
+    noun = "attack" if details.attacks == 1 else "attacks"
+    _panel_rate(draw, top, "", f"most-used gear · {details.attacks} {noun} with an army")
+    cell_w = (WIDTH - 2 * PAD - 44 - (MAX_DETAIL_HEROES - 1) * HERO_GAP) / MAX_DETAIL_HEROES
+    cy0, cy1 = top + 48, top + height - 18
+    for i, usage in enumerate(details.heroes[:MAX_DETAIL_HEROES]):
+        cx0 = PAD + 22 + i * (cell_w + HERO_GAP)
+        _panel(
+            canvas,
+            (_px(cx0), _px(cy0), _px(cx0 + cell_w), _px(cy1)),
+            _px(12),
+            _mix(SURFACE_2, TEXT, 0.03),
+            GROUP_BORDER,
+            _px(1),
+        )
+        _draw_tile(canvas, draw, _px(cx0 + 12), _px(cy0 + 12), _Tile(usage.hero, TILE), images)
+        tx = cx0 + 12 + TILE + 12
+        room = _px(cx0 + cell_w - 12 - tx)
+        _draw_runs(draw, _px(tx), _px(cy0 + 32), fit_runs(usage.hero.label, _text_fonts(15, 700), room), TEXT)
+        share = usage.uses / details.attacks if details.attacks else 0.0
+        pct = f"{share:.0%}"
+        big = _inter(22, 700)
+        draw.text((_px(tx), _px(cy0 + 60)), pct, font=big, fill=GOLD_LIGHT, anchor="ls")
+        draw.text(
+            (_px(tx) + big.getlength(pct) + _px(6), _px(cy0 + 60)),
+            "of attacks",
+            font=_inter(12, 500),
+            fill=MUTED,
+            anchor="ls",
+        )
+        ey = cy0 + 12 + TILE + 12
+        ex = cx0 + 12
+        for unit in usage.equipment:
+            _draw_tile(canvas, draw, _px(ex), _px(ey), _Tile(unit, SMALL_TILE), images)
+            ex += SMALL_TILE + 6
+        if usage.pet is not None:
+            ex += 8 if usage.equipment else 0
+            _draw_tile(canvas, draw, _px(ex), _px(ey), _Tile(usage.pet, SMALL_TILE), images)
+        parts = []
+        if usage.equipment:
+            parts.append(f"Gear {usage.equipment_uses}/{usage.uses}")
+        if usage.pet is not None:
+            parts.append(f"Pet {usage.pet_uses}/{usage.uses}")
+        foot = " · ".join(parts) or "No equipment recorded"
+        runs = fit_runs(foot, _text_fonts(12, 500), _px(cell_w - 24))
+        _draw_runs(draw, _px(cx0 + 12), _px(ey + SMALL_TILE + 20), runs, DIM)
+
+
+def _details_army(
+    canvas: Image.Image, draw: ImageDraw.ImageDraw, details: SeasonDetails, top: float, images: _IconImages
+) -> None:
+    """The most-used troops and spells (exact counts), with the clan castle most often seen
+    alongside them, drawn like the armies card."""
+    usage = details.army
+    if usage is None:
+        return
+    _card_panel(canvas, top, _army_height(details))
+    _panel_title(draw, top, "MOST-USED ARMY")
+    share = usage.uses / details.attacks if details.attacks else 0.0
+    _panel_rate(draw, top, f"{share:.0%}", f"of attacks ({usage.uses}/{details.attacks})")
+    y = top + ARMY_HEAD
+    for line in army_lines(usage.army):
+        _draw_line(canvas, draw, line, y, images)
+        y += LINE_H + LINE_GAP
 
 
 # ------------------------------------------------------------------ badge downloads

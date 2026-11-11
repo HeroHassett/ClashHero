@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
@@ -187,3 +189,99 @@ def parse_army(code: str | None) -> Army:
         elif m["cc_spells"]:
             army.cc_spells += _items(m["cc_spells"], "spell")
     return army
+
+
+# ------------------------------------------------------------------ usage across many attacks
+
+
+@dataclass(frozen=True)
+class HeroUsage:
+    """One hero across a set of attacks: how many brought it, its most-used equipment pair and
+    pet, and how many of those attacks had exactly that pair / that pet."""
+
+    hero: Unit
+    uses: int
+    equipment: tuple[Unit, ...] = ()
+    equipment_uses: int = 0
+    pet: Unit | None = None
+    pet_uses: int = 0
+
+
+@dataclass(frozen=True)
+class ArmyUsage:
+    """The most-used army: its troops and spells (in the order the player last had them), the
+    clan castle most often seen with it, and how many attacks used those troops and spells."""
+
+    army: Army
+    uses: int
+
+
+def _most_used(keys: Sequence) -> tuple | None:
+    """The most frequent key; ties go to the one used last (``keys`` is chronological)."""
+    counts = Counter(keys)
+    if not counts:
+        return None
+    last = {k: i for i, k in enumerate(keys)}
+    return max(counts, key=lambda k: (counts[k], last[k]))
+
+
+def hero_usage(armies: Sequence[Army]) -> list[HeroUsage]:
+    """Every hero brought in ``armies`` (chronological), most used first, each with its
+    most-used equipment pair and pet. Equipment pairs match regardless of order."""
+    loadouts: dict[int, list[HeroLoadout]] = {}
+    for army in armies:
+        for h in army.heroes:
+            loadouts.setdefault(h.hero.id, []).append(h)
+    out = []
+    for runs in loadouts.values():
+        hero = runs[-1].hero
+        gear_keys = [tuple(sorted(e.id for e in h.equipment)) for h in runs if h.equipment]
+        gear = _most_used(gear_keys)
+        shown: tuple[Unit, ...] = ()
+        if gear is not None:
+            shown = next(
+                h.equipment for h in reversed(runs) if tuple(sorted(e.id for e in h.equipment)) == gear
+            )
+        pet_keys = [h.pet.id for h in runs if h.pet]
+        pet_id = _most_used(pet_keys)
+        pet = next((h.pet for h in reversed(runs) if h.pet and h.pet.id == pet_id), None)
+        out.append(
+            HeroUsage(
+                hero=hero,
+                uses=len(runs),
+                equipment=shown,
+                equipment_uses=gear_keys.count(gear) if gear is not None else 0,
+                pet=pet,
+                pet_uses=pet_keys.count(pet_id) if pet is not None else 0,
+            )
+        )
+    out.sort(key=lambda u: (-u.uses, u.hero.id))
+    return out
+
+
+def _units_key(units: Sequence[Unit]) -> tuple:
+    return tuple(sorted((u.id, u.count) for u in units))
+
+
+def common_army(armies: Sequence[Army]) -> ArmyUsage | None:
+    """The troops and spells used most often across ``armies`` (chronological), exact counts
+    included, with the clan castle most often seen alongside them (it's donated, so it varies
+    on its own). None when no army has troops or spells."""
+    own = [a for a in armies if a.troops or a.spells]
+    keys = [(_units_key(a.troops), _units_key(a.spells)) for a in own]
+    best = _most_used(keys)
+    if best is None:
+        return None
+    matching = [a for a, k in zip(own, keys, strict=True) if k == best]
+    latest = matching[-1]
+    with_cc = [a for a in matching if a.cc_troops or a.cc_spells]
+    cc_keys = [(_units_key(a.cc_troops), _units_key(a.cc_spells)) for a in with_cc]
+    cc_best = _most_used(cc_keys)
+    cc = next((a for a, k in zip(reversed(with_cc), reversed(cc_keys), strict=True) if k == cc_best), None)
+    army = Army(
+        troops=list(latest.troops),
+        spells=list(latest.spells),
+        cc_troops=list(cc.cc_troops) if cc else [],
+        cc_spells=list(cc.cc_spells) if cc else [],
+    )
+    return ArmyUsage(army, len(matching))

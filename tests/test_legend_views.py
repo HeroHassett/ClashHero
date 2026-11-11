@@ -139,7 +139,7 @@ def test_custom_id_round_trip():
     for view in cog.LEGEND_VIEWS:
         cid = cog.legend_view_id(view, TAG, DAY)
         assert len(cid) < 100
-        assert cog.parse_legend_view_id(cid) == (view, TAG, DAY)
+        assert cog.parse_legend_view_id(cid) == (view, TAG, DAY, False)
         assert cog.LegendViewButton.__discord_ui_compiled_template__.fullmatch(cid)
     assert cog.legend_view_id("season", "#2pq8vlyc0", DAY) == "lg:v:season:2PQ8VLYC0:2026-11-07"
     assert cog.parse_legend_view_id("lg:v:week:2PQ8VLYC0:2026-11-07") is None
