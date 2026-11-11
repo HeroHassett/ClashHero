@@ -224,17 +224,37 @@ def clan_move_embed(
     return e
 
 
-def role_change_embed(clan_name: str, name: str, tag: str, old: str | None, new: str | None) -> discord.Embed:
+def role_change_embed(
+    clan_name: str,
+    name: str,
+    tag: str,
+    old: str | None,
+    new: str | None,
+    *,
+    town_hall: int | None = None,
+    trophies: int | None = None,
+    league: str | None = None,
+    badge_url: str | None = None,
+    at: datetime | None = None,
+) -> discord.Embed:
+    """Laid out like the join and leave posts: the player (linked to their profile) as the title,
+    the new role with the old one after it, their Town Hall and trophies when known, and the clan
+    with its badge and the time in the footer. Green for a promotion, red for a demotion."""
     from clashhero.constants import ROLE_RANK
 
     promoted = ROLE_RANK.get(new or "", 0) > ROLE_RANK.get(old or "", 0)
-    verb = "promoted" if promoted else "demoted"
+    arrow = "▲" if promoted else "▼"
+    verb = "Promoted" if promoted else "Demoted"
+    lines = [f"{arrow} {verb} to **{role_name(new)}** · was {role_name(old)}"]
+    if town_hall:
+        lines.append(" ".join(_member_head(town_hall, league, trophies or 0)))
     e = discord.Embed(
-        description=f"**{name}** was {verb}: {role_name(old)} → **{role_name(new)}**",
+        title=f"{escape_markdown(name)} ({tag})",
+        url=player_link(tag),
+        description="\n".join(lines),
         color=GREEN if promoted else RED,
     )
-    e.set_footer(text=f"{clan_name} · {tag}")
-    return e
+    return _clan_footer(e, clan_name, badge_url, at)
 
 
 def name_change_embed(tag: str, old: str, new: str) -> discord.Embed:

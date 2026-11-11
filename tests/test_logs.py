@@ -119,8 +119,52 @@ def test_embed_builders_smoke():
     ]
     for embed in builders:
         assert embed.to_dict()
-    assert "promoted" in E.role_change_embed("C", "A", "#A", "member", "admin").description
-    assert "demoted" in E.role_change_embed("C", "A", "#A", "coLeader", "admin").description
+    assert "Promoted to **Elder**" in E.role_change_embed("C", "A", "#A", "member", "admin").description
+    assert "Demoted to **Elder**" in E.role_change_embed("C", "A", "#A", "coLeader", "admin").description
+
+
+def test_role_change_post():
+    at = datetime(2026, 11, 11, 7, 23, tzinfo=UTC)
+    e = E.role_change_embed(
+        "Aurora",
+        "Johnny_*",
+        "#Q808CLJCJ",
+        "member",
+        "coLeader",
+        town_hall=17,
+        trophies=5227,
+        league="Legend I",
+        badge_url="https://api-assets.clashofclans.com/badges/70/x.png",
+        at=at,
+    )
+    assert e.title == "Johnny\\_\\* (#Q808CLJCJ)" and e.url == player_link("#Q808CLJCJ")
+    first, second = e.description.split("\n")
+    assert first == "▲ Promoted to **Co-Leader** · was Member"
+    assert "**17**" in second and "**5,227**" in second  # Town Hall and trophies
+    assert (e.footer.text, e.footer.icon_url, e.timestamp) == (
+        "Aurora",
+        "https://api-assets.clashofclans.com/badges/70/x.png",
+        at,
+    )
+    assert e.color == E.GREEN
+    down = E.role_change_embed("Aurora", "Kim", "#K", "coLeader", "member")
+    assert down.description == "▼ Demoted to **Member** · was Co-Leader" and down.color == E.RED
+    assert down.footer.icon_url is None and down.timestamp is None  # no badge, no time: left out
+
+
+async def test_role_changes_post_with_the_player_and_a_profile_button(cog, sent, db):
+    await cog.on_clash_role_change(ev.RoleChanged("#C", "Clan", "#A", "Alice", "member", "admin"))
+    assert sent == []  # nobody subscribed: nothing looked up or sent
+    await db.set_clan_log(1, "#C", "role_change", 100)
+    await db.execute(
+        "INSERT INTO players (player_tag, name, town_hall, trophies, league, clan_tag, updated_at) "
+        "VALUES ('#A', 'Alice', 16, 4900, 'Electro Titan', '#C', 'x')"
+    )
+    await cog.on_clash_role_change(ev.RoleChanged("#C", "Clan", "#A", "Alice", "member", "admin"))
+    [(kind, clan, log_type, embed, view)] = sent
+    assert (kind, clan, log_type) == ("clan_log", "#C", "role_change")
+    assert embed.title == "Alice (#A)" and "**16**" in embed.description and embed.timestamp is not None
+    assert [b.url for b in view.children] == [player_link("#A")]
 
 
 # ------------------------------------------------------------------ upgrades / boosts / settings

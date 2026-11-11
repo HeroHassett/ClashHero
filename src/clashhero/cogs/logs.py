@@ -464,12 +464,22 @@ class Logs(BaseCog):
 
     @commands.Cog.listener()
     async def on_clash_role_change(self, e: ev.RoleChanged) -> None:
-        await send_clan_log(
-            self.bot,
-            e.clan_tag,
-            "role_change",
-            E.role_change_embed(e.clan_name, e.name, e.player_tag, e.old_role, e.new_role),
+        if not await self.db.clan_log_targets(e.clan_tag, "role_change"):
+            return
+        player = await self.db.get_player_row(e.player_tag)  # Town Hall and trophies, if polled
+        embed = E.role_change_embed(
+            e.clan_name,
+            e.name,
+            e.player_tag,
+            e.old_role,
+            e.new_role,
+            town_hall=player["town_hall"] if player else None,
+            trophies=player["trophies"] if player else None,
+            league=player["league"] if player else None,
+            badge_url=await self._badge(e.clan_tag),
+            at=datetime.now(UTC),
         )
+        await send_clan_log(self.bot, e.clan_tag, "role_change", embed, view=E.profile_view(e.player_tag))
 
     @commands.Cog.listener()
     async def on_clash_name_change(self, e: ev.NameChanged) -> None:
