@@ -166,3 +166,12 @@ async def test_collector_ranks_legend_one(setup):  # noqa: F811
     assert ranked == [("#B", 1, 5200), ("#A", 2, 5100)]  # Legend II and missing players left out
     # Past the reset deadline nothing more is read.
     assert await col.build_legend_ranking(datetime(2026, 11, 8, 4, 59, 45, tzinfo=UTC)) == []
+
+
+async def test_end_of_day_ranks_over_a_season(db):
+    await ranks.store_rankings(db, items(("#A", 3)), "2026-11-03", NOW)
+    await ranks.store_rankings(db, items(("#A", 5)), "2026-11-05", NOW)
+    await ranks.store_full_ranking(db, "2026-11-05", [("#A", 4, 5900), ("#B", 9, 5100)])
+    await ranks.store_full_ranking(db, "2026-12-01", [("#A", 1, 6000)])  # outside the range
+    assert await ranks.eod_ranks(db, "#A", "2026-11-02", "2026-11-29") == {"2026-11-03": 3, "2026-11-05": 4}
+    assert await ranks.eod_ranks(db, "#Z", "2026-11-02", "2026-11-29") == {}

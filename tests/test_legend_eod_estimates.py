@@ -346,20 +346,20 @@ def _card(**kw):
     return dataclasses.replace(base, **kw)
 
 
-def test_the_clan_shows_top_right():
+def test_the_clan_shows_over_the_name():
     plain = open_png(cards.render_legend_season(_card())).convert("RGB")
     with_clan = open_png(cards.render_legend_season(_card(clan_name="KiNG oF ClAn", clan_badge=badge_png())))
     name_only = open_png(cards.render_legend_season(_card(clan_name="KiNG oF ClAn"))).convert("RGB")
-    corner = (650, 30, 964, 130)
-    assert plain.crop(corner).tobytes() != with_clan.convert("RGB").crop(corner).tobytes()
-    assert name_only.crop(corner).tobytes() != with_clan.convert("RGB").crop(corner).tobytes()
-    badge = with_clan.convert("RGB").crop((964 - cards.CLAN_BADGE, 50, 964, 110))
+    eyebrow = (146, 36, 480, 66)  # right of the logo, over the player's name
+    assert plain.crop(eyebrow).tobytes() != with_clan.convert("RGB").crop(eyebrow).tobytes()
+    assert name_only.crop(eyebrow).tobytes() != with_clan.convert("RGB").crop(eyebrow).tobytes()
+    badge = with_clan.convert("RGB").crop((146, 36, 172, 64))
     colours = [c for _, c in badge.getcolors(maxcolors=100_000)]
     assert any(r > 100 and b > 150 and g < 90 for r, g, b in colours)  # the purple badge
     long = _card(
         player_name="戦Supercalifragilistic Expialidocious" * 2, clan_name="龍の騎士団 of the north" * 3
     )
-    assert open_png(cards.render_legend_season(long)).size == (1000, cards.SEASON_H)
+    assert open_png(cards.render_legend_season(long)).size == (1000, cards.season_height(long))
 
 
 def test_no_clan_leaves_the_card_unchanged():

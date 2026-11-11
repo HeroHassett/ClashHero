@@ -15,7 +15,7 @@ import io
 import logging
 import re
 import sqlite3
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -38,7 +38,13 @@ from clashhero.services.emojis import EMOJIS
 from clashhero.services.outbox import send_clan_log, send_dm, send_to_channel, update_live_message
 from clashhero.utils.checks import has_permission, manager
 from clashhero.utils.fmt import guild_color, signed, table
-from clashhero.utils.ranked import is_legend_one, is_tracked_ranked, league_name, weekly_attack_cap
+from clashhero.utils.ranked import (
+    daily_attack_cap,
+    is_legend_one,
+    is_tracked_ranked,
+    league_name,
+    weekly_attack_cap,
+)
 from clashhero.utils.resolve import (
     ResolveError,
     clan_autocomplete,
@@ -146,32 +152,57 @@ def season_card(
     summary: repo.SeasonSummary,
     now: datetime,
     trophies_now: int | None = None,
+    league: str | None = None,
+    day_ranks: Mapping[str, int] | None = None,
+    rank_now: int | None = None,
 ) -> cards.SeasonCard:
     """What the season card shows, from the season's recorded days. Every legend day of the
-    season window gets a point (untracked days have none); per-day averages are over the days
-    with battles of that kind; stars count only battles read from the battle log."""
+    season window gets a point (untracked days have none; today's is the trophies now); per-day
+    averages are over the days with battles of that kind; stars count only battles read from the
+    battle log. ``day_ranks``: end-of-day global ranks by legend day; ``rank_now``: the live
+    global rank (top 200 only), else the card shows the latest end-of-day one."""
     first = window.start.date()
     count = (window.end.date() - first).days
     by_day = {d.day: d for d in summary.days}
+    ranks_by_day = day_ranks or {}
+    today = None
+    if window.contains(now):
+        today = min(count - 1, max(0, (date.fromisoformat(legend_day_id(now)) - first).days))
     points = []
     for i in range(count):
         day = first + timedelta(days=i)
         sd = by_day.get(day.isoformat())
         end = None if sd is None else sd.end if sd.end is not None else sd.start
-        played = sd is not None and bool(sd.stats.attacks or sd.stats.defenses)
-        points.append(cards.SeasonPoint(day, end, sd.stats.net if played else None))
-    today = None
-    if window.contains(now):
-        today = min(count - 1, max(0, (date.fromisoformat(legend_day_id(now)) - first).days))
+        if i == today and trophies_now is not None:
+            end = trophies_now
+        stats = sd.stats if sd is not None else None
+        played = stats is not None and bool(stats.attacks or stats.defenses)
+        points.append(
+            cards.SeasonPoint(
+                day,
+                end,
+                stats.net if played else None,
+                offense=stats.offense if stats else 0,
+                defense=stats.defense if stats else 0,
+                attacks=len(stats.attacks) if stats else 0,
+                defenses=len(stats.defenses) if stats else 0,
+                rank=ranks_by_day.get(day.isoformat()),
+            )
+        )
     ends = [p.end for p in points if p.end is not None]
     trophies = ends[-1] if ends else None
     if today is not None and trophies_now is not None:
         trophies = trophies_now
-    first_tracked = next((d for d in summary.days if d.start is not None), None)
-    start = first_tracked.start if first_tracked else None
-    start_label = "this season"
-    if first_tracked and (since := date.fromisoformat(first_tracked.day)) > first:
-        start_label = f"since {since:%b} {since.day}"  # tracking began mid-season
+    rank, rank_day = (rank_now, None) if today is not None and rank_now is not None else (None, None)
+    if rank is None:
+        shown = points if today is None else points[: today + 1]
+        latest = next((p for p in reversed(shown) if p.rank is not None), None)
+        if latest is not None:
+            rank, rank_day = latest.rank, latest.day
+    cap = None
+    if league is None or is_legend_one(league):
+        today_stats = by_day.get(legend_day_id(now)) if today is not None else None
+        cap = today_stats.stats.cap if today_stats is not None else daily_attack_cap("Legend I")
 
     def avg(values: list[int]) -> float | None:
         return sum(values) / len(values) if values else None
@@ -184,11 +215,15 @@ def season_card(
         days=tuple(points),
         today=today,
         trophies=trophies,
-        start=start,
-        start_label=start_label,
+        league=league,
+        rank=rank,
+        rank_day=rank_day,
+        cap=cap,
         offense_per_day=avg([d.stats.offense for d in days if d.stats.attacks]),
         defense_per_day=avg([d.stats.defense for d in days if d.stats.defenses]),
         net_per_day=avg([d.stats.net for d in days if d.stats.attacks or d.stats.defenses]),
+        attack_days=sum(1 for d in days if d.stats.attacks),
+        defense_days=sum(1 for d in days if d.stats.defenses),
         attacks=len(summary.all_attacks),
         defenses=len(summary.all_defenses),
         attack_stars=cards.star_counts(h.stars for h in summary.attack_hits),
@@ -196,28 +231,11 @@ def season_card(
     )
 
 
-def season_details(
-    summary: repo.SeasonSummary, now: datetime, *, daily_cap: bool = True
-) -> cards.SeasonDetails:
-    """The detailed card's extra panels: the latest legend days, and hero, equipment and army
-    usage over the season's attacks that have an army code (battles read from the battle log).
-    ``daily_cap``: show battles against the day's cap (Legend I); other tiers have a weekly one."""
-    today = legend_day_id(now)
-    days = tuple(
-        cards.DetailDay(
-            day=date.fromisoformat(d.day),
-            offense=d.stats.offense,
-            defense=d.stats.defense,
-            attacks=len(d.stats.attacks),
-            defenses=len(d.stats.defenses),
-            cap=d.stats.cap if daily_cap else None,
-            today=d.day == today,
-        )
-        for d in summary.days
-    )
+def season_details(summary: repo.SeasonSummary) -> cards.SeasonDetails:
+    """The detailed card's extra panels: hero, equipment and army usage over the season's
+    attacks that have an army code (battles read from the battle log)."""
     armies = [a for h in summary.attack_hits if h.army_share_code and (a := parse_army(h.army_share_code))]
     return cards.SeasonDetails(
-        days=days[-cards.MAX_DETAIL_DAYS :],
         attacks=len(armies),
         heroes=tuple(hero_usage(armies)),
         army=common_army(armies),
@@ -251,25 +269,29 @@ async def _player_clan(bot, player) -> tuple[str | None, bytes | None]:
 async def _season_image(
     bot, tag: str, name: str, season_id: str, summary: repo.SeasonSummary, *, details: bool = False
 ) -> discord.File | None:
-    """The season card for /legends logs (with ``details``, the taller one with the day strip,
-    heroes and army), or None (logged) if it can't be drawn."""
+    """The season card for /legends logs (with ``details``, the taller one with heroes and the
+    most-used army), or None (logged) if it can't be drawn."""
     try:
         player = await bot.db.get_player_row(tag)
         now = _now()
+        window = season_by_id(season_id)
+        first, last = window.start.date(), window.end.date() - timedelta(days=1)
         card = season_card(
             name=name,
             tag=tag,
-            window=season_by_id(season_id),
+            window=window,
             summary=summary,
             now=now,
             trophies_now=player["trophies"] if player else None,
+            league=await repo.player_league(bot.db, tag),
+            day_ranks=await ranks.eod_ranks(bot.db, tag, first.isoformat(), last.isoformat()),
+            rank_now=await ranks.current_rank(bot.db, tag, now) if window.contains(now) else None,
         )
         clan_name, clan_badge = await _player_clan(bot, player)
         if clan_name:
             card = dataclasses.replace(card, clan_name=clan_name, clan_badge=clan_badge)
         if details:
-            league = await repo.player_league(bot.db, tag)
-            extra = season_details(summary, now, daily_cap=league is None or is_legend_one(league))
+            extra = season_details(summary)
             extra = dataclasses.replace(extra, icons=await unit_icons.fetch_icons(extra.icon_names()))
             card = dataclasses.replace(card, details=extra)
         png = await asyncio.to_thread(cards.render_legend_season, card)
@@ -1276,7 +1298,7 @@ class Legends(BaseCog):
     @app_commands.autocomplete(player=player_autocomplete, season=_season_autocomplete)
     @app_commands.describe(
         season="Pick a season, or type any date in it (YYYY-MM-DD); default: current",
-        details="Add the day-by-day strip, heroes and equipment, and the most-used army to the card",
+        details="Add heroes and equipment, and the most-used army, to the season card",
     )
     async def legends_logs(
         self,

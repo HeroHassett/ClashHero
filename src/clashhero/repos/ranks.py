@@ -71,6 +71,19 @@ async def eod_rank(db: Database, tag: str, legend_day: str) -> int | None:
     )
 
 
+async def eod_ranks(db: Database, tag: str, first_day: str, last_day: str) -> dict[str, int]:
+    """The player's end-of-day global rank for each legend day from ``first_day`` to ``last_day``
+    that has one (as :func:`eod_rank`: ClashHero's own full ranking first, else the top 200)."""
+    out: dict[str, int] = {}
+    for table in ("legend_day_ranks", "legend_day_full_ranks"):  # the full ranking wins
+        rows = await db.fetchall(
+            f"SELECT legend_day, rank FROM {table} WHERE player_tag = ? AND legend_day BETWEEN ? AND ?",
+            (tag, first_day, last_day),
+        )
+        out.update({r["legend_day"]: r["rank"] for r in rows})
+    return out
+
+
 # ------------------------------------------------------------------ country leaderboards
 
 # Country rankings are fetched every few hours; older than this counts as unknown.

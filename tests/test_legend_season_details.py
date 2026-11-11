@@ -2,7 +2,7 @@
 season card, and the view buttons keeping it."""
 
 import io
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 
 import discord
 import pytest
@@ -88,30 +88,18 @@ def day(d, attacks=(), defenses=(), codes=()):
     return SeasonDay(d, None, None, stats)
 
 
-def test_season_details_days_and_armies():
+def test_season_details_armies():
     summary = season(
         day("2026-11-05", [40, 32], [-40], codes=[MAIN, ""]),
         day("2026-11-06"),
         day(DAY, [40], [-16, -5], codes=[SWAPPED]),
     )
-    details = cog.season_details(summary, NOW)
-    assert [(d.day, d.offense, d.defense, d.attacks, d.defenses, d.cap, d.today) for d in details.days] == [
-        (date(2026, 11, 5), 72, -40, 2, 1, 8, False),
-        (date(2026, 11, 6), 0, 0, 0, 0, 8, False),
-        (date(2026, 11, 7), 40, -21, 1, 2, 8, True),
-    ]
+    details = cog.season_details(summary)
     assert details.attacks == 2  # only attacks with an army code
     assert details.heroes[0].uses == 2 and details.army.uses == 2
     assert {"Archer Queen", "Barbarian King"} <= details.icon_names()
-    assert [d.cap for d in cog.season_details(summary, NOW, daily_cap=False).days] == [None] * 3
-
-
-def test_season_details_keeps_the_latest_days():
-    days = [day(f"2026-11-{n:02d}", [40]) for n in range(2, 16)]
-    details = cog.season_details(season(*days), NOW)
-    assert len(details.days) == cards.MAX_DETAIL_DAYS
-    assert details.days[-1].day == date(2026, 11, 15)
-    assert (details.attacks, details.heroes, details.army) == (0, (), None)
+    empty = cog.season_details(season(day(DAY, [40])))
+    assert (empty.attacks, empty.heroes, empty.army) == (0, (), None)
 
 
 # ------------------------------------------------------------------ the card
@@ -123,27 +111,26 @@ def card(details=None):
     )
     base = cog.season_card(name="JoNico", tag=TAG, window=season_by_id(SEASON), summary=summary, now=NOW)
     if details is True:
-        details = cog.season_details(summary, NOW)
+        details = cog.season_details(summary)
     return base if details is None else cards.SeasonCard(**{**base.__dict__, "details": details})
 
 
 def test_the_detailed_card_is_taller():
     plain, detailed = card(), card(True)
-    assert cards.season_height(plain) == cards.SEASON_H
     height = cards.season_height(detailed)
-    assert height > cards.SEASON_H
+    assert height > cards.season_height(plain)
     im = open_png(cards.render_legend_season(detailed))
     assert im.size == (cards.WIDTH, height)
     # Same top: the details only add panels under the star breakdowns.
-    top = (0, 0, cards.WIDTH, cards.STARS_Y + cards.STARS_H)
+    top = (0, 0, cards.WIDTH, cards.stars_top(plain) + cards.STARS_H)
     plain_im = open_png(cards.render_legend_season(plain)).convert("RGB")
     assert plain_im.crop(top).tobytes() == im.convert("RGB").crop(top).tobytes()
 
 
-def test_details_without_armies_or_days():
+def test_details_without_armies():
     empty = card(cards.SeasonDetails())
     im = open_png(cards.render_legend_season(empty))
-    expected = cards.SEASON_H + 2 * cards.DETAILS_GAP + cards.DAYS_H + cards.HEROES_EMPTY_H
+    expected = cards.season_height(card()) + cards.DETAILS_GAP + cards.HEROES_EMPTY_H
     assert im.size == (cards.WIDTH, expected) == (cards.WIDTH, cards.season_height(empty))
 
 
@@ -204,7 +191,7 @@ def test_the_army_row_grows_with_its_rows():
 
 
 def test_unknown_units_and_long_names_still_draw():
-    details = cog.season_details(season(day(DAY, [40], codes=["h1p999e998_997u5x998s2x999"])), NOW)
+    details = cog.season_details(season(day(DAY, [40], codes=["h1p999e998_997u5x998s2x999"])))
     assert details.heroes[0].equipment[0].name is None
     open_png(cards.render_legend_season(card(details))).load()
 
@@ -264,7 +251,7 @@ async def test_render_legend_view_draws_the_details(db, monkeypatch):
     _, file = await cog.render_legend_view(_Bot(db), None, "day", TAG, DAY, details=True)
     assert isinstance(file, discord.File)
     details = seen["card"].details
-    assert details.attacks == 1 and details.days[-1].today and details.days[-1].cap == 8
+    assert details.attacks == 1 and seen["card"].cap == 8 and seen["card"].shown[-1].attacks == 1
     assert "Archer Queen" in asked["names"]
     await cog.render_legend_view(_Bot(db), None, "season", TAG, DAY)
     assert seen["card"].details is None

@@ -2131,44 +2131,29 @@ def star_counts(stars: Iterable[int | None]) -> StarCounts:
 
 @dataclass(frozen=True)
 class SeasonPoint:
-    """One legend day of the season: end-of-day trophies (None when the day wasn't tracked) and
-    the day's net trophies (None without battles)."""
+    """One legend day of the season: end-of-day trophies (today: trophies now; None when the day
+    wasn't tracked), the day's net (None without battles), trophies won and lost (``defense`` is
+    signed), battles fought, and the global rank at the end of the day (None when unknown)."""
 
     day: date
     end: int | None = None
     net: int | None = None
-
-
-MAX_DETAIL_DAYS = 10
-MAX_DETAIL_HEROES = 4
-
-
-@dataclass(frozen=True)
-class DetailDay:
-    """One legend day in the detailed card's day strip: trophies won and lost, battles fought
-    and the day's battle cap (None for tiers without one)."""
-
-    day: date
     offense: int = 0
     defense: int = 0
     attacks: int = 0
     defenses: int = 0
-    cap: int | None = 8
-    today: bool = False
+    rank: int | None = None
 
-    @property
-    def played(self) -> bool:
-        return bool(self.attacks or self.defenses)
+
+MAX_DETAIL_HEROES = 4
 
 
 @dataclass(frozen=True)
 class SeasonDetails:
-    """The extra panels of the detailed season card (/legends logs details). ``days``: the
-    latest legend days, chronological (the strip shows the last MAX_DETAIL_DAYS); ``attacks``:
-    attacks with a recorded army, which the hero and army shares are of; ``icons``: unit name
-    -> image bytes."""
+    """The extra panels of the detailed season card (/legends logs details). ``attacks``: attacks
+    with a recorded army, which the hero and army shares are of; ``icons``: unit name -> image
+    bytes."""
 
-    days: tuple[DetailDay, ...] = ()
     attacks: int = 0
     heroes: tuple[HeroUsage, ...] = ()
     army: ArmyUsage | None = None
@@ -2188,8 +2173,10 @@ class SeasonDetails:
 class SeasonCard:
     """What the season card shows. ``days``: every legend day of the season window, in order;
     ``today``: the index of today in ``days`` while the season runs, None once it's over;
-    ``trophies``: now (or final); ``start``: when the season started; the per-day averages are
-    over the days with battles of that kind."""
+    ``trophies``: now (or final); ``rank``: the global rank, live when ``rank_day`` is None, else
+    at the end of that day; ``cap``: battles a day (None for tiers without a daily cap). The
+    per-day averages are over the days with battles of that kind (``attack_days``,
+    ``defense_days``)."""
 
     player_name: str
     player_tag: str
@@ -2197,22 +2184,35 @@ class SeasonCard:
     days: tuple[SeasonPoint, ...]
     today: int | None = None
     trophies: int | None = None
-    start: int | None = None
-    start_label: str = "this season"  # "since Nov 5" when tracking began after the season started
+    league: str | None = None
+    rank: int | None = None
+    rank_day: date | None = None
+    cap: int | None = 8
     offense_per_day: float | None = None
     defense_per_day: float | None = None
     net_per_day: float | None = None
+    attack_days: int = 0
+    defense_days: int = 0
     attacks: int = 0
     defenses: int = 0
     attack_stars: StarCounts = StarCounts()
     defense_stars: StarCounts = StarCounts()
-    clan_name: str | None = None  # the player's clan, shown top right with its badge
+    clan_name: str | None = None  # the player's clan, over their name with its badge
     clan_badge: bytes | None = None
     details: SeasonDetails | None = None  # the extra panels under the star breakdowns
 
     @property
     def played_days(self) -> int:
         return sum(1 for p in self.days if p.net is not None)
+
+    @property
+    def shown(self) -> tuple[SeasonPoint, ...]:
+        """The days the chart and the day strip show: the season so far (all of it once over)."""
+        return self.days if self.today is None else self.days[: self.today + 1]
+
+    @property
+    def peak(self) -> int | None:
+        return max((p.end for p in self.shown if p.end is not None), default=None)
 
 
 # Star breakdown ramps, 0★ to 3★: one hue each, lighter = more stars (validated as ordinal ramps
@@ -2222,26 +2222,52 @@ DEFENSE_RAMP: tuple[RGB, ...] = ((127, 58, 66), (168, 58, 61), (214, 74, 60), (2
 GRID: RGB = (38, 38, 48)  # one step off the panel surface
 PANEL_SURFACE: RGB = (26, 26, 34)
 
-SEASON_ROW_Y = 160
-HERO_W = 336
-TILE_H = 110
-CHART_Y = SEASON_ROW_Y + TILE_H + 14
-CHART_H = 368
-STARS_Y = CHART_Y + CHART_H + 14
-STARS_H = 148
-SEASON_H = STARS_Y + STARS_H + BOTTOM_PAD
-PLOT_L = PAD + 76  # y-axis labels sit in the gutter left of this
+# The season card, top to bottom (1x): the header (the player; the season; trophies and global
+# rank) over a hairline, four stat tiles, the season so far as a trophy line with the day strip
+# under it, and the offense and defense breakdowns side by side. The detailed card adds heroes and
+# the most-used army under those.
+SEASON_CENTER_X = 500  # left edge of the header's middle block (the season)
+HEAD_RULE_Y = 150
+STATS_Y = 164
+STATS_H = 94
+STAT_GAP = 12
+TODAY_TILE_W = 270  # the last tile is wider: today's attacks and defenses sit beside its net
+TRAJ_Y = STATS_Y + STATS_H + 14
+TRAJ_HEAD = 92  # panel top to the plot
+PLOT_L = PAD + 70  # y-axis labels sit in the gutter left of this
 PLOT_R = WIDTH - PAD - 26
-PLOT_TOP = CHART_Y + 54
-PLOT_H = 186
-NET_TOP = PLOT_TOP + PLOT_H + 22
-NET_H = 64
-AXIS_Y = NET_TOP + NET_H + 18
+PLOT_TOP = TRAJ_Y + TRAJ_HEAD
+PLOT_H = 236
+STRIP_GAP = 26  # plot bottom to the day strip
+STRIP_ROW_H = 92
+STRIP_ROW_GAP = 10
+TRAJ_FOOT = 14
+MAX_STRIP_COLS = 14  # more days than this: the strip wraps and only key points are labelled
+WRAPPED_STRIP_COLS = 10  # days a row once the strip wraps
+LABEL_MIN_GAP = 64  # labelled points closer than this (dense chart) drop the less important label
+STARS_H = 252
+SECTION_GAP = 14
+
+
+def strip_rows(days: int) -> int:
+    """Rows of the day strip: one, aligned with the chart's points, up to MAX_STRIP_COLS days;
+    beyond that up to WRAPPED_STRIP_COLS days a row."""
+    return 1 if days <= MAX_STRIP_COLS else math.ceil(days / WRAPPED_STRIP_COLS)
+
+
+def trajectory_height(card: SeasonCard) -> int:
+    rows = strip_rows(len(card.shown))
+    return TRAJ_HEAD + PLOT_H + STRIP_GAP + rows * STRIP_ROW_H + (rows - 1) * STRIP_ROW_GAP + TRAJ_FOOT
+
+
+def stars_top(card: SeasonCard) -> int:
+    return TRAJ_Y + trajectory_height(card) + SECTION_GAP
 
 
 def render_legend_season(card: SeasonCard) -> bytes:
-    """PNG of a player's legend season: trophies (hero figure) and per-day averages, the trophy
-    line over the whole season window with daily net bars under it, and star breakdowns."""
+    """PNG of a player's legend season: the player, the season and their trophies and global
+    rank; average offense, defense and net a day and today so far; the trophy line over the
+    season so far with each day's results under it; and the star breakdowns."""
     with _RENDER_LOCK:
         image = _render_season(card)
     buf = io.BytesIO()
@@ -2255,23 +2281,41 @@ def _render_season(card: SeasonCard) -> Image.Image:
     draw = ImageDraw.Draw(canvas, "RGBA")
     _backdrop(canvas)
     _season_header(canvas, draw, card)
-    _season_figures(canvas, draw, card)
-    _season_chart(canvas, draw, card)
+    _season_stats(canvas, draw, card)
+    _season_trajectory(canvas, draw, card)
+    top = stars_top(card)
     half = (WIDTH - 2 * PAD - 12) / 2
-    _stars_panel(canvas, draw, PAD, PAD + half, "OFFENSE", "triples", card.attack_stars, OFFENSE_RAMP)
     _stars_panel(
         canvas,
         draw,
-        WIDTH - PAD - half,
-        WIDTH - PAD,
+        (PAD, PAD + half, top),
+        "OFFENSE",
+        _count(card.attacks, "attack"),
+        "triples",
+        card.attack_stars,
+        OFFENSE_RAMP,
+    )
+    _stars_panel(
+        canvas,
+        draw,
+        (WIDTH - PAD - half, WIDTH - PAD, top),
         "DEFENSE",
+        _count(card.defenses, "defense"),
         "triples against",
         card.defense_stars,
         DEFENSE_RAMP,
     )
     if card.details is not None:
-        _season_details(canvas, draw, card.details)
+        _season_details(canvas, draw, card.details, top + STARS_H + DETAILS_GAP)
     return canvas.resize((WIDTH, height), Image.Resampling.LANCZOS)
+
+
+def _count(n: int, noun: str) -> str:
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+def _sign_color(n: float) -> RGB:
+    return GAIN_TEXT if n > 0 else LOSS_TEXT if n < 0 else TEXT
 
 
 def _gradient_runs(canvas: Image.Image, x: int, baseline: int, runs: Sequence[Run]) -> None:
@@ -2294,136 +2338,188 @@ def _gradient_runs(canvas: Image.Image, x: int, baseline: int, runs: Sequence[Ru
     canvas.paste(gradient, (round(x + left), round(baseline + top)), mask)
 
 
-CLAN_BADGE = 84
-CLAN_NAME_W = 300
-
-
-def _season_clan(canvas: Image.Image, draw: ImageDraw.ImageDraw, card: SeasonCard) -> int:
-    """The player's clan, right-aligned in the header and mirroring the left side: its badge, and
-    to its left a gold "CLAN" eyebrow over the name in the title's Cinzel gradient (shrunk, then
-    cut, to fit; CJK falls back like the player name). Without a badge, the text alone. Returns
-    the block's left edge (drawing scale)."""
-    right = _px(WIDTH - PAD)
-    badge = _contained_image(card.clan_badge, _px(CLAN_BADGE))
-    if badge is not None:
-        bx = right - badge.width
-        canvas.paste(badge, (bx, _px(HEADER_TOP + LOGO_SIZE / 2) - badge.height // 2), badge)
-        right = bx - _px(16)
-    name = (card.clan_name or "").strip()
-    if not name:
-        return right
-    runs: list[Run] = []
-    for size in range(30, 19, -1):
-        runs = _runs(name, (_cinzel(size), *_fallback_fonts(size)))
-        if _runs_width(runs) <= _px(CLAN_NAME_W):
-            break
-    else:
-        runs = fit_runs(name, (_cinzel(20), *_fallback_fonts(20)), _px(CLAN_NAME_W))
-    if not runs:
-        return right
-    width = _runs_width(runs)
-    _tracked(draw, right, _px(HEADER_TOP + 18), "CLAN", _inter(13, 600), GOLD, _px(1.9), "right")
-    _gradient_runs(canvas, round(right - width), _px(HEADER_TOP + 58), runs)
-    return round(right - max(width, _inter(13, 600).getlength("CLAN") + _px(1.9) * 3))
+# ------------------------------------------------------------------ header
 
 
 def _season_header(canvas: Image.Image, draw: ImageDraw.ImageDraw, card: SeasonCard) -> None:
+    """Left, the player: their clan over their name, then tag and league. Middle, the season.
+    Right, trophies (now, or final) and the global rank."""
     _draw_logo(canvas, draw)
-    x = _px(PAD + LOGO_SIZE + 24)
-    max_w = _px(WIDTH - PAD) - x
-    if card.clan_name:
-        max_w = min(max_w, _season_clan(canvas, draw, card) - _px(28) - x)
-    total = len(card.days)
-    if card.today is not None:
-        eyebrow = f"LEGEND SEASON · DAY {card.today + 1} / {total}"
-    else:
-        eyebrow = f"LEGEND SEASON · FINAL · {total} DAYS"
-    _tracked(draw, x, _px(HEADER_TOP + 18), eyebrow, _inter(13, 600), GOLD, _px(1.9), "left")
+    right = _season_trophies(canvas, draw, card)
+    middle = _px(SEASON_CENTER_X)
+    _season_block(draw, card, middle, right - _px(24))
 
+    x = _px(PAD + LOGO_SIZE + 22)
+    max_w = middle - _px(24) - x
+    _season_clan(canvas, draw, card, x, max_w)
     name = card.player_name.strip() or card.player_tag
     runs: list[Run] = []
-    for size in range(34, 23, -1):
+    for size in range(34, 21, -1):
         runs = _runs(name, (_cinzel(size), *_fallback_fonts(size)))
         if _runs_width(runs) <= max_w:
             break
     else:
-        runs = fit_runs(name, (_cinzel(24), *_fallback_fonts(24)), max_w)
+        runs = fit_runs(name, (_cinzel(22), *_fallback_fonts(22)), max_w)
     if not runs:
-        runs = _runs(card.player_tag, (_cinzel(34),))
+        runs = _runs(card.player_tag, (_cinzel(30),))
     _gradient_runs(canvas, x, _px(HEADER_TOP + 58), runs)
 
-    font = _inter(18, 500)
-    base = _px(HEADER_TOP + 88)
+    font = _inter(16, 500)
+    base = _px(HEADER_TOP + 86)
     draw.text((x, base), card.player_tag, font=font, fill=MUTED, anchor="ls")
-    sx = x + font.getlength(card.player_tag) + _px(10)
-    draw.text((sx, base), "·", font=font, fill=DIM, anchor="ls")
-    sx += font.getlength("·") + _px(10)
-    draw.text((sx, base), card.season, font=_inter(18, 600), fill=TEXT, anchor="ls")
+    if card.league:
+        sx = x + font.getlength(card.player_tag) + _px(10)
+        draw.text((sx, base), "|", font=font, fill=DIM, anchor="ls")
+        sx += font.getlength("|") + _px(10)
+        league = fit_runs(card.league, _text_fonts(16, 600), x + max_w - sx)
+        _draw_runs(draw, sx, base, league, TEXT)
+    rule = _px(HEAD_RULE_Y)
+    draw.line((_px(PAD), rule, _px(WIDTH - PAD), rule), fill=BORDER, width=_px(1))
+
+
+def _season_clan(
+    canvas: Image.Image, draw: ImageDraw.ImageDraw, card: SeasonCard, x: int, max_w: int
+) -> None:
+    """Over the player's name: their clan's badge and name in gold (just "LEGEND LOGS" without a
+    clan)."""
+    base = _px(HEADER_TOP + 18)
+    name = (card.clan_name or "").strip()
+    if not name:
+        _tracked(draw, x, base, "LEGEND LOGS", _inter(13, 600), GOLD, _px(1.9), "left")
+        return
+    badge = _contained_image(card.clan_badge, _px(24))
+    if badge is not None:
+        canvas.paste(badge, (x, base - _px(5) - badge.height // 2), badge)
+        x += badge.width + _px(8)
+        max_w -= badge.width + _px(8)
+    _draw_runs(draw, x, base, fit_runs(name, _text_fonts(15, 700), max_w), GOLD)
+
+
+def _season_block(draw: ImageDraw.ImageDraw, card: SeasonCard, x: int, right: int) -> None:
+    """The header's middle: which season, and how far into it (or that it's over)."""
+    _tracked(draw, x, _px(HEADER_TOP + 18), "SEASON REPORT", _inter(12, 700), DIM, _px(1.6), "left")
+    _draw_runs(draw, x, _px(HEADER_TOP + 54), fit_runs(card.season, _text_fonts(22, 700), right - x), TEXT)
+    font = _inter(14, 500)
+    base = _px(HEADER_TOP + 84)
+    total = len(card.days)
+    if card.today is not None:
+        r, cy = _px(4), base - _px(5)
+        draw.ellipse((x, cy - r, x + 2 * r, cy + r), fill=GAIN_TEXT)
+        x += 2 * r + _px(8)
+        parts = [("Active season", TEXT), ("  ·  ", DIM), (f"Day {card.today + 1} of {total}", MUTED)]
+    else:
+        parts = [("Final", TEXT), ("  ·  ", DIM), (f"{total} days", MUTED)]
+    for text, fill in parts:
+        draw.text((x, base), text, font=font, fill=fill, anchor="ls")
+        x += font.getlength(text)
+
+
+def _season_trophies(canvas: Image.Image, draw: ImageDraw.ImageDraw, card: SeasonCard) -> int:
+    """Top right: trophies now (or final) in the gold gradient with a cup, and the global rank
+    under them. Returns the block's left edge (drawing scale)."""
+    right = _px(WIDTH - PAD)
+    label = "CURRENT TROPHIES" if card.today is not None else "FINAL TROPHIES"
+    label_font = _inter(12, 700)
+    _tracked(draw, right, _px(HEADER_TOP + 18), label, label_font, DIM, _px(1.6), "right")
+    left = right - sum(label_font.getlength(c) for c in label) - _px(1.6) * (len(label) - 1)
+
+    value = f"{card.trophies:,}" if card.trophies is not None else "—"
+    big = _inter(46, 700)
+    base = _px(HEADER_TOP + 62)
+    vx = right - big.getlength(value)
+    _gradient_runs(canvas, round(vx), base, [(value, big)])
+    cup = _px(34)
+    cx = vx - _px(10) - 0.54 * cup
+    _trophy(draw, cx, base - _px(13), cup, GOLD)
+    left = min(left, cx - 0.54 * cup)
+
+    if card.rank is not None:
+        font, bold = _inter(14, 500), _inter(14, 700)
+        parts = [(f"#{card.rank:,}", bold, TEXT), (" global", font, MUTED)]
+        if card.rank_day is not None:  # not live: the latest end-of-day rank
+            parts.append((f" · end of {card.rank_day:%b} {card.rank_day.day}", font, DIM))
+        width = sum(f.getlength(t) for t, f, _ in parts)
+        sx = right - width
+        for text, f, fill in parts:
+            draw.text((sx, _px(HEADER_TOP + 88)), text, font=f, fill=fill, anchor="ls")
+            sx += f.getlength(text)
+        left = min(left, right - width)
+    return round(left)
+
+
+# ------------------------------------------------------------------ stat tiles
 
 
 def _fmt_avg(value: float | None) -> str:
     if value is None:
         return "—"
-    n = round(value)
-    return f"+{n}" if n > 0 else f"−{-n}" if n < 0 else "0"
+    return _signed(round(value))
 
 
-def _season_figures(canvas: Image.Image, draw: ImageDraw.ImageDraw, card: SeasonCard) -> None:
-    """The hero trophies panel (brand-gradient edge) and three compact tiles."""
-    y0, y1 = SEASON_ROW_Y, SEASON_ROW_Y + TILE_H
-    x0, x1 = PAD, PAD + HERO_W
-    w, h = _px(x1 - x0), _px(y1 - y0)
-    _panel(
-        canvas,
-        (_px(x0), _px(y0), _px(x1), _px(y1)),
-        _px(RADIUS),
-        _highlight_fill(w, h),
-        _highlight_border(w, h),
-        _px(2),
-    )
-    label = "Trophies now" if card.today is not None else "Final trophies"
-    draw.text((_px(x0 + 22), _px(y0 + 32)), label, font=_inter(14, 600), fill=MUTED, anchor="ls")
-    hero = _inter(48, 700)
-    cy = _px(y0 + 70)
-    _trophy(draw, _px(x0 + 38), cy + _px(2), _px(34), GOLD)
-    value = f"{card.trophies:,}" if card.trophies is not None else "—"
-    draw.text((_px(x0 + 64), _baseline(hero, cy)), value, font=hero, fill=TEXT, anchor="ls")
-    if card.trophies is not None and card.start is not None:
-        change = card.trophies - card.start
-        delta = _inter(20, 700)
-        right = _px(x1 - 22)
-        text = f"+{change:,}" if change > 0 else f"\u2212{-change:,}" if change < 0 else "0"
-        draw.text((right, _baseline(delta, _px(y0 + 54))), text, font=delta, fill=TEXT, anchor="rs")
-        _movement(
-            draw,
-            right - delta.getlength(text) - _px(14),
-            _px(y0 + 54),
-            "up" if change > 0 else "down" if change < 0 else "same",
-        )
-        sub = _inter(13, 500)
-        draw.text((right, _px(y0 + 80)), card.start_label, font=sub, fill=MUTED, anchor="rs")
-        draw.text((right, _px(y0 + 98)), f"from {card.start:,}", font=sub, fill=DIM, anchor="rs")
-
-    tiles = (
-        ("Offense per day", card.offense_per_day, f"{card.attacks} attacks"),
-        ("Defense per day", card.defense_per_day, f"{card.defenses} defenses"),
-        ("Net per day", card.net_per_day, f"{card.played_days} of {len(card.days)} days played"),
-    )
-    left = x1 + 12
-    tile_w = (WIDTH - PAD - left - 2 * 12) / 3
-    for i, (label, value, sub) in enumerate(tiles):
-        tx0 = left + i * (tile_w + 12)
-        box = (_px(tx0), _px(y0), _px(tx0 + tile_w), _px(y1))
+def _season_stats(canvas: Image.Image, draw: ImageDraw.ImageDraw, card: SeasonCard) -> None:
+    """Average offense, defense and net a day (each over the days with battles of that kind),
+    and today so far (the last day, once the season is over)."""
+    y0, y1 = STATS_Y, STATS_Y + STATS_H
+    w = (WIDTH - 2 * PAD - 3 * STAT_GAP - TODAY_TILE_W) / 3
+    for i in range(4):
+        x0 = PAD + i * (w + STAT_GAP)
+        x1 = x0 + (w if i < 3 else TODAY_TILE_W)
+        box = (_px(x0), _px(y0), _px(x1), _px(y1))
         _panel(canvas, box, _px(RADIUS), _row_fill(box[2] - box[0], box[3] - box[1]), BORDER, _px(1))
-        draw.text((_px(tx0 + 18), _px(y0 + 32)), label, font=_inter(14, 600), fill=MUTED, anchor="ls")
-        font = _inter(30, 700)
-        vy = _px(y0 + 66)
-        vx = _px(tx0 + 18)
-        if value is not None and round(value) != 0:
-            _movement(draw, vx + _px(7), vy, "up" if value > 0 else "down")
-            vx += _px(22)
-        draw.text((vx, _baseline(font, vy)), _fmt_avg(value), font=font, fill=TEXT, anchor="ls")
-        draw.text((_px(tx0 + 18), _px(y0 + 96)), sub, font=_inter(13, 500), fill=DIM, anchor="ls")
+    tiles = (
+        ("AVG. DAILY OFFENSE", card.offense_per_day, card.attack_days),
+        ("AVG. DAILY DEFENSE", card.defense_per_day, card.defense_days),
+        ("AVG. DAILY NET", card.net_per_day, card.played_days),
+    )
+    big = _inter(32, 700)
+    for i, (label, value, days) in enumerate(tiles):
+        x = _px(PAD + i * (w + STAT_GAP) + 18)
+        _tracked(draw, x, _px(y0 + 30), label, _inter(11, 700), DIM, _px(1.3), "left")
+        text = _fmt_avg(value)
+        fill = DIM if value is None else _sign_color(round(value))
+        draw.text((x, _px(y0 + 74)), text, font=big, fill=fill, anchor="ls")
+        sub = _count(days, "active day")
+        draw.text(
+            (x + big.getlength(text) + _px(9), _px(y0 + 74)),
+            sub,
+            font=_inter(12, 500),
+            fill=DIM,
+            anchor="ls",
+        )
+    _today_tile(draw, card, PAD + 3 * (w + STAT_GAP))
+
+
+def _today_tile(draw: ImageDraw.ImageDraw, card: SeasonCard, x0: float) -> None:
+    point = card.shown[-1] if card.shown else None
+    x = _px(x0 + 18)
+    if card.today is not None:
+        r, cy = _px(3.5), _px(STATS_Y + 26)
+        draw.ellipse((x, cy - r, x + 2 * r, cy + r), fill=GAIN_TEXT)
+        label, lx = "TODAY SO FAR", x + 2 * r + _px(8)
+    else:
+        label, lx = "LAST DAY", x
+    _tracked(draw, lx, _px(STATS_Y + 30), label, _inter(11, 700), DIM, _px(1.3), "left")
+    offense, defense = (point.offense, point.defense) if point else (0, 0)
+    big = _inter(34, 700)
+    net = _signed(offense + defense)
+    draw.text((x, _px(STATS_Y + 74)), net, font=big, fill=_sign_color(offense + defense), anchor="ls")
+
+    right = _px(x0 + TODAY_TILE_W - 18)
+    lx = x + big.getlength(net) + _px(18)
+    bold, font = _inter(13, 700), _inter(13, 500)
+    lines = (
+        (point.attacks if point else 0, "attacks", offense, _signed(offense) if offense else "+0"),
+        (point.defenses if point else 0, "defenses", defense, _signed(defense) if defense else "−0"),
+    )
+    for k, (n, noun, trophies, text) in enumerate(lines):
+        base = _px(STATS_Y + 56 + k * 22)
+        count = f"{n}/{card.cap}" if card.cap is not None else str(n)
+        draw.text((lx, base), count, font=bold, fill=TEXT, anchor="ls")
+        draw.text((lx + bold.getlength(count) + _px(5), base), noun, font=font, fill=MUTED, anchor="ls")
+        draw.text((right, base), text, font=bold, fill=_sign_color(trophies), anchor="rs")
+
+
+# ------------------------------------------------------------------ the season so far
 
 
 def _nice_ticks(lo: float, hi: float, target: int = 4) -> list[int]:
@@ -2442,115 +2538,167 @@ def _nice_ticks(lo: float, hi: float, target: int = 4) -> list[int]:
     return list(range(int(start), int(end) + 1, step))
 
 
-def _season_chart(canvas: Image.Image, draw: ImageDraw.ImageDraw, card: SeasonCard) -> None:
-    """End-of-day trophies across the whole season window (gaps where a day wasn't tracked),
-    with each day's net as a bar on its own baseline underneath."""
-    box = (_px(PAD), _px(CHART_Y), _px(WIDTH - PAD), _px(CHART_Y + CHART_H))
-    _panel(canvas, box, _px(RADIUS), _row_fill(box[2] - box[0], box[3] - box[1]), BORDER, _px(1))
-    _tracked(draw, _px(PAD + 22), _px(CHART_Y + 30), "TROPHIES", _inter(12, 700), DIM, _px(1.6), "left")
+def _smooth(points: Sequence[tuple[float, float]], steps: int = 12) -> list[tuple[float, float]]:
+    """A curve through ``points`` (x increasing) that never overshoots between them (monotone
+    cubic interpolation), sampled ``steps`` times a segment."""
+    if len(points) < 3:
+        return list(points)
+    xs, ys = [p[0] for p in points], [p[1] for p in points]
+    k = len(points)
+    d = [(ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i]) for i in range(k - 1)]
+    m = [d[0], *(0.0 if d[i - 1] * d[i] <= 0 else (d[i - 1] + d[i]) / 2 for i in range(1, k - 1)), d[-1]]
+    for i in range(k - 1):
+        if d[i] == 0:
+            m[i] = m[i + 1] = 0.0
+            continue
+        a, b = m[i] / d[i], m[i + 1] / d[i]
+        if a * a + b * b > 9:
+            t = 3 / math.sqrt(a * a + b * b)
+            m[i], m[i + 1] = t * a * d[i], t * b * d[i]
+    out = []
+    for i in range(k - 1):
+        h = xs[i + 1] - xs[i]
+        for j in range(steps):
+            t = j / steps
+            t2, t3 = t * t, t * t * t
+            y = (
+                (2 * t3 - 3 * t2 + 1) * ys[i]
+                + (t3 - 2 * t2 + t) * h * m[i]
+                + (-2 * t3 + 3 * t2) * ys[i + 1]
+                + (t3 - t2) * h * m[i + 1]
+            )
+            out.append((xs[i] + t * h, y))
+    out.append(points[-1])
+    return out
 
-    n = max(1, len(card.days))
-    slot = (PLOT_R - PLOT_L) / n
+
+def _season_trajectory(canvas: Image.Image, draw: ImageDraw.ImageDraw, card: SeasonCard) -> None:
+    """Trophies at the end of each day of the season so far (today: now), a smooth line broken
+    where a day wasn't tracked, each point labelled with its trophies and global rank (on a long
+    season, only the key points), and the day strip under it."""
+    top = TRAJ_Y
+    _card_panel(canvas, top, trajectory_height(card))
+    _panel_title(draw, top, "SEASON TRAJECTORY")
+    sub = "Trophies at the end of each day · global rank"
+    draw.text((_px(PAD + 22), _px(top + 54)), sub, font=_inter(13, 500), fill=DIM, anchor="ls")
+    if (peak := card.peak) is not None:
+        right = _px(WIDTH - PAD - 22)
+        value = f"{peak:,}"
+        big = _inter(20, 700)
+        draw.text((right, _px(top + 31)), value, font=big, fill=GOLD_LIGHT, anchor="rs")
+        label_x = right - big.getlength(value) - _px(8)
+        draw.text((label_x, _px(top + 30)), "season peak", font=_inter(13, 500), fill=MUTED, anchor="rs")
+
+    shown = card.shown
+    n = max(1, len(shown))
+    col = (PLOT_R - PLOT_L) / n
 
     def x_at(i: int) -> float:
-        return PLOT_L + (i + 0.5) * slot
+        return PLOT_L + (i + 0.5) * col
 
-    values = [p.end for p in card.days if p.end is not None]
-    tick_font = _inter(12, 500)
+    bottom = PLOT_TOP + PLOT_H
+    values = [p.end for p in shown if p.end is not None]
     if values:
-        span = max(values) - min(values)
-        ticks = _nice_ticks(min(values) - span * 0.04, max(values) + span * 0.1)
+        pad = (max(values) - min(values)) * 0.35 + 10  # room for the labels above and below
+        ticks = _nice_ticks(min(values) - pad, max(values) + pad)
         lo, hi = ticks[0], ticks[-1]
     else:
         ticks, lo, hi = [], 0, 1
 
     def y_at(v: float) -> float:
-        return PLOT_TOP + PLOT_H - (v - lo) / (hi - lo) * PLOT_H
+        return bottom - (v - lo) / (hi - lo) * PLOT_H
 
+    tick_font = _inter(12, 500)
     for t in ticks:
         y = _px(y_at(t))
         draw.line((_px(PLOT_L), y, _px(PLOT_R), y), fill=GRID, width=_px(1))
         draw.text(
             (_px(PLOT_L - 12), _baseline(tick_font, y)), f"{t:,}", font=tick_font, fill=DIM, anchor="rs"
         )
+    guide_end = bottom + (STRIP_GAP - 6 if strip_rows(len(shown)) == 1 else 0)
+    for i in range(len(shown)):  # a faint dotted guide down each day (to its strip cell when aligned)
+        x = _px(x_at(i))
+        for y in range(PLOT_TOP, round(guide_end), 7):
+            draw.line((x, _px(y), x, _px(y + 3)), fill=(*GRID, 255), width=_px(1))
 
-    if card.today is not None:  # today, and the rest of the season still to play
-        tx = _px(x_at(card.today))
-        draw.line((tx, _px(PLOT_TOP - 8), tx, _px(NET_TOP + NET_H)), fill=(*GOLD, 70), width=_px(1))
-        _tracked(draw, tx, _px(PLOT_TOP - 14), "TODAY", _inter(10, 700), GOLD, _px(1.2), "center")
-
-    # Contiguous runs of tracked days: an area wash and a 2px line each.
     runs: list[list[tuple[float, float]]] = [[]]
-    for i, p in enumerate(card.days):
+    for i, p in enumerate(shown):
         if p.end is None:
             if runs[-1]:
                 runs.append([])
             continue
-        runs[-1].append((_px(x_at(i)), _px(y_at(p.end))))
-    runs = [r for r in runs if r]
-    if runs:
-        _season_area(canvas, runs)
-        for r in runs:
-            if len(r) > 1:
-                draw.line(r, fill=GOLD, width=_px(2), joint="curve")
+        runs[-1].append((x_at(i), y_at(p.end)))
+    curves = [[(_px(x), _px(y)) for x, y in _smooth(r)] for r in runs if r]
+    if curves:
+        _season_area(canvas, curves)
+        for c in curves:
+            if len(c) > 1:
+                draw.line(c, fill=GOLD, width=_px(2), joint="curve")
 
-    tracked = [(i, p.end) for i, p in enumerate(card.days) if p.end is not None]
+    tracked = [(i, p) for i, p in enumerate(shown) if p.end is not None]
     last = tracked[-1][0] if tracked else None
-    for i, v in tracked:
-        cx, cy = _px(x_at(i)), _px(y_at(v))
+    for i, p in tracked:
+        cx, cy = _px(x_at(i)), _px(y_at(p.end))
         big = i == last
-        r = _px(6 if big else 4)
-        ring = _px(2)
+        r, ring = _px(5 if big else 4), _px(2)
         if big:
-            draw.ellipse(
-                (cx - r - _px(6), cy - r - _px(6), cx + r + _px(6), cy + r + _px(6)), fill=(*GOLD, 40)
-            )
+            halo = r + _px(6)
+            draw.ellipse((cx - halo, cy - halo, cx + halo, cy + halo), fill=(*GOLD, 40))
         draw.ellipse((cx - r - ring, cy - r - ring, cx + r + ring, cy + r + ring), fill=PANEL_SURFACE)
         draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=GOLD_LIGHT if big else GOLD)
-
-    # Direct labels: the latest value and, when it isn't the latest, the peak.
-    label_font = _inter(14, 700)
-    if tracked:
-        li, lv = tracked[-1]
-        if li == card.today and li < len(card.days) - 3:  # beside the point, clear of the TODAY rule
-            lx, ly = _px(x_at(li) + 14), _baseline(label_font, _px(y_at(lv)))
-            draw.text((lx, ly), f"{lv:,}", font=label_font, fill=TEXT, anchor="ls")
-        else:
-            _value_label(draw, x_at(li), y_at(lv), f"{lv:,}", label_font, TEXT)
-        pi, pv = max(tracked, key=lambda t: (t[1], -t[0]))
-        if pi != li and pv > lv:
-            _value_label(draw, x_at(pi), y_at(pv), f"Peak {pv:,}", _inter(12, 600), MUTED)
-    else:
-        msg = "No legend days recorded yet"
+    for i, p in _labelled(tracked, x_at):
+        _trophy_label(draw, x_at(i), y_at(p.end), p.end)
+        if p.rank is not None:
+            _rank_label(draw, x_at(i), y_at(p.end), p.rank)
+    if not tracked:
         f = _inter(16, 500)
+        mid = _baseline(f, _px(PLOT_TOP + PLOT_H / 2))
         draw.text(
-            (_px((PLOT_L + PLOT_R) / 2), _baseline(f, _px(PLOT_TOP + PLOT_H / 2))),
-            msg,
-            font=f,
-            fill=MUTED,
-            anchor="ms",
+            (_px((PLOT_L + PLOT_R) / 2), mid), "No legend days recorded yet", font=f, fill=MUTED, anchor="ms"
         )
-
-    _season_net_bars(draw, card, x_at, slot)
-
-    # x axis: weekly date ticks (the first legend day of each week, and the last day).
-    axis_font = _inter(12, 500)
-    marks = sorted({*range(0, n, 7), n - 1})
-    for i in marks:
-        if i >= len(card.days):
-            continue
-        d = card.days[i].day
-        color = GOLD if card.today == i else DIM
-        draw.text(
-            (_px(x_at(i)), _px(AXIS_Y + 10)), f"{d:%b} {d.day}", font=axis_font, fill=color, anchor="ms"
-        )
+    _day_strip(draw, card, x_at, col)
 
 
-def _value_label(draw, x: float, y: float, text: str, font, fill) -> None:
-    """A direct label just above a point, kept inside the plot horizontally."""
-    w = font.getlength(text) / SCALE
+def _labelled(tracked: Sequence[tuple[int, SeasonPoint]], x_at) -> list[tuple[int, SeasonPoint]]:
+    """The points that get labels: all of them while the strip lines up with the chart; on a long
+    season the latest, the peak, the low and the first, skipping any too close to one kept."""
+    if not tracked:
+        return []
+    if len(tracked) <= MAX_STRIP_COLS and x_at(1) - x_at(0) >= LABEL_MIN_GAP:
+        return list(tracked)
+    by_value = sorted(tracked, key=lambda t: (t[1].end, t[0]))
+    candidates = [tracked[-1], by_value[-1], by_value[0], tracked[0]]
+    kept: list[tuple[int, SeasonPoint]] = []
+    for i, p in candidates:
+        if all(abs(x_at(i) - x_at(j)) >= LABEL_MIN_GAP for j, _ in kept):
+            kept.append((i, p))
+    return kept
+
+
+def _trophy_label(draw: ImageDraw.ImageDraw, x: float, y: float, value: int) -> None:
+    """A dark pill above a point: its trophies in gold and a small cup."""
+    font = _inter(12, 700)
+    text = f"{value:,}"
+    w = font.getlength(text) / SCALE + 8 + 4 + 10 + 7
     cx = min(max(x, PLOT_L + w / 2), PLOT_R - w / 2)
-    draw.text((_px(cx), _px(y - 14)), text, font=font, fill=fill, anchor="ms")
+    cy = y - 21
+    box = (_px(cx - w / 2), _px(cy - 10), _px(cx + w / 2), _px(cy + 10))
+    draw.rounded_rectangle(box, radius=_px(10), fill=(*SURFACE, 240), outline=(*GOLD, 110), width=_px(1))
+    tx = _px(cx - w / 2 + 8)
+    draw.text((tx, _baseline(font, _px(cy))), text, font=font, fill=GOLD_LIGHT, anchor="ls")
+    _trophy(draw, tx + font.getlength(text) + _px(4 + 5), _px(cy + 1), _px(11), GOLD)
+
+
+def _rank_label(draw: ImageDraw.ImageDraw, x: float, y: float, rank: int) -> None:
+    """A small chip under a point with the global rank at the end of that day."""
+    font = _inter(11, 600)
+    text = f"#{rank:,}"
+    w = font.getlength(text) / SCALE + 14
+    cx = min(max(x, PLOT_L + w / 2), PLOT_R - w / 2)
+    cy = y + 21
+    box = (_px(cx - w / 2), _px(cy - 9), _px(cx + w / 2), _px(cy + 9))
+    draw.rounded_rectangle(box, radius=_px(5), fill=(*SURFACE, 235), outline=(*BORDER, 255), width=_px(1))
+    draw.text((_px(cx), _baseline(font, _px(cy))), text, font=font, fill=MUTED, anchor="ms")
 
 
 def _season_area(canvas: Image.Image, runs: list[list[tuple[float, float]]]) -> None:
@@ -2560,167 +2708,133 @@ def _season_area(canvas: Image.Image, runs: list[list[tuple[float, float]]]) -> 
     ox, oy = _px(PLOT_L), _px(PLOT_TOP)
     mask = Image.new("L", (w, h), 0)
     md = ImageDraw.Draw(mask)
-    bottom = h
     for r in runs:
         if len(r) < 2:
             continue
         points = [(x - ox, y - oy) for x, y in r]
-        md.polygon([*points, (points[-1][0], bottom), (points[0][0], bottom)], fill=255)
+        md.polygon([*points, (points[-1][0], h), (points[0][0], h)], fill=255)
     fade = Image.new("L", (1, 64))
-    fade.putdata([round(70 - 62 * i / 63) for i in range(64)])  # strongest near the line
+    fade.putdata([round(56 - 52 * i / 63) for i in range(64)])  # strongest near the top
     alpha = ImageChops.multiply(mask, fade.resize((w, h), Image.Resampling.BILINEAR))
     canvas.paste(_gradient((w, h), BRAND_GRADIENT), (ox, oy), alpha)
 
 
-def _season_net_bars(draw: ImageDraw.ImageDraw, card: SeasonCard, x_at, slot: float) -> None:
-    """Each day's net trophies as a bar from a zero baseline: up and green for a gain, down and
-    red for a loss (direction carries the sign as well as colour). Best and worst days labelled."""
-    nets = [(i, p.net) for i, p in enumerate(card.days) if p.net is not None]
-    pad = 13  # room for the labels above and below the bars
-    up = max([v for _, v in nets if v > 0], default=0)
-    down = -min([v for _, v in nets if v < 0], default=0)
-    room = NET_H - 2 * pad
-    base = NET_TOP + pad + (room * up / (up + down) if up + down else room / 2)
-    draw.line((_px(PLOT_L), _px(base), _px(PLOT_R), _px(base)), fill=GRID, width=_px(1))
-    _tracked(
-        draw,
-        _px(PLOT_L - 12),
-        _baseline(_inter(10, 700), _px(base)),
-        "NET",
-        _inter(10, 700),
-        DIM,
-        _px(1.2),
-        "right",
-    )
-    if not nets:
-        return
-    scale = (up + down) or 1
-    half = room
-    bar_w = min(14.0, slot * 0.55)
-    radius = _px(3)
-    for i, v in nets:
-        cx = x_at(i)
-        length = max(2.0, abs(v) / scale * half) if v else 0
-        if not length:
-            draw.rounded_rectangle(
-                (_px(cx - bar_w / 2), _px(base - 1), _px(cx + bar_w / 2), _px(base + 1)),
-                radius=_px(1),
-                fill=SAME,
-            )
+def _day_strip(draw: ImageDraw.ImageDraw, card: SeasonCard, x_at, col: float) -> None:
+    """Each day of the season so far: its date, net, trophies won / lost, and attacks / defenses.
+    Up to MAX_STRIP_COLS days sit under their points; more wrap onto rows of their own."""
+    shown = card.shown
+    top = PLOT_TOP + PLOT_H + STRIP_GAP
+    rows = strip_rows(len(shown))
+    if rows == 1:
+        cells = [(i, x_at(i), top, col) for i in range(len(shown))]
+    else:
+        per = math.ceil(len(shown) / rows)
+        w = (PLOT_R - PLOT_L) / per
+        cells = [
+            (i, PLOT_L + (i % per + 0.5) * w, top + (i // per) * (STRIP_ROW_H + STRIP_ROW_GAP), w)
+            for i in range(len(shown))
+        ]
+    date_font, net_font = _inter(10, 700), _inter(18, 700)
+    narrow = min((w for _, _, _, w in cells), default=col) < 68  # "+320/−296" needs ~61 at 11px
+    small, tiny = _inter(10 if narrow else 11, 500), _inter(10 if narrow else 11, 600)
+    for i, cx, ry, w in cells:
+        p = shown[i]
+        today = i == card.today
+        if today:
+            box = (_px(cx - w / 2 + 2), _px(ry - 6), _px(cx + w / 2 - 2), _px(ry + STRIP_ROW_H - 2))
+            draw.rounded_rectangle(box, radius=_px(10), fill=(*GOLD, 18), outline=(*GOLD, 120), width=_px(1))
+        chip_w = min(w - 8, 60)
+        chip = (_px(cx - chip_w / 2), _px(ry), _px(cx + chip_w / 2), _px(ry + 20))
+        outline = (*GOLD, 150) if today else (*BORDER, 255)
+        draw.rounded_rectangle(chip, radius=_px(5), fill=(255, 255, 255, 8), outline=outline, width=_px(1))
+        label = f"{p.day:%b %d}".upper()
+        _tracked(
+            draw,
+            _px(cx),
+            _baseline(date_font, _px(ry + 10)),
+            label,
+            date_font,
+            GOLD if today else MUTED,
+            _px(0.8),
+            "center",
+        )
+        if p.end is None and not (p.attacks or p.defenses):
+            draw.text((_px(cx), _px(ry + 48)), "—", font=net_font, fill=DIM, anchor="ms")
             continue
-        if v > 0:
-            box = (_px(cx - bar_w / 2), _px(base - length), _px(cx + bar_w / 2), _px(base))
-            draw.rounded_rectangle(box, radius=radius, fill=UP, corners=(True, True, False, False))
-        else:
-            box = (_px(cx - bar_w / 2), _px(base), _px(cx + bar_w / 2), _px(base + length))
-            draw.rounded_rectangle(box, radius=radius, fill=DOWN, corners=(False, False, True, True))
-    font = _inter(11, 700)
-    best = max(nets, key=lambda t: t[1])
-    worst = min(nets, key=lambda t: t[1])
-    for i, v in {best, worst}:
-        if not v:
-            continue
-        length = max(2.0, abs(v) / scale * half)
-        y = base - length - 5 if v > 0 else base + length + 13
-        draw.text((_px(x_at(i)), _px(y)), _signed(v), font=font, fill=MUTED, anchor="ms")
+        net = p.offense + p.defense
+        draw.text((_px(cx), _px(ry + 48)), _signed(net), font=net_font, fill=_sign_color(net), anchor="ms")
+        lost = f"+{p.defense}" if p.defense > 0 else f"−{-p.defense}"
+        draw.text((_px(cx), _px(ry + 66)), f"+{p.offense}/{lost}", font=small, fill=MUTED, anchor="ms")
+        draw.text((_px(cx), _px(ry + 84)), f"{p.attacks}/{p.defenses}", font=tiny, fill=DIM, anchor="ms")
+
+
+# ------------------------------------------------------------------ star breakdowns
 
 
 def _stars_panel(
     canvas: Image.Image,
     draw: ImageDraw.ImageDraw,
-    x0: float,
-    x1: float,
+    where: tuple[float, float, float],
     title: str,
+    count_label: str,
     rate_label: str,
     stars: StarCounts,
     ramp: Sequence[RGB],
 ) -> None:
-    """A star breakdown: a tall segmented bar (3★ to 0★, share printed where it fits), a legend
-    with the counts, and the triple rate."""
-    y0 = STARS_Y
-    box = (_px(x0), _px(y0), _px(x1), _px(y0 + STARS_H))
+    """A star breakdown (``where``: left, right and top): the triple rate big, then a row for
+    each star result, 3★ to 0★, with a bar, the count and the share."""
+    x0, x1, top = where
+    box = (_px(x0), _px(top), _px(x1), _px(top + STARS_H))
     _panel(canvas, box, _px(RADIUS), _row_fill(box[2] - box[0], box[3] - box[1]), BORDER, _px(1))
-    _tracked(draw, _px(x0 + 22), _px(y0 + 30), title, _inter(12, 700), DIM, _px(1.6), "left")
+    _tracked(draw, _px(x0 + 22), _px(top + 30), title, _inter(12, 700), ramp[3], _px(1.6), "left")
+    draw.text((_px(x1 - 22), _px(top + 30)), count_label, font=_inter(13, 500), fill=MUTED, anchor="rs")
+
     rate = stars.triple_rate
-    if rate is not None:
-        small = _inter(13, 500)
-        right = _px(x1 - 22)
-        draw.text((right, _px(y0 + 30)), rate_label, font=small, fill=MUTED, anchor="rs")
-        big = _inter(20, 700)
+    big = _inter(40, 700)
+    text = f"{rate * 100:.1f}%" if rate is not None else "—"
+    draw.text(
+        (_px(x0 + 22), _px(top + 82)), text, font=big, fill=TEXT if rate is not None else DIM, anchor="ls"
+    )
+    label_x = _px(x0 + 22) + big.getlength(text) + _px(10)
+    draw.text((label_x, _px(top + 82)), rate_label, font=_inter(15, 500), fill=MUTED, anchor="ls")
+    draw.line((_px(x0 + 22), _px(top + 104), _px(x1 - 22), _px(top + 104)), fill=GRID, width=_px(1))
+
+    total = stars.total
+    bx0, bx1 = x0 + 22 + 76, x1 - 22 - 96
+    count_font, share_font = _inter(16, 700), _inter(13, 500)
+    for k, s in enumerate((3, 2, 1, 0)):
+        cy = top + 130 + k * 27
+        for j in range(3):
+            _star(draw, _px(x0 + 30 + j * 20), _px(cy), _px(8), GOLD_LIGHT if j < s else EMPTY_STAR)
+        draw.rounded_rectangle(
+            (_px(bx0), _px(cy - 5), _px(bx1), _px(cy + 5)), radius=_px(5), fill=(255, 255, 255, 10)
+        )
+        c = stars.counts[s]
+        if c:
+            end = bx0 + max(10.0, (bx1 - bx0) * c / total)
+            draw.rounded_rectangle(
+                (_px(bx0), _px(cy - 5), _px(end), _px(cy + 5)), radius=_px(5), fill=ramp[s]
+            )
         draw.text(
-            (right - small.getlength(rate_label) - _px(8), _px(y0 + 31)),
-            f"{rate:.0%}",
-            font=big,
+            (_px(x1 - 22 - 50), _baseline(count_font, _px(cy))),
+            str(c),
+            font=count_font,
             fill=TEXT,
             anchor="rs",
         )
-
-    bx0, bx1 = x0 + 22, x1 - 22
-    by0, by1 = y0 + 46, y0 + 74
-    if not stars.total:
-        draw.rounded_rectangle(
-            (_px(bx0), _px(by0), _px(bx1), _px(by1)), radius=_px(4), fill=(255, 255, 255, 8)
-        )
-        f = _inter(13, 500)
-        msg = "No battles with star data yet"
+        share = f"{c / total:.0%}" if total else "—"
         draw.text(
-            (_px((bx0 + bx1) / 2), _baseline(f, _px((by0 + by1) / 2))), msg, font=f, fill=DIM, anchor="ms"
-        )
-    else:
-        parts = [(s, stars.counts[s]) for s in (3, 2, 1, 0) if stars.counts[s]]
-        gap = 2
-        width = bx1 - bx0 - gap * (len(parts) - 1)
-        x = bx0
-        label_font = _inter(13, 700)
-        for k, (s, c) in enumerate(parts):
-            seg = width * c / stars.total
-            end = bx1 if k == len(parts) - 1 else x + seg
-            color = ramp[s]
-            draw.rounded_rectangle((_px(x), _px(by0), _px(end), _px(by1)), radius=_px(4), fill=color)
-            text = f"{c / stars.total:.0%}"
-            if label_font.getlength(text) + _px(16) <= _px(end - x):
-                lum = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2]
-                ink = (24, 18, 12) if lum > 140 else (255, 255, 255)
-                draw.text(
-                    (_px(x + 8), _baseline(label_font, _px((by0 + by1) / 2))),
-                    text,
-                    font=label_font,
-                    fill=ink,
-                    anchor="ls",
-                )
-            x = end + gap
-
-    # Legend: swatch, star count, battles.
-    ly = y0 + 100
-    col_w = (bx1 - bx0) / 4
-    count_font = _inter(15, 700)
-    for k, s in enumerate((3, 2, 1, 0)):
-        lx = bx0 + k * col_w
-        draw.rounded_rectangle((_px(lx), _px(ly - 5), _px(lx + 10), _px(ly + 5)), radius=_px(2), fill=ramp[s])
-        sx = lx + 18
-        digit = _inter(14, 600)
-        draw.text((_px(sx), _baseline(digit, _px(ly))), str(s), font=digit, fill=MUTED, anchor="ls")
-        sx += digit.getlength(str(s)) / SCALE + 8
-        _star(draw, _px(sx), _px(ly), _px(6), MUTED)
-        draw.text(
-            (_px(sx + 14), _baseline(count_font, _px(ly))),
-            str(stars.counts[s]),
-            font=count_font,
-            fill=TEXT,
-            anchor="ls",
+            (_px(x1 - 22), _baseline(share_font, _px(cy))), share, font=share_font, fill=MUTED, anchor="rs"
         )
     if stars.missing:
         noun = "battle" if stars.missing == 1 else "battles"
         note = f"{stars.missing} {noun} without star data (inferred from trophy changes)"
-        draw.text((_px(bx0), _px(y0 + 132)), note, font=_inter(12, 500), fill=DIM, anchor="ls")
+        draw.text((_px(x0 + 22), _px(top + STARS_H - 16)), note, font=_inter(12, 500), fill=DIM, anchor="ls")
 
 
 # ------------------------------------------------------------------ season details (/legends logs details)
 
 DETAILS_GAP = 14
-DAYS_H = 152
-DAY_GUTTER = 96  # row labels left of the day columns
-MIN_DAY_COLS = 7  # a short strip keeps columns this narrow rather than stretching
 HEROES_H = 216
 HEROES_EMPTY_H = 92
 HERO_GAP = 10
@@ -2819,23 +2933,23 @@ def _army_height(details: SeasonDetails) -> int:
 
 
 def season_height(card: SeasonCard) -> int:
-    """The season card's height: SEASON_H, plus the detail panels when there are any."""
-    if card.details is None:
-        return SEASON_H
-    d = card.details
-    height = SEASON_H + DETAILS_GAP + DAYS_H + DETAILS_GAP + _heroes_height(d)
-    if army := _army_height(d):
-        height += DETAILS_GAP + army
-    return height
+    """The season card's height: down to the star breakdowns, plus the detail panels when there
+    are any. A long season's day strip takes two rows."""
+    height = stars_top(card) + STARS_H
+    if card.details is not None:
+        d = card.details
+        height += DETAILS_GAP + _heroes_height(d)
+        if army := _army_height(d):
+            height += DETAILS_GAP + army
+    return height + BOTTOM_PAD
 
 
-def _season_details(canvas: Image.Image, draw: ImageDraw.ImageDraw, details: SeasonDetails) -> None:
-    """Under the star breakdowns: the latest days one by one, each hero's share of attacks with
-    its most-used equipment and pet, and the most-used army."""
+def _season_details(
+    canvas: Image.Image, draw: ImageDraw.ImageDraw, details: SeasonDetails, top: float
+) -> None:
+    """Under the star breakdowns: each hero's share of attacks with its most-used equipment and
+    pet, and the most-used army."""
     images = _IconImages(details.icons)
-    top = STARS_Y + STARS_H + DETAILS_GAP
-    _details_days(canvas, draw, details, top)
-    top += DAYS_H + DETAILS_GAP
     _details_heroes(canvas, draw, details, top, images)
     top += _heroes_height(details) + DETAILS_GAP
     if _army_height(details):
@@ -2860,55 +2974,6 @@ def _centered_message(draw: ImageDraw.ImageDraw, top: float, height: float, text
     f = _inter(15, 500)
     cy = top + 30 + (height - 30) / 2
     draw.text((_px(WIDTH / 2), _baseline(f, _px(cy))), text, font=f, fill=MUTED, anchor="ms")
-
-
-def _details_days(canvas: Image.Image, draw: ImageDraw.ImageDraw, details: SeasonDetails, top: float) -> None:
-    """The latest legend days left to right (today highlighted): net trophies, trophies won and
-    lost (gained, below Legend I), and attacks and defenses against the day's cap."""
-    _card_panel(canvas, top, DAYS_H)
-    _panel_title(draw, top, "DAY BY DAY")
-    days = details.days[-MAX_DETAIL_DAYS:]
-    if not days:
-        _centered_message(draw, top, DAYS_H, "No legend days recorded yet")
-        return
-    noun = "day" if len(days) == 1 else "days"
-    _panel_rate(draw, top, "", f"latest {len(days)} legend {noun}")
-
-    date_y, net_y, won_y, fought_y = top + 64, top + 92, top + 119, top + 140
-    label_font = _inter(10, 700)
-    for text, y in (("NET", net_y), ("OFF / DEF", won_y), ("BATTLES", fought_y)):
-        base = _baseline(label_font, _px(y)) if y == net_y else _px(y)
-        _tracked(draw, _px(PAD + 22), base, text, label_font, DIM, _px(1.2), "left")
-
-    x0 = PAD + 22 + DAY_GUTTER
-    col = (WIDTH - PAD - 22 - x0) / max(len(days), MIN_DAY_COLS)
-    date_font = _inter(11, 700)
-    net_font = _inter(20, 700)
-    small = _inter(12, 600)
-    for i, d in enumerate(days):
-        cx = x0 + (i + 0.5) * col
-        if d.today:
-            box = (_px(cx - col / 2 + 3), _px(top + 44), _px(cx + col / 2 - 3), _px(top + DAYS_H - 8))
-            draw.rounded_rectangle(box, radius=_px(10), fill=(*GOLD, 18), outline=(*GOLD, 120), width=_px(1))
-        label = "TODAY" if d.today else f"{d.day:%b} {d.day.day}".upper()
-        _tracked(draw, _px(cx), _px(date_y), label, date_font, GOLD if d.today else MUTED, _px(1.1), "center")
-        if not d.played:
-            draw.text((_px(cx), _baseline(net_font, _px(net_y))), "—", font=net_font, fill=DIM, anchor="ms")
-            continue
-        net = d.offense + d.defense
-        color = GAIN_TEXT if net > 0 else LOSS_TEXT if net < 0 else TEXT
-        draw.text(
-            (_px(cx), _baseline(net_font, _px(net_y))), _signed(net), font=net_font, fill=color, anchor="ms"
-        )
-        won, lost, sep = f"+{d.offense}", _signed(d.defense), " / "
-        width = small.getlength(won) + small.getlength(sep) + small.getlength(lost)
-        x = _px(cx) - width / 2
-        for text, fill in ((won, TEXT), (sep, DIM), (lost, TEXT)):
-            draw.text((x, _px(won_y)), text, font=small, fill=fill, anchor="ls")
-            x += small.getlength(text)
-        cap = f"/{d.cap}" if d.cap is not None else ""
-        fought = f"{d.attacks}{cap} · {d.defenses}{cap}"
-        draw.text((_px(cx), _px(fought_y)), fought, font=_inter(12, 500), fill=DIM, anchor="ms")
 
 
 def _details_heroes(
