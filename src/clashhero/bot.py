@@ -120,8 +120,11 @@ class ClashHeroBot(commands.Bot):
             await self.collector.start()
 
     async def close(self) -> None:
+        # Stop what polls and posts before closing what it uses: the collector, then the cogs'
+        # loops and the Discord connection (super().close() unloads the cogs), then the
+        # Clash API client and the database.
         self.collector.stop()
+        await super().close()
         if self.coc.http is not None:  # only set once login() succeeded
             await self.coc.close()
         await self.db.close()
-        await super().close()

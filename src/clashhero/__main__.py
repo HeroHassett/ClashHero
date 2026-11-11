@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import signal
 import sys
 
 import coc
@@ -17,8 +19,33 @@ async def run(config: Config) -> None:
     # Build the bot inside the running event loop: coc.py binds its client to the loop that
     # exists when it's created, and features like fetching CWL wars or many players at once
     # fail with "attached to a different loop" if that isn't the loop the bot runs on.
-    async with ClashHeroBot(config) as bot:
-        await bot.start(config.discord_token)
+    stopping = _stop_on_sigterm()
+    try:
+        async with ClashHeroBot(config) as bot:
+            await bot.start(config.discord_token)
+    except asyncio.CancelledError:
+        if not stopping.is_set():
+            raise
+    finally:
+        with contextlib.suppress(NotImplementedError, RuntimeError):
+            asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM)
+
+
+def _stop_on_sigterm() -> asyncio.Event:
+    """Close the bot on SIGTERM, as Ctrl+C does: cancel this task so ``async with`` closes it.
+    Docker, systemd and ``kill`` stop with SIGTERM, and a container's first process ignores it
+    unless it handles it (Docker then kills the bot mid-work after 10 seconds)."""
+    stopping = asyncio.Event()
+    task = asyncio.current_task()
+
+    def stop() -> None:
+        if task is not None and not stopping.is_set():
+            stopping.set()
+            task.cancel()
+
+    with contextlib.suppress(NotImplementedError, RuntimeError):  # no signal handlers on Windows
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stop)
+    return stopping
 
 
 def main() -> None:
