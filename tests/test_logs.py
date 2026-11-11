@@ -97,7 +97,7 @@ def test_embed_builders_smoke():
         E.town_hall_embed("Alice", "#A", 15, 16),
         E.war_preference_embed("Alice", "#A", False),
         E.league_change_embed("Alice", "#A", None, "Legend League", 5000),
-        E.donations_embed("Clan", [("Alice", 20, 0), ("Bob", 0, 15)]),
+        E.donations_embed("Clan", "#C", [E.Donation("Alice", 20, 0), E.Donation("Bob", 0, 15)]),
         E.clan_games_progress_embed("Clan", [("Alice", 200, 1200)]),
         E.war_attack_embed(WAR, attack, "Alice", "Xeno"),
         E.war_attack_embed(
@@ -121,6 +121,99 @@ def test_embed_builders_smoke():
         assert embed.to_dict()
     assert "Promoted to **Elder**" in E.role_change_embed("C", "A", "#A", "member", "admin").description
     assert "Demoted to **Elder**" in E.role_change_embed("C", "A", "#A", "coLeader", "admin").description
+
+
+def test_donations_post(monkeypatch):
+    from clashhero.services.emojis import EMOJIS
+
+    monkeypatch.setattr(EMOJIS, "_by_name", {f"th{n}": f"<:th{n}:{n}>" for n in (16, 17, 18)})
+    at = datetime(2026, 11, 11, 7, 36, tzinfo=UTC)
+    entries = [
+        E.Donation("H cat", 80, 119, town_hall=17),
+        E.Donation("MW Hjale", 154, 119, town_hall=18),
+        E.Donation("lvl", 59, 0, town_hall=16, in_clan=False),
+        E.Donation("Anurag", 0, 55),
+    ]
+    e = E.donations_embed(
+        "Aurora",
+        "#2J8VGUCV2",
+        entries,
+        numbers={"d": {154: "<:nd_154:1>"}, "r": {}},
+        badge_url="https://api-assets.clashofclans.com/badges/200/x.png",
+        member_count=42,
+        at=at,
+    )
+    assert e.title == "Aurora (#2J8VGUCV2)" and e.url.endswith("tag=2J8VGUCV2")
+    assert e.thumbnail.url == e.footer.icon_url == "https://api-assets.clashofclans.com/badges/200/x.png"
+    assert (e.footer.text, e.timestamp) == ("42/50", at)
+    donated, received = e.description.split("\n\n")
+    assert donated.split("\n") == [
+        "▲ **Donated**",
+        "<:th18:18> <:nd_154:1> MW Hjale",  # most first; the coloured number when there is one
+        "<:th17:17> **80** H cat",
+        "<:th16:16> **59** ~~lvl~~",  # gone from the clan
+    ]
+    assert received.split("\n") == [
+        "▼ **Received**",
+        "<:th17:17> **119** H cat",  # a tie goes by name
+        "<:th18:18> **119** MW Hjale",
+        "**55** Anurag",  # no Town Hall known: no icon
+    ]
+    assert "Received" not in E.donations_embed("C", "#C", [E.Donation("A", 5, 0)]).description
+    plain = E.donations_embed("C", "#C", [E.Donation("A", 5, 0)])
+    assert plain.footer.text == "C" and plain.thumbnail.url is None
+
+
+def test_long_donation_lists_are_cut_to_fit():
+    many = [E.Donation(f"Player number {i:02d} " + "x" * 40, 100 + i, 100 + i) for i in range(50)]
+    e = E.donations_embed("C", "#C", many)
+    assert len(e.description) <= 4000 and "more" in e.description
+    donated, received = e.description.split("\n\n")
+    assert donated.endswith("more") and received.endswith("more")
+
+
+def test_arrows_are_coloured_emojis_when_uploaded(monkeypatch):
+    from clashhero.services.emojis import EMOJIS
+
+    assert E._arrow("up") == "▲" and E._arrow("down") == "▼"
+    monkeypatch.setattr(
+        EMOJIS, "_by_name", {"ui_arrow_up": "<:ui_arrow_up:1>", "ui_arrow_down": "<:ui_arrow_down:2>"}
+    )
+    assert E._arrow("up") == "<:ui_arrow_up:1>" and E._arrow("up", "blue") == "▲"
+    leave = E.member_leave_embed("Clan", M, 39, 74, 0)
+    assert "**74** <:ui_arrow_up:1> **0** <:ui_arrow_down:2>" in leave.description
+    assert E.role_change_embed("C", "A", "#A", "admin", "member").description.startswith(
+        "<:ui_arrow_down:2> Demoted"
+    )
+
+
+async def test_donations_flush_uses_the_clan_poll(cog, sent, db, monkeypatch):
+    from clashhero.services.emojis import EMOJIS
+    from clashhero.services.snapshots import ClanSnap
+
+    monkeypatch.setattr(EMOJIS, "_by_name", {"th16": "<:th16:1>", "th12": "<:th12:1>"})
+    monkeypatch.setattr(EMOJIS, "loaded", False)  # no uploads from the fake bot
+
+    snap = ClanSnap("#C", "Aurora", 21, None, None, None, members={"#A": M})
+    cog.bot.collector = type("Col", (), {"clan_snapshot": lambda self, tag: snap if tag == "#C" else None})()
+    await cog.on_clash_donations(ev.DonationsChanged("#C", "Aurora", "#A", "Alice", 20, 5))
+    await cog.on_clash_donations(ev.DonationsChanged("#C", "Aurora", "#GONE", "Gone", 7, 0))
+    await cog.flush_now()
+    assert sent == []  # nobody follows the clan's donations: nothing sent
+    await db.set_clan_log(1, "#C", "donations", 100)
+    await db.execute(
+        "INSERT INTO players (player_tag, name, town_hall, trophies, league, clan_tag, updated_at) "
+        "VALUES ('#GONE', 'Gone', 12, 3000, NULL, NULL, 'x')"
+    )
+    await cog.on_clash_donations(ev.DonationsChanged("#C", "Aurora", "#A", "Alice", 20, 5))
+    await cog.on_clash_donations(ev.DonationsChanged("#C", "Aurora", "#GONE", "Gone", 7, 0))
+    await cog.flush_now()
+    [(_, clan, log_type, embed, _)] = sent
+    assert (clan, log_type, embed.title, embed.footer.text) == ("#C", "donations", "Aurora (#C)", "1/50")
+    assert embed.description.split("\n")[1:3] == [
+        f"<:th{M.town_hall}:1> **20** Alice",  # Town Hall from the clan's poll
+        "<:th12:1> **7** ~~Gone~~",  # left: struck through, Town Hall from the stored profile
+    ]
 
 
 def test_role_change_post():
@@ -533,28 +626,55 @@ async def test_recent_leavers_expire(cog, db):
     assert await cog._recent_leavers() == {"#B"}
 
 
-def test_log_list_lines_groups_by_clan():
-    from clashhero.cogs.logs import log_list_lines
+def test_log_list_shows_each_clan_with_its_badge_and_every_log_type():
+    from clashhero.cogs.logs import LogClan, log_list_embeds
+    from clashhero.constants import CLAN_LOG_TYPES, SERVER_LOG_TYPES
 
     clan_rows = [
         {"clan_tag": "#A", "log_type": "donations", "channel_id": 1, "ping_role_id": None},
-        {"clan_tag": "#A", "log_type": "unknown_kind", "channel_id": 2, "ping_role_id": 9},
-        {"clan_tag": "#B", "log_type": "donations", "channel_id": 3, "ping_role_id": None},
+        {"clan_tag": "#A", "log_type": "role_change", "channel_id": 2, "ping_role_id": 9},
+        {"clan_tag": "#A", "log_type": "join_leave", "channel_id": 2, "ping_role_id": None},
+        {"clan_tag": "#B", "log_type": "unknown_kind", "channel_id": 3, "ping_role_id": None},
     ]
     server_rows = [{"log_type": "welcome", "channel_id": 4}]
-    assert log_list_lines(clan_rows, server_rows, {"#A": "Alpha"}) == [
-        "🏳️ **Alpha** `#A`",
-        "Donation log → <#1>",
-        "unknown_kind → <#2> · ping <@&9>",
-        "",
-        "🏳️ **#B** `#B`",
-        "Donation log → <#3>",
-        "",
-        "🖥️ **Server**",
-        "Account linked (welcome) → <#4>",
+    clans = [LogClan("#A", "Aurora", "https://badge/a.png"), LogClan("#C", "Quiet", None)]
+    a, c, b, server = log_list_embeds(clans, clan_rows, server_rows, 0x123456)
+    assert (a.author.name, a.author.icon_url, a.author.url) == (
+        "Aurora (#A)",
+        "https://badge/a.png",
+        "https://link.clashofclans.com/?action=OpenClanProfile&tag=A",
+    )
+    assert a.description == "Posting to <#1>, <#2>"
+    fields = {f.name: f.value for f in a.fields}
+    assert len(a.fields) == len(CLAN_LOG_TYPES) and all(f.inline for f in a.fields)
+    assert (fields["Donation log"], fields["Role change"], fields["War start / end"]) == (
+        "<#1>",
+        "<#2>\nping <@&9>",
+        "—",
+    )
+    assert "Clan achievements" in fields and "Unit upgrades" in fields  # short names in the grid
+    assert c.author.name == "Quiet (#C)" and "No logs set up" in c.description and not c.fields
+    assert b.author.name == "#B (#B)" and b.fields[-1].name == "unknown_kind"  # not a linked clan
+    assert server.title == "Server logs" and len(server.fields) == len(SERVER_LOG_TYPES)
+    assert {f.name: f.value for f in server.fields}["Account linked"] == "<#4>"
+    [empty] = log_list_embeds([], [], [])
+    assert empty.title == "Server logs" and "No logs configured" in empty.description
+
+
+def test_log_list_pages_stay_within_discord_limits():
+    from clashhero.cogs.logs import LogClan, embed_pages, log_list_embeds
+    from clashhero.constants import CLAN_LOG_TYPES
+
+    clans = [LogClan(f"#{i:03d}", f"Clan {i}") for i in range(14)]
+    rows = [
+        {"clan_tag": c.tag, "log_type": kind, "channel_id": 10**17 + n, "ping_role_id": None}
+        for c in clans
+        for n, kind in enumerate(CLAN_LOG_TYPES)
     ]
-    assert log_list_lines([], [], {}) == []
-    assert log_list_lines([], server_rows, {})[0] == "🖥️ **Server**"
+    embeds = log_list_embeds(clans, rows, [])
+    pages = embed_pages(embeds)
+    assert [e for page in pages for e in page] == embeds and len(pages) > 1
+    assert all(len(page) <= 10 and sum(len(e) for e in page) <= 6000 for page in pages)
 
 
 def test_missing_post_permissions():

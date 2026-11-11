@@ -208,6 +208,10 @@ class Collector:
     def dispatch(self, event: ev.ClashEvent) -> None:
         self.bot.dispatch(event.event_name, event)
 
+    def clan_snapshot(self, clan_tag: str) -> ClanSnap | None:
+        """The clan as of its last poll (members with Town Hall, role and donations), if any."""
+        return self._clans.get(clan_tag)
+
     def clan_lists_member(self, clan_tag: str, player_tag: str) -> bool:
         """Whether the clan's last poll still had this player (their leave isn't processed yet)."""
         snap = self._clans.get(clan_tag)

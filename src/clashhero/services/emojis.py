@@ -14,6 +14,9 @@ Naming (2-32 chars, lowercase letters, digits, underscores):
 - league tier ``Legend I`` -> ``lt_legend_i``; label ``Clan Wars`` -> ``lbl_clan_wars``
 - units: slug of the in-game name (``barbarian_king``, ``rage_spell``, ``l_a_s_s_i``)
 - town halls: ``th1`` ... ``th20``
+- drawn by the bot itself: coloured arrows (``ui_arrow_up``, ``ui_arrow_down``,
+  ``ui_arrow_up_blue``), uploaded at startup, and coloured numbers for the donation log
+  (``nd_119`` donated, ``nr_119`` received), uploaded the first time an amount comes up
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import io
 import logging
 import re
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -64,9 +68,11 @@ class EmojiRegistry:
 
     def __init__(self) -> None:
         self._by_name: dict[str, str] = {}
+        self.loaded = False  # the app's emojis have been fetched (so missing ones can be uploaded)
 
     def load(self, emojis: list[discord.Emoji]) -> None:
         self._by_name = {e.name: str(e) for e in emojis}
+        self.loaded = True
 
     def add(self, emoji: discord.Emoji) -> None:
         self._by_name[emoji.name] = str(emoji)
@@ -115,10 +121,12 @@ def emoji_image(data: bytes) -> bytes:
         return out.getvalue()
 
 
-async def _upload(client: discord.Client, name: str, data: bytes) -> discord.Emoji | None:
+async def _upload(
+    client: discord.Client, name: str, data: bytes, *, pause: float = 1.0
+) -> discord.Emoji | None:
     try:
         emoji = await client.create_application_emoji(name=name, image=emoji_image(data))
-        await asyncio.sleep(1)  # be gentle with Discord's rate limits on a first big sync
+        await asyncio.sleep(pause)  # be gentle with Discord's rate limits on a first big sync
         return emoji
     except discord.HTTPException as e:
         log.warning("Couldn't upload emoji %s: %s", name, e)
@@ -176,6 +184,119 @@ async def sync_official(bot: ClashHeroBot) -> int:
                 uploaded += 1
     log.info("Uploaded %d official icons as emojis (%d total)", uploaded, len(EMOJIS))
     return uploaded
+
+
+# ------------------------------------------------------------------ drawn by the bot: arrows and numbers
+
+GAIN_GREEN = (87, 204, 130)
+LOSS_RED = (240, 98, 90)
+DONATED_BLUE = (88, 166, 255)
+# name -> (direction, colour): ▲ / ▼ in the log posts, coloured like gains and losses.
+ARROWS = {
+    "ui_arrow_up": ("up", GAIN_GREEN),
+    "ui_arrow_down": ("down", LOSS_RED),
+    "ui_arrow_up_blue": ("up", DONATED_BLUE),
+}
+NUMBER_COLORS = {"d": DONATED_BLUE, "r": LOSS_RED}  # donated, received
+MAX_NUMBER = 9999
+NUMBER_BUDGET = 1800  # number emojis stop once the app has this many, leaving room for the rest
+MAX_NEW_NUMBERS = 20  # uploads for one message; any more show as text that time
+_number_lock: asyncio.Lock | None = None
+
+
+def _png(im) -> bytes:
+    out = io.BytesIO()
+    im.save(out, "PNG", optimize=True)
+    return out.getvalue()
+
+
+def arrow_image(direction: str, color: tuple[int, int, int]) -> bytes:
+    """A small solid triangle pointing ``up`` or ``down``, drawn 4x and scaled down for smooth
+    edges; it sits about text-high in a message."""
+    from PIL import Image, ImageDraw
+
+    big = EMOJI_SIZE * 4
+    im = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+    top, bottom, left, right = big * 0.30, big * 0.72, big * 0.24, big * 0.76
+    if direction == "up":
+        points = [(big / 2, top), (right, bottom), (left, bottom)]
+    else:
+        points = [(left, top), (right, top), (big / 2, bottom)]
+    ImageDraw.Draw(im).polygon(points, fill=(*color, 255))
+    return _png(im.resize((EMOJI_SIZE, EMOJI_SIZE), Image.Resampling.LANCZOS))
+
+
+def number_key(kind: str, n: int) -> str:
+    return f"n{kind}_{n}"
+
+
+def number_image(n: int, color: tuple[int, int, int]) -> bytes:
+    """``n`` in bold coloured digits, as big as fits the emoji (long numbers come out smaller)."""
+    from PIL import Image, ImageDraw
+
+    from clashhero.services.cards import _inter
+
+    text = str(n)
+    size = 44  # 88 px digits: about text-high once Discord shrinks the emoji
+    font = _inter(size, 700)
+    room = EMOJI_SIZE - 6
+    if font.getlength(text) > room:
+        size = max(8, int(size * room / font.getlength(text)))
+        font = _inter(size, 700)
+    im = Image.new("RGBA", (EMOJI_SIZE, EMOJI_SIZE), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(im)
+    x0, y0, x1, y1 = draw.textbbox((0, 0), text, font=font, anchor="ls")
+    x = (EMOJI_SIZE - (x1 - x0)) / 2 - x0
+    y = (EMOJI_SIZE - (y1 - y0)) / 2 - y0
+    draw.text((x, y), text, font=font, fill=(*color, 255), anchor="ls")
+    return _png(im)
+
+
+async def sync_drawn(client: discord.Client) -> int:
+    """Upload the drawn arrows that aren't there yet (after :func:`sync_official` loaded the
+    app's emojis). Returns uploads."""
+    if not EMOJIS.loaded:
+        return 0
+    uploaded = 0
+    for name, (direction, color) in ARROWS.items():
+        if name in EMOJIS:
+            continue
+        emoji = await _upload(client, name, arrow_image(direction, color))
+        if emoji is not None:
+            EMOJIS.add(emoji)
+            uploaded += 1
+    return uploaded
+
+
+async def number_emojis(client: discord.Client, kind: str, values: Iterable[int]) -> dict[int, str]:
+    """``{value: emoji}`` for the donation log's coloured numbers (``kind`` "d" donated, "r"
+    received), uploading any not there yet: at most MAX_NEW_NUMBERS a call and only while the app
+    has fewer than NUMBER_BUDGET emojis. Values left out are shown as text; this never raises."""
+    global _number_lock
+    if not EMOJIS.loaded or kind not in NUMBER_COLORS:
+        return {}
+    _number_lock = _number_lock or asyncio.Lock()
+    out: dict[int, str] = {}
+    new = 0
+    async with _number_lock:
+        for n in sorted(set(values)):
+            if not 0 <= n <= MAX_NUMBER:
+                continue
+            name = number_key(kind, n)
+            if name not in EMOJIS:
+                if new >= MAX_NEW_NUMBERS or len(EMOJIS) >= NUMBER_BUDGET:
+                    continue
+                new += 1
+                try:
+                    emoji = await _upload(client, name, number_image(n, NUMBER_COLORS[kind]), pause=0.25)
+                except Exception:  # never let an emoji break a post
+                    log.warning("Couldn't make number emoji %s", name, exc_info=True)
+                    break
+                if emoji is None:
+                    continue
+                EMOJIS.add(emoji)
+            out[n] = EMOJIS.get(name)
+    return out
 
 
 # ------------------------------------------------------------------ CLI: upload your own icons

@@ -66,6 +66,12 @@ def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+def _arrow(direction: str, color: str = "") -> str:
+    """The bot's coloured arrow emoji (green ▲, red ▼, or blue ▲), else the plain character."""
+    name = f"ui_arrow_{direction}" + (f"_{color}" if color else "")
+    return EMOJIS.get(name, "▲" if direction == "up" else "▼")
+
+
 def profile_view(tag: str) -> discord.ui.View:
     """Link-only view with a "Profile" button that opens the player in game. Link buttons need
     no persistence, so this can be attached to any log post."""
@@ -189,7 +195,7 @@ def member_leave_embed(
     """Town Hall, trophies, and troops donated ▲ / received ▼ in this clan this season."""
     castle = EMOJIS.get("ui_donate_troops", "🏰")
     line = _member_head(member.town_hall, member.league, member.trophies)
-    line.append(f"{castle}**{donated:,}** ▲ **{received:,}** ▼")
+    line.append(f"{castle}**{donated:,}** {_arrow('up')} **{received:,}** {_arrow('down')}")
     e = _member_embed(member, [" ".join(line)], RED)
     return _clan_footer(e, f"Left {clan_name} [{member_count}/50]", badge_url, at)
 
@@ -243,7 +249,7 @@ def role_change_embed(
     from clashhero.constants import ROLE_RANK
 
     promoted = ROLE_RANK.get(new or "", 0) > ROLE_RANK.get(old or "", 0)
-    arrow = "▲" if promoted else "▼"
+    arrow = _arrow("up" if promoted else "down")
     verb = "Promoted" if promoted else "Demoted"
     lines = [f"{arrow} {verb} to **{role_name(new)}** · was {role_name(old)}"]
     if town_hall:
@@ -291,22 +297,76 @@ def league_change_embed(
     return e
 
 
-def donations_embed(clan_name: str, entries: Sequence[tuple[str, int, int]]) -> discord.Embed:
-    """entries: (name, donated, received) aggregated over the batch window."""
-    donated = [(n, d) for n, d, _ in entries if d > 0]
-    received = [(n, r) for n, _, r in entries if r > 0]
-    e = discord.Embed(title=f"{clan_name} donations", color=GREEN)
-    if donated:
-        e.add_field(
-            name=f"Donated ({sum(d for _, d in donated)})",
-            value="\n".join(f"`{d:>4}` {n}" for n, d in sorted(donated, key=lambda x: -x[1]))[:1024],
-        )
-    if received:
-        e.add_field(
-            name=f"Received ({sum(r for _, r in received)})",
-            value="\n".join(f"`{r:>4}` {n}" for n, r in sorted(received, key=lambda x: -x[1]))[:1024],
-        )
-    return e
+@dataclass(frozen=True)
+class Donation:
+    """One player's donations over a batch window. ``in_clan``: still a member (a name is struck
+    through once they've left)."""
+
+    name: str
+    donated: int
+    received: int
+    town_hall: int | None = None
+    in_clan: bool = True
+
+
+def donations_embed(
+    clan_name: str,
+    clan_tag: str,
+    entries: Sequence[Donation],
+    *,
+    numbers: Mapping[str, Mapping[int, str]] | None = None,
+    badge_url: str | None = None,
+    member_count: int | None = None,
+    at: datetime | None = None,
+) -> discord.Embed:
+    """The clan (linked, its badge as the thumbnail), then who donated and who received, most
+    first: each line a Town Hall icon, the amount and the name. ``numbers``: coloured number
+    emojis by kind ("d" donated, "r" received) and amount; an amount without one is bold text."""
+    numbers = numbers or {}
+
+    def line(d: Donation, amount: int, kind: str) -> str:
+        th = EMOJIS.town_hall(d.town_hall) if d.town_hall else ""
+        number = numbers.get(kind, {}).get(amount) or f"**{amount:,}**"
+        name = escape_markdown(d.name)
+        return " ".join(x for x in (th, number, name if d.in_clan else f"~~{name}~~") if x)
+
+    sections = []
+    for kind, label, arrow, amount in (
+        ("d", "Donated", _arrow("up", "blue"), lambda d: d.donated),
+        ("r", "Received", _arrow("down"), lambda d: d.received),
+    ):
+        rows = sorted((d for d in entries if amount(d) > 0), key=lambda d: (-amount(d), d.name.lower()))
+        if rows:
+            sections.append((f"{arrow} **{label}**", [line(d, amount(d), kind) for d in rows]))
+    e = discord.Embed(
+        title=f"{clan_name} ({clan_tag})",
+        url=clan_link(clan_tag),
+        description=_fit_sections(sections, 4000),
+        color=BLUE,
+    )
+    if badge_url:
+        e.set_thumbnail(url=badge_url)
+    return _clan_footer(e, f"{member_count}/50" if member_count is not None else clan_name, badge_url, at)
+
+
+def _fit_sections(sections: Sequence[tuple[str, list[str]]], limit: int) -> str:
+    """Headed sections separated by a blank line, dropping each section's last lines (noting
+    how many) until it all fits ``limit`` characters."""
+    keep = [len(lines) for _, lines in sections]
+
+    def render() -> str:
+        parts = []
+        for (head, lines), n in zip(sections, keep, strict=True):
+            body = lines[:n] + ([f"… and {len(lines) - n} more"] if n < len(lines) else [])
+            parts.append("\n".join([head, *body]))
+        return "\n\n".join(parts)
+
+    text = render()
+    while len(text) > limit and any(keep):
+        longest = max(range(len(keep)), key=lambda i: keep[i])
+        keep[longest] -= 1
+        text = render()
+    return text
 
 
 def clan_games_progress_embed(clan_name: str, entries: Sequence[tuple[str, int, int]]) -> discord.Embed:

@@ -106,9 +106,11 @@ class ClashHeroBot(commands.Bot):
             log.warning("Couldn't load ranked league tiers; using the built-in list", exc_info=True)
 
     async def _sync_emojis(self) -> None:
-        """Load ClashHero's app emojis and upload missing official icons (league tiers, labels)."""
+        """Load ClashHero's app emojis and upload missing official icons (league tiers, labels)
+        and the arrows the bot draws itself."""
         try:
             await emojis.sync_official(self)
+            await emojis.sync_drawn(self)
         except Exception:
             log.warning("Emoji sync failed; messages fall back to text", exc_info=True)
 

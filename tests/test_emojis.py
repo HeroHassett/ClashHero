@@ -20,9 +20,9 @@ class E:
 
 @pytest.fixture
 def registry():
-    saved = dict(EMOJIS._by_name)
+    saved, loaded = dict(EMOJIS._by_name), EMOJIS.loaded
     yield EMOJIS
-    EMOJIS._by_name = saved
+    EMOJIS._by_name, EMOJIS.loaded = saved, loaded
 
 
 def test_names():
@@ -80,3 +80,68 @@ async def test_sync_loads_existing_and_skips_present(registry, monkeypatch):
     monkeypatch.setattr(emojis, "official_icons", official_icons)
     assert await emojis.sync_official(bot) == 0
     assert registry.league("Legend I")
+
+
+# ------------------------------------------------------------------ drawn: arrows and numbers
+
+
+def _colours(data):
+    im = Image.open(io.BytesIO(data)).convert("RGBA")
+    assert im.size == (emojis.EMOJI_SIZE, emojis.EMOJI_SIZE)
+    return {c[:3] for _, c in im.getcolors(maxcolors=1 << 16) if c[3] == 255}
+
+
+def test_arrows_and_numbers_are_drawn_in_colour():
+    assert emojis.GAIN_GREEN in _colours(emojis.arrow_image("up", emojis.GAIN_GREEN))
+    down = Image.open(io.BytesIO(emojis.arrow_image("down", emojis.LOSS_RED))).convert("RGBA")
+    assert down.getpixel((64, 45))[3] == 255 and down.getpixel((64, 88))[3] < 255  # wide top, point below
+    assert emojis.DONATED_BLUE in _colours(emojis.number_image(119, emojis.DONATED_BLUE))
+    wide = Image.open(io.BytesIO(emojis.number_image(9999, emojis.LOSS_RED))).getbbox()
+    assert wide[0] >= 0 and wide[2] <= emojis.EMOJI_SIZE  # long numbers shrink to fit
+    assert emojis.number_key("d", 119) == "nd_119"
+
+
+class Uploader:
+    def __init__(self, fail=()):
+        self.made, self.fail = [], set(fail)
+
+    async def create_application_emoji(self, *, name, image):
+        if name in self.fail:
+            raise RuntimeError("boom")
+        self.made.append(name)
+        return E(name, 900 + len(self.made))
+
+
+async def test_number_emojis_are_made_once_and_within_limits(registry, monkeypatch):
+    monkeypatch.setattr(emojis, "_upload", _fast_upload)
+    registry.load([E("nd_80", 5)])
+    bot = Uploader()
+    got = await emojis.number_emojis(bot, "d", [80, 154, 154, -1, 10_000])
+    assert got == {80: "<:nd_80:5>", 154: "<:nd_154:901>"} and bot.made == ["nd_154"]
+    assert await emojis.number_emojis(bot, "d", [154]) == {154: "<:nd_154:901>"}  # no new upload
+    assert await emojis.number_emojis(bot, "x", [1]) == {}
+    monkeypatch.setattr(emojis, "MAX_NEW_NUMBERS", 2)
+    many = await emojis.number_emojis(bot, "r", [1, 2, 3])
+    assert sorted(many) == [1, 2]  # 3 waits for a later message
+    monkeypatch.setattr(emojis, "NUMBER_BUDGET", len(registry))
+    assert await emojis.number_emojis(bot, "r", [4]) == {}  # the app is full enough
+    registry.loaded = False
+    assert await emojis.number_emojis(bot, "r", [1]) == {}  # not loaded yet: names unknown
+
+
+async def test_a_failed_number_emoji_never_breaks_the_post(registry, monkeypatch):
+    monkeypatch.setattr(emojis, "_upload", _fast_upload)
+    registry.load([])
+    assert await emojis.number_emojis(Uploader(fail={"nr_7"}), "r", [7, 8]) == {}
+
+
+async def test_drawn_arrows_upload_when_missing(registry, monkeypatch):
+    monkeypatch.setattr(emojis, "_upload", _fast_upload)
+    registry.load([E("ui_arrow_up", 3)])
+    bot = Uploader()
+    assert await emojis.sync_drawn(bot) == 2 and sorted(bot.made) == ["ui_arrow_down", "ui_arrow_up_blue"]
+    assert await emojis.sync_drawn(bot) == 0
+
+
+async def _fast_upload(client, name, data, *, pause=1.0):
+    return await client.create_application_emoji(name=name, image=data)

@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -23,12 +23,13 @@ from clashhero import events as ev
 from clashhero.cogs import _log_embeds as E
 from clashhero.cogs._base import BaseCog
 from clashhero.constants import CLAN_LOG_TYPES, SERVER_LOG_TYPES
+from clashhero.services import emojis
 from clashhero.services.outbox import send_clan_log, send_to_channel
 from clashhero.utils.checks import manager
-from clashhero.utils.fmt import make_embed
+from clashhero.utils.fmt import clan_link, guild_color
 from clashhero.utils.resolve import ResolveError, clan_autocomplete, resolve_clan
 from clashhero.utils.seasons import game_season
-from clashhero.utils.style import header, ok_embed
+from clashhero.utils.style import ok_embed
 
 log = logging.getLogger(__name__)
 
@@ -87,28 +88,88 @@ def check_can_post(channel, me) -> None:
         )
 
 
-def log_list_lines(clan_rows, server_rows, clan_names: dict[str, str]) -> list[str]:
-    """/logs list body: one block per clan (header with name and tag), then server logs."""
-    lines: list[str] = []
-    current = None
+# Field names for /logs list where the description is too long for a grid cell.
+LOG_FIELD_NAMES = {
+    "clan_achievements": "Clan achievements",
+    "legend_daily": "Legend daily summary",
+    "legend_battles": "Legend battle feed",
+    "war_state": "War start / end",
+    "upgrades": "Unit upgrades",
+    "clan_settings": "Clan settings",
+    "flag_alert": "Flagged player joined",
+    "welcome": "Account linked",
+}
+MAX_EMBED_FIELDS = 25
+MAX_MESSAGE_EMBEDS = 10
+MAX_MESSAGE_CHARS = 5800  # Discord allows 6000 characters over all of a message's embeds
+
+
+@dataclass(frozen=True)
+class LogClan:
+    tag: str
+    name: str | None = None
+    badge_url: str | None = None
+
+
+def log_field_name(kind: str, names: dict[str, str] = CLAN_LOG_TYPES) -> str:
+    return LOG_FIELD_NAMES.get(kind) or names.get(kind, kind).split(" (")[0]
+
+
+def log_list_embeds(
+    clans: Iterable[LogClan], clan_rows, server_rows, color: discord.Color | int | None = None
+) -> list[discord.Embed]:
+    """/logs list: an embed per clan, its badge beside its name, the channels it posts to and
+    every log type in a grid with its channel ("—" when off); then the server's own logs."""
+    by_clan: dict[str, dict[str, Any]] = defaultdict(dict)
     for r in clan_rows:
-        tag = r["clan_tag"]
-        if tag != current:
-            if lines:
-                lines.append("")
-            lines.append(header(clan_names.get(tag) or tag, "clan", f"`{tag}`"))
-            current = tag
-        ping = f" · ping <@&{r['ping_role_id']}>" if r["ping_role_id"] else ""
-        lines.append(f"{CLAN_LOG_TYPES.get(r['log_type'], r['log_type'])} → <#{r['channel_id']}>{ping}")
-    if server_rows:
-        if lines:
-            lines.append("")
-        lines.append(header("Server", "🖥️"))
-        lines += [
-            f"{SERVER_LOG_TYPES.get(r['log_type'], r['log_type'])} → <#{r['channel_id']}>"
-            for r in server_rows
-        ]
-    return lines
+        by_clan[r["clan_tag"]][r["log_type"]] = r
+    info = {c.tag: c for c in clans}
+    order = [*info, *sorted(t for t in by_clan if t not in info)]
+    embeds = []
+    for tag in order:
+        clan = info.get(tag, LogClan(tag))
+        e = discord.Embed(color=color)
+        e.set_author(name=f"{clan.name or tag} ({tag})", url=clan_link(tag), icon_url=clan.badge_url or None)
+        logs = by_clan.get(tag, {})
+        if not logs:
+            e.description = "No logs set up for this clan yet. Use `/logs clan`."
+            embeds.append(e)
+            continue
+        channels = dict.fromkeys(r["channel_id"] for r in logs.values())
+        e.description = "Posting to " + ", ".join(f"<#{c}>" for c in channels)
+        kinds = [*CLAN_LOG_TYPES, *sorted(k for k in logs if k not in CLAN_LOG_TYPES)]
+        for kind in kinds[:MAX_EMBED_FIELDS]:
+            r = logs.get(kind)
+            value = "—" if r is None else f"<#{r['channel_id']}>"
+            if r is not None and r["ping_role_id"]:
+                value += f"\nping <@&{r['ping_role_id']}>"
+            e.add_field(name=log_field_name(kind), value=value)
+        embeds.append(e)
+
+    server = {r["log_type"]: r for r in server_rows}
+    e = discord.Embed(title="Server logs", color=color)
+    if not by_clan and not server:
+        e.description = "No logs configured yet. Use `/logs clan` and `/logs server`."
+    for kind in [*SERVER_LOG_TYPES, *sorted(k for k in server if k not in SERVER_LOG_TYPES)]:
+        r = server.get(kind)
+        e.add_field(
+            name=log_field_name(kind, SERVER_LOG_TYPES), value="—" if r is None else f"<#{r['channel_id']}>"
+        )
+    embeds.append(e)
+    return embeds
+
+
+def embed_pages(embeds: Sequence[discord.Embed]) -> list[list[discord.Embed]]:
+    """Embeds split into messages within Discord's limits (10 embeds, 6000 characters)."""
+    pages: list[list[discord.Embed]] = [[]]
+    size = 0
+    for e in embeds:
+        if pages[-1] and (len(pages[-1]) == MAX_MESSAGE_EMBEDS or size + len(e) > MAX_MESSAGE_CHARS):
+            pages.append([])
+            size = 0
+        pages[-1].append(e)
+        size += len(e)
+    return pages
 
 
 def merge_unit_changes(
@@ -231,15 +292,20 @@ class Logs(BaseCog):
         server_rows = await self.db.fetchall(
             "SELECT * FROM server_logs WHERE guild_id = ? ORDER BY log_type", (interaction.guild_id,)
         )
-        names = {r["clan_tag"]: r["name"] for r in await self.db.get_guild_clan_rows(interaction.guild_id)}
-        lines = log_list_lines(clan_rows, server_rows, names)
-        embed = await make_embed(
-            self.bot,
-            interaction.guild_id,
-            title="Configured logs",
-            description="\n".join(lines)[:4000] or "No logs configured. Use `/logs clan`.",
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        clans = [
+            LogClan(r["clan_tag"], r["name"], r["badge_url"])
+            for r in await self.db.get_guild_clan_rows(interaction.guild_id)
+        ]
+        known = {c.tag for c in clans}
+        for tag in dict.fromkeys(r["clan_tag"] for r in clan_rows):
+            if tag not in known:  # logs for a clan the server no longer links
+                row = await self.db.get_clan_row(tag)
+                clans.append(LogClan(tag, row["name"] if row else None, row["badge_url"] if row else None))
+        color = await guild_color(self.bot, interaction.guild_id)
+        first, *rest = embed_pages(log_list_embeds(clans, clan_rows, server_rows, color))
+        await interaction.response.send_message(embeds=first, ephemeral=True)
+        for page in rest:
+            await interaction.followup.send(embeds=page, ephemeral=True)
 
     # ------------------------------------------------------------------ batching
 
@@ -253,14 +319,8 @@ class Logs(BaseCog):
         upgrades, self._upgrades = self._upgrades, defaultdict(dict)
         boosts, self._boosts = self._boosts, defaultdict(dict)
         for clan_tag, by_player in donations.items():
-            entries = [tuple(v) for v in by_player.values()]
-            if entries:
-                await send_clan_log(
-                    self.bot,
-                    clan_tag,
-                    "donations",
-                    E.donations_embed(self._clan_names.get(clan_tag, clan_tag), entries),
-                )
+            if by_player:
+                await self._post_donations(clan_tag, by_player)
         for clan_tag, by_player in games.items():
             entries = [tuple(v) for v in by_player.values()]
             if entries:
@@ -314,6 +374,41 @@ class Logs(BaseCog):
                 "clan_settings",
                 E.clan_settings_embed(e.clan_name, e.clan_tag, e.changes),
             )
+
+    async def _post_donations(self, clan_tag: str, by_player: dict[str, list]) -> None:
+        """One clan's donations over the batch: who gave and who got, with each player's Town
+        Hall and, in colour, the amounts (number emojis, made the first time an amount comes up).
+        Players gone from the clan's latest poll are struck through."""
+        if not await self.db.clan_log_targets(clan_tag, "donations"):
+            return
+        collector = getattr(self.bot, "collector", None)
+        snap = collector.clan_snapshot(clan_tag) if collector is not None else None
+        entries = []
+        for tag, (name, donated, received) in by_player.items():
+            member = snap.members.get(tag) if snap is not None else None
+            town_hall = member.town_hall if member is not None else None
+            if town_hall is None:
+                row = await self.db.get_player_row(tag)
+                town_hall = row["town_hall"] if row else None
+            entries.append(
+                E.Donation(
+                    name, donated, received, town_hall=town_hall, in_clan=snap is None or member is not None
+                )
+            )
+        numbers = {
+            "d": await emojis.number_emojis(self.bot, "d", [d.donated for d in entries if d.donated > 0]),
+            "r": await emojis.number_emojis(self.bot, "r", [d.received for d in entries if d.received > 0]),
+        }
+        embed = E.donations_embed(
+            self._clan_names.get(clan_tag, snap.name if snap else clan_tag),
+            clan_tag,
+            entries,
+            numbers=numbers,
+            badge_url=await self._badge(clan_tag),
+            member_count=len(snap.members) if snap is not None else None,
+            at=datetime.now(UTC),
+        )
+        await send_clan_log(self.bot, clan_tag, "donations", embed)
 
     @commands.Cog.listener()
     async def on_clash_donations(self, e: ev.DonationsChanged) -> None:
