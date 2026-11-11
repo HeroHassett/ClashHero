@@ -31,10 +31,19 @@ def b(ts, attack=True, kind="legend", opp="#O"):
 
 def test_parse():
     (x,) = parse_battles([item("20261104T020237.000Z", attack=False, kind="ranked", stars=1, pct=55)])
-    assert (x.kind, x.ranked, x.stars, x.destruction, x.opponent_th) == ("defense", True, 1, 55, 17)
+    assert (x.kind, x.ranked, x.stars, x.destruction) == ("defense", True, 1, 55)
     assert x.occurred_at == datetime(2026, 11, 4, 2, 2, 37, tzinfo=UTC)
     assert not b("20261104T020237.000Z", kind="homeVillage").ranked
     assert parse_timestamp("20261104T020237.000Z").tzinfo is UTC
+
+
+def test_opponent_town_hall_counts_from_one():
+    # The log's opponentTownHallLevel counts from zero: a Town Hall 18 opponent reads 17.
+    (x,) = parse_battles([item("20261104T020237.000Z")])
+    assert x.opponent_th == 18
+    raw = item("20261104T020237.000Z")
+    del raw["opponentTownHallLevel"]
+    assert parse_battles([raw])[0].opponent_th is None
 
 
 def test_first_look_is_baseline():

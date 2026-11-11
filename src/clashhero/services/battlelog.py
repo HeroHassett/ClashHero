@@ -71,6 +71,12 @@ def parse_timestamp(raw: str) -> datetime:
     return datetime.strptime(raw, "%Y%m%dT%H%M%S.%fZ").replace(tzinfo=UTC)
 
 
+def _town_hall(raw: Any) -> int | None:
+    """The log's ``opponentTownHallLevel`` counts from zero (a Town Hall 18 opponent reads 17),
+    unlike ``townHallLevel`` on a player's profile."""
+    return raw + 1 if isinstance(raw, int) else None
+
+
 def parse_battles(items: Iterable[dict[str, Any]]) -> list[Battle]:
     out = []
     for it in items or ():
@@ -84,7 +90,7 @@ def parse_battles(items: Iterable[dict[str, Any]]) -> list[Battle]:
                 attack=bool(it.get("attack")),
                 opponent_tag=it.get("opponentPlayerTag") or "",
                 opponent_name=it.get("opponentName") or "?",
-                opponent_th=it.get("opponentTownHallLevel"),
+                opponent_th=_town_hall(it.get("opponentTownHallLevel")),
                 stars=int(it.get("stars") or 0),
                 destruction=int(it.get("destructionPercentage") or 0),
                 army_share_code=it.get("armyShareCode"),

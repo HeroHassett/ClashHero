@@ -67,3 +67,51 @@ async def test_columns_added_to_existing_database(tmp_path):
     db = Database(path)  # second start is a no-op
     await db.connect()
     await db.close()
+
+
+async def test_stored_opponent_town_halls_raised_once(tmp_path):
+    import aiosqlite
+
+    from clashhero.db import Database
+
+    path = tmp_path / "old.db"
+    async with aiosqlite.connect(path) as conn:  # battles saved with the log's zero-based level
+        await conn.execute(
+            "CREATE TABLE legend_events (id INTEGER PRIMARY KEY, player_tag TEXT, legend_day TEXT, "
+            "season_id TEXT, kind TEXT, trophies INTEGER, trophies_after INTEGER, occurred_at TEXT, "
+            "opponent_th INTEGER)"
+        )
+        await conn.executemany(
+            "INSERT INTO legend_events (id, kind, opponent_th) VALUES (?, 'defense', ?)",
+            [(1, 17), (2, 16), (3, 0), (4, None)],
+        )
+        await conn.commit()
+    for _ in range(2):  # the second start leaves them alone
+        db = Database(path)
+        await db.connect()
+        try:
+            rows = await db.fetchall("SELECT opponent_th FROM legend_events ORDER BY id")
+        finally:
+            await db.close()
+        assert [r[0] for r in rows] == [18, 17, 0, None]
+
+
+async def test_fresh_database_keeps_new_battles(tmp_path):
+    from clashhero.db import Database
+
+    path = tmp_path / "new.db"
+    db = Database(path)
+    await db.connect()
+    await db.execute(
+        "INSERT INTO legend_events (player_tag, legend_day, season_id, kind, trophies, trophies_after, "
+        "occurred_at, opponent_th) VALUES ('#A', '2026-11-11', '2026-11-02', 'attack', 40, 5040, "
+        "'2026-11-11T12:00:00+00:00', 18)"
+    )
+    await db.close()
+    db = Database(path)
+    await db.connect()
+    try:
+        th = await db.fetchval("SELECT opponent_th FROM legend_events")
+    finally:
+        await db.close()
+    assert th == 18

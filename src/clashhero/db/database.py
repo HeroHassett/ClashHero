@@ -18,6 +18,14 @@ import aiosqlite
 
 Row = aiosqlite.Row
 
+# Data fixes that must run exactly once per database, in order. ``PRAGMA user_version`` counts how
+# many have run; a fresh database runs them on empty tables. Append, never edit or reorder.
+# (Idempotent fixes go in fixes.sql instead.)
+ONE_TIME_FIXES = (
+    # Battles stored the battle log's zero-based opponent Town Hall (18 read as 17); raise them.
+    "UPDATE legend_events SET opponent_th = opponent_th + 1 WHERE opponent_th > 0",
+)
+
 
 class Database:
     def __init__(self, path: Path | str) -> None:
@@ -44,6 +52,7 @@ class Database:
             await self._conn.executescript(script)
         await self._add_missing_columns()
         await self._conn.executescript(resources.files("clashhero.db").joinpath("fixes.sql").read_text())
+        await self._run_one_time_fixes()
         await self._conn.commit()
 
     @staticmethod
@@ -67,6 +76,14 @@ class Database:
             if m.name.startswith("columns_"):
                 out.extend(importlib.import_module(f"{pkg.__name__}.{m.name}").COLUMNS)
         return out
+
+    async def _run_one_time_fixes(self) -> None:
+        async with self.conn.execute("PRAGMA user_version") as cur:
+            done = (await cur.fetchone())[0]
+        for sql in ONE_TIME_FIXES[done:]:
+            await self.conn.execute(sql)
+        if done < len(ONE_TIME_FIXES):
+            await self.conn.execute(f"PRAGMA user_version = {len(ONE_TIME_FIXES)}")
 
     async def _add_missing_columns(self) -> None:
         """Columns added after a table first shipped. ``CREATE TABLE IF NOT EXISTS`` never alters an
