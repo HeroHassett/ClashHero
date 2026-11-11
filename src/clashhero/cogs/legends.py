@@ -35,7 +35,7 @@ from clashhero.services import icons as unit_icons
 from clashhero.services.army import common_army, hero_usage, parse_army
 from clashhero.services.battlelog import army_link, estimate_legend_result
 from clashhero.services.emojis import EMOJIS
-from clashhero.services.outbox import send_clan_log, send_to_channel, update_live_message
+from clashhero.services.outbox import send_clan_log, send_dm, send_to_channel, update_live_message
 from clashhero.utils.checks import has_permission, manager
 from clashhero.utils.fmt import guild_color, signed, table
 from clashhero.utils.ranked import is_legend_one, is_tracked_ranked, league_name, weekly_attack_cap
@@ -951,11 +951,7 @@ class Legends(BaseCog):
         kind = event.kind
         view = alert_view(event, sub["id"])
         if sub["channel_id"] == 0:
-            try:
-                user = self.bot.get_user(sub["user_id"]) or await self.bot.fetch_user(sub["user_id"])
-                await user.send(embed=embed, view=view)
-            except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
-                log.info("Could not DM legend alert to %s: %s", sub["user_id"], e)
+            await send_dm(self.bot, sub["user_id"], embed=embed, view=view, what="legend alert")
             return
         ping = f"<@&{sub['ping_role_id']}>" if kind == "defense" and sub["ping_role_id"] else None
         await send_to_channel(self.bot, sub["channel_id"], content=ping, embed=embed, view=view)

@@ -13,7 +13,7 @@ from discord.ext import commands
 from clashhero.cogs._base import BaseCog
 from clashhero.events import MemberJoined
 from clashhero.repos import flags as repo
-from clashhero.services.outbox import send_server_log
+from clashhero.services.outbox import send_dm, send_server_log
 from clashhero.utils.checks import manager
 from clashhero.utils.fmt import chunk_lines, make_embed, player_link, ts
 from clashhero.utils.resolve import ResolveError, parse_tag, player_autocomplete, resolve_clans
@@ -99,13 +99,8 @@ async def dm_users(bot, user_ids: Iterable[int], embed: discord.Embed) -> tuple[
     """DM each user. Returns (delivered, failed) user ids; failures are logged, never raised."""
     sent, failed = [], []
     for uid in user_ids:
-        try:
-            user = bot.get_user(uid) or await bot.fetch_user(uid)
-            await user.send(embed=embed)
-            sent.append(uid)
-        except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
-            log.info("Could not DM flag notice to %s: %s", uid, e)
-            failed.append(uid)
+        delivered = await send_dm(bot, uid, embed=embed, what="flag notice")
+        (sent if delivered else failed).append(uid)
     return sent, failed
 
 
